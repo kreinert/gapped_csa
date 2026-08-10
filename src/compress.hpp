@@ -502,10 +502,12 @@ private:
             id_of[intervals[i].name] = (int)i;
         const int N = (int)intervals.size();
 
+        // Preference relation: only intervals with |I_c| > 2 participate
+        // (cardinality-2 intervals are ignored for prefs / DAG / Phase I).
         std::fprintf(stderr, "[dep-order] preference / DAG build...\n");
         auto t0 = Clock::now();
         for (const auto& iv : intervals) {
-            if (iv.hi - iv.lo <= 1) continue;
+            if (iv.hi - iv.lo <= 2) continue;
             Candidate c = best_candidate_(iv.name, iv.lo, iv.hi, /*avail=*/false);
             if (c.coverage() < 2) continue;
             uint64_t src_name = name_of_rank_(c.src_lo);
@@ -581,7 +583,7 @@ private:
             std::fprintf(stderr, "=== Phase I accept order (reverse topo, sinks first) ===\n  ");
             for (int k = N - 1; k >= 0; --k) {
                 const auto& iv = intervals[topo[k]];
-                if (iv.hi - iv.lo <= 1) continue;
+                if (iv.hi - iv.lo <= 2) continue;
                 if (!pref_of(iv.name)) continue;
                 std::fprintf(stderr, "%s ", name_to_string(G_.shape, iv.name).c_str());
             }

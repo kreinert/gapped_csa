@@ -45,7 +45,8 @@ static std::vector<Cand> best_per_interval(const GappedSA& G, int max_add) {
         size_t r2 = r + 1;
         while (r2 < m && G.first_symbol((int32_t)r2) == name) ++r2;
         int32_t lo = (int32_t)r, hi = (int32_t)r2;
-        if (hi - lo <= 1) { r = r2; continue; }
+        // Preference relation: only |I_c| > 2 (match DepOrder).
+        if (hi - lo <= 2) { r = r2; continue; }
 
         Cand best{};
         best.coverage = 0;
