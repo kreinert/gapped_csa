@@ -1,0 +1,18 @@
+# binaries
+/gcsa
+/validate
+/bench_repetition
+/compare_algos
+/simulate_repeats
+/dump_graph
+/find_minimal_gap
+*.o
+a.out
+
+# optional vendored libdivsufsort (not required; SA-IS is header-only)
+external/
+
+# local test data / scratch
+*.fasta
+/out
+.DS_Store
