@@ -160,7 +160,8 @@ int main(int argc, char** argv) {
             std::string a = need("--algo");
             if (a == "greedy") algo = CompressAlgo::Greedy;
             else if (a == "dep-order" || a == "dep") algo = CompressAlgo::DepOrder;
-            else { std::cerr << "--algo must be greedy|dep-order\n"; return 1; }
+            else if (a == "greedy-dfs" || a == "dfs") algo = CompressAlgo::GreedyDfs;
+            else { std::cerr << "--algo must be greedy|dep-order|greedy-dfs\n"; return 1; }
         }
         else { std::cerr << "unknown arg: " << k << "\n"; return 1; }
     }

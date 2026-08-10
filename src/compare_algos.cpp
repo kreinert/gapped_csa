@@ -1,7 +1,8 @@
 // compare_algos.cpp
 //
-// Side-by-side comparison of CompressAlgo::Greedy vs CompressAlgo::DepOrder
-// on the note's #.# example and on the repetition suite (weight-30 shapes).
+// Side-by-side comparison of CompressAlgo::Greedy, DepOrder, and GreedyDfs
+// on the note's #.# example, the GCCTTTAAAG×3 demo, short repetitive DNA,
+// and the weight-30 repetition suite.
 //
 // Build:  make compare_algos
 // Usage:  ./compare_algos [--min-rep N] [--max-rep N] [--step S] [--seed S]
@@ -107,20 +108,66 @@ static Result run_algo(const Shape& sh, const std::string& text,
     return r;
 }
 
-static void print_pair(const std::string& tag, const Result& g, const Result& d) {
-    double dC = (g.C == 0) ? 0.0 : 100.0 * (1.0 - (double)d.C / (double)g.C);
-    std::cout << std::left << std::setw(28) << tag
-              << std::setw(8) << g.C
-              << std::setw(8) << std::fixed << std::setprecision(1) << g.keep_pct
-              << std::setw(8) << d.C
-              << std::setw(8) << d.keep_pct
-              << std::setw(9) << std::setprecision(1) << dC
-              << std::setw(6) << ((g.ok && g.rt) ? "ok" : "FAIL")
-              << std::setw(6) << ((d.ok && d.rt) ? "ok" : "FAIL")
-              << std::setw(8) << std::setprecision(1) << g.build_ms
-              << std::setw(8) << d.build_ms
+static void print_header() {
+    std::cout << std::left
+              << std::setw(28) << "case"
+              << std::setw(7)  << "g|C|"
+              << std::setw(6)  << "g%"
+              << std::setw(7)  << "d|C|"
+              << std::setw(6)  << "d%"
+              << std::setw(7)  << "f|C|"
+              << std::setw(6)  << "f%"
+              << std::setw(8)  << "best"
+              << std::setw(5)  << "g"
+              << std::setw(5)  << "d"
+              << std::setw(5)  << "f"
               << "\n";
 }
+
+// g=greedy, d=dep-order, f=greedy-dfs (f for "dfs"/forest)
+static void print_row(const std::string& tag,
+                      const Result& g, const Result& d, const Result& f) {
+    size_t bC = std::min({g.C, d.C, f.C});
+    std::string best;
+    if (g.C == bC) best += (best.empty() ? "" : "/") + std::string("g");
+    if (d.C == bC) best += (best.empty() ? "" : "/") + std::string("d");
+    if (f.C == bC) best += (best.empty() ? "" : "/") + std::string("f");
+    if (best == "g/d/f") best = "tie";
+
+    auto ok = [](const Result& r) { return (r.ok && r.rt) ? "ok" : "FAIL"; };
+    std::cout << std::left << std::setw(28) << tag
+              << std::setw(7) << g.C
+              << std::setw(6) << std::fixed << std::setprecision(1) << g.keep_pct
+              << std::setw(7) << d.C
+              << std::setw(6) << d.keep_pct
+              << std::setw(7) << f.C
+              << std::setw(6) << f.keep_pct
+              << std::setw(8) << best
+              << std::setw(5) << ok(g)
+              << std::setw(5) << ok(d)
+              << std::setw(5) << ok(f)
+              << "\n";
+}
+
+struct Totals {
+    long long sum_g = 0, sum_d = 0, sum_f = 0;
+    int win_g = 0, win_d = 0, win_f = 0, tie = 0;
+    int fails = 0, n = 0;
+
+    void add(const Result& g, const Result& d, const Result& f) {
+        ++n;
+        sum_g += (long long)g.C;
+        sum_d += (long long)d.C;
+        sum_f += (long long)f.C;
+        if (!g.ok || !g.rt || !d.ok || !d.rt || !f.ok || !f.rt) ++fails;
+        size_t b = std::min({g.C, d.C, f.C});
+        int winners = (g.C == b) + (d.C == b) + (f.C == b);
+        if (winners > 1) ++tie;
+        else if (g.C == b) ++win_g;
+        else if (d.C == b) ++win_d;
+        else ++win_f;
+    }
+};
 
 int main(int argc, char** argv) {
     uint64_t seed = 1;
@@ -148,90 +195,76 @@ int main(int argc, char** argv) {
         }
     }
 
-    std::cout << "Comparing greedy vs dep-order (max_add=" << max_add << ")\n\n";
-    std::cout << std::left
-              << std::setw(28) << "case"
-              << std::setw(8)  << "g|C|"
-              << std::setw(8)  << "g%"
-              << std::setw(8)  << "d|C|"
-              << std::setw(8)  << "d%"
-              << std::setw(9)  << "dC%↓"
-              << std::setw(6)  << "g"
-              << std::setw(6)  << "d"
-              << std::setw(8)  << "g_ms"
-              << std::setw(8)  << "d_ms"
-              << "\n";
+    std::cout << "Comparing greedy | dep-order | greedy-dfs  (max_add=" << max_add << ")\n"
+              << "columns: g=greedy  d=dep-order  f=greedy-dfs\n\n";
+    print_header();
 
-    int fails = 0;
-    int dep_better = 0, greedy_better = 0, tie = 0;
-    long long sum_gC = 0, sum_dC = 0;
+    Totals tot;
 
-    // --- Note's #.# example ------------------------------------------------
-    {
-        std::string text = "ACGTCTTAAACCCTCGTCTTAAACCCAACGTCTTAAACCC";
-        Shape sh = Shape::parse("#.#");
+    auto run_case = [&](const std::string& tag, const Shape& sh, const std::string& text) {
         Result g = run_algo(sh, text, max_add, CompressAlgo::Greedy);
         Result d = run_algo(sh, text, max_add, CompressAlgo::DepOrder);
-        print_pair("note #.# (n=40)", g, d);
-        if (!g.ok || !g.rt || !d.ok || !d.rt) ++fails;
-        sum_gC += (long long)g.C; sum_dC += (long long)d.C;
-        if (d.C < g.C) ++dep_better; else if (g.C < d.C) ++greedy_better; else ++tie;
-    }
+        Result f = run_algo(sh, text, max_add, CompressAlgo::GreedyDfs);
+        print_row(tag, g, d, f);
+        std::cout.flush();
+        tot.add(g, d, f);
+    };
 
-    // --- A few small shapes on a short repetitive text ---------------------
+    // --- Hand examples -----------------------------------------------------
+    run_case("note #.# (n=40)",
+             Shape::parse("#.#"),
+             "ACGTCTTAAACCCTCGTCTTAAACCCAACGTCTTAAACCC");
+    run_case("GCCTTTAAAG x3 #.#",
+             Shape::parse("#.#"),
+             "GCCTTTAAAGGCCTTTAAAGGCCTTTAAAG");
+    run_case("GGGCGGCGGC ##",
+             Shape::parse("##"),
+             "GGGCGGCGGC");
+
+    // --- Short repetitive DNA ----------------------------------------------
     {
         std::mt19937_64 rng(seed);
         std::string motif = random_dna(200, rng);
         std::string text = concat_copies(motif, 20);
-        for (const char* pat : {"#####", "##.##", "####.####", "#.#.#.#"}) {
-            Shape sh = Shape::parse(pat);
-            Result g = run_algo(sh, text, max_add, CompressAlgo::Greedy);
-            Result d = run_algo(sh, text, max_add, CompressAlgo::DepOrder);
-            print_pair(std::string("rep20x200 ") + pat, g, d);
-            if (!g.ok || !g.rt || !d.ok || !d.rt) ++fails;
-            sum_gC += (long long)g.C; sum_dC += (long long)d.C;
-            if (d.C < g.C) ++dep_better; else if (g.C < d.C) ++greedy_better; else ++tie;
-        }
+        for (const char* pat : {"#####", "##.##", "####.####", "#.#.#.#"})
+            run_case(std::string("rep20x200 ") + pat, Shape::parse(pat), text);
     }
 
     std::cout << "\n";
 
-    // --- Full weight-30 repetition suite -----------------------------------
+    // --- Weight-30 suite ---------------------------------------------------
     std::mt19937_64 rng(seed);
     std::string motif = random_dna(motif_len, rng);
     auto shapes = make_shapes();
     std::cout << "Weight-30 suite: motif_len=" << motif_len
               << " reps=" << min_rep << ".." << max_rep << " step " << step
               << " shapes=" << shapes.size() << "\n";
+    print_header();
 
     for (int reps = min_rep; reps <= max_rep; reps += step) {
         std::string text = concat_copies(motif, reps);
         for (auto& spec : shapes) {
-            Shape sh = Shape::parse(spec.pattern);
-            Result g = run_algo(sh, text, max_add, CompressAlgo::Greedy);
-            Result d = run_algo(sh, text, max_add, CompressAlgo::DepOrder);
-            std::string tag = "x" + std::to_string(reps) + " " + spec.label;
-            print_pair(tag, g, d);
-            std::cout.flush();
-            if (!g.ok || !g.rt || !d.ok || !d.rt) ++fails;
-            sum_gC += (long long)g.C; sum_dC += (long long)d.C;
-            if (d.C < g.C) ++dep_better;
-            else if (g.C < d.C) ++greedy_better;
-            else ++tie;
+            run_case("x" + std::to_string(reps) + " " + spec.label,
+                     Shape::parse(spec.pattern), text);
         }
     }
 
-    int total = dep_better + greedy_better + tie;
-    double overall = (sum_gC == 0) ? 0.0 : 100.0 * (1.0 - (double)sum_dC / (double)sum_gC);
+    auto pct = [](long long a, long long b) -> double {
+        if (b == 0) return 0.0;
+        return 100.0 * (1.0 - (double)a / (double)b);
+    };
     std::cout << "\n=== Summary ===\n"
-              << "configs: " << total
-              << "  dep-order better: " << dep_better
-              << "  greedy better: " << greedy_better
-              << "  tie: " << tie << "\n"
-              << "total |C| greedy=" << sum_gC
-              << "  dep-order=" << sum_dC
-              << "  overall reduction: " << std::fixed << std::setprecision(2)
-              << overall << "%\n"
-              << "correctness failures: " << fails << "\n";
-    return fails ? 1 : 0;
+              << "configs: " << tot.n << "\n"
+              << "unique wins:  greedy=" << tot.win_g
+              << "  dep-order=" << tot.win_d
+              << "  greedy-dfs=" << tot.win_f
+              << "  ties/shared=" << tot.tie << "\n"
+              << "total |C|:  greedy=" << tot.sum_g
+              << "  dep-order=" << tot.sum_d
+              << "  greedy-dfs=" << tot.sum_f << "\n"
+              << "vs greedy:  dep-order " << std::fixed << std::setprecision(2)
+              << pct(tot.sum_d, tot.sum_g) << "% fewer stored"
+              << "  greedy-dfs " << pct(tot.sum_f, tot.sum_g) << "% fewer stored\n"
+              << "correctness failures: " << tot.fails << "\n";
+    return tot.fails ? 1 : 0;
 }

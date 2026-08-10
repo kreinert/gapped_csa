@@ -52,10 +52,12 @@ make
 ./bench_repetition
 ./bench_repetition --min-rep 10 --max-rep 100 --step 10 --seed 1
 
-# Compare greedy vs dependency-order (+ un-pin / retarget) compression
+# Compare / choose compression heuristic
 ./compare_algos
-./gcsa --algo dep-order          # note example with dep-order
-./gcsa -g genome.fasta -s "##.##" --algo dep-order
+./gcsa --algo greedy
+./gcsa --algo dep-order
+./gcsa --algo greedy-dfs          # DFS from best add=+1 hub, cumulative add
+GCSA_TRACE_DFS=1 ./gcsa -g /tmp/ex.fa -s "#.#" --algo greedy-dfs
 ```
 
 Shapes use `#` (care) and `.` (don't care), e.g. `#.#`, `##.##`, `#..#..#`.

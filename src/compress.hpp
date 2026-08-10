@@ -27,11 +27,12 @@
 // one contiguous run (H_rest).  This is the two-hash-entries-per-shape scheme of
 // the note.
 //
-// Two source-selection strategies are implemented (CompressAlgo):
-//   Greedy   – size-order availability-aware greedy (v1); pins sources forever.
-//   DepOrder – compress sink k-mers first; then compress former sources via a
-//              deeper LCP-interval, retargeting dependents' (pos,add) through
-//              the new source (transitive add). Iterates to a fixed point.
+// Compression strategies (CompressAlgo):
+//   Greedy    – size-order availability-aware greedy; pins sources forever.
+//   DepOrder  – dependency-order + un-pin / retarget.
+//   GreedyDfs – pick the add=+1 source hub of greatest total coverage; DFS to
+//               its add=+1 targets (|I|>2), then their add=+1 targets, etc.,
+//               always pointing at the DFS root with cumulative add (1,2,3,...).
 
 #pragma once
 
@@ -41,6 +42,7 @@
 #include <cstdlib>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <algorithm>
 #include <queue>
 #include <string>
@@ -50,12 +52,14 @@ namespace gcsa {
 enum class CompressAlgo {
     Greedy,    // size-first, pin sources
     DepOrder,  // dependency-order + un-pin / retarget
+    GreedyDfs, // DFS from best add=+1 hub, cumulative add to root
 };
 
 inline const char* algo_name(CompressAlgo a) {
     switch (a) {
         case CompressAlgo::Greedy:   return "greedy";
         case CompressAlgo::DepOrder: return "dep-order";
+        case CompressAlgo::GreedyDfs: return "greedy-dfs";
     }
     return "?";
 }
@@ -406,6 +410,23 @@ private:
             ++indeg[t];
         }
 
+        const bool trace = (std::getenv("GCSA_TRACE_DEP") != nullptr);
+        if (trace) {
+            std::fprintf(stderr, "=== preferred ===\n");
+            for (auto& p : prefs)
+                std::fprintf(stderr, "  %s -> prefers %s add=%d cov=%d src[%d,%d)\n",
+                    name_to_string(G_.shape, p.iv->name).c_str(),
+                    name_to_string(G_.shape, p.src_name).c_str(),
+                    p.cand.add, p.cand.coverage(), p.cand.src_lo, p.cand.src_hi);
+            std::fprintf(stderr, "=== DAG edges (src -> target) ===\n");
+            for (auto& p : prefs) {
+                if (p.iv->name == p.src_name) continue;
+                std::fprintf(stderr, "  %s -> %s\n",
+                    name_to_string(G_.shape, p.src_name).c_str(),
+                    name_to_string(G_.shape, p.iv->name).c_str());
+            }
+        }
+
         // Kahn topological order; sources before dependents.
         // We *accept* in reverse topo (sinks / dependents first), then improve.
         std::queue<int> q;
@@ -430,16 +451,40 @@ private:
             for (int u : rest) topo.push_back(u);
         }
 
+        if (trace) {
+            std::fprintf(stderr, "=== Phase I accept order (reverse topo, sinks first) ===\n  ");
+            for (int k = N - 1; k >= 0; --k) {
+                const auto& iv = intervals[topo[k]];
+                if (iv.hi - iv.lo <= 1) continue;
+                if (!pref_of(iv.name)) continue;
+                std::fprintf(stderr, "%s ", name_to_string(G_.shape, iv.name).c_str());
+            }
+            std::fprintf(stderr, "\n");
+        }
+
         // Pass 1: accept preferred candidates in reverse topo (sinks first),
         // with availability. This pins sources that dependents need.
+        int step = 0;
         for (int k = N - 1; k >= 0; --k) {
             uint64_t name = intervals[topo[k]].name;
             Pref* p = pref_of(name);
             if (!p) continue;
             // Recompute under current availability (source may already be gone).
             Candidate c = best_candidate_(p->iv->name, p->iv->lo, p->iv->hi, /*avail=*/true);
+            ++step;
+            if (trace) {
+                std::fprintf(stderr, "I.%d I_%s", step, name_to_string(G_.shape, name).c_str());
+                if (c.coverage() < 2) std::fprintf(stderr, " -> SKIP\n");
+                else std::fprintf(stderr, " -> ACCEPT src=I_%s[%d,%d) add=%d cov=%d\n",
+                    name_to_string(G_.shape, name_of_rank_(c.src_lo)).c_str(),
+                    c.src_lo, c.src_hi, c.add, c.coverage());
+            }
             if (c.coverage() < 2) continue;
             accept_(c, accepted);
+        }
+        if (trace) {
+            size_t kept = 0; for (auto x : removed_) if (!x) ++kept;
+            std::fprintf(stderr, "after Phase I: kept=%zu accepted=%zu\n", kept, accepted.size());
         }
 
         // Pass 2: fixed-point un-pin — try to compress intervals further
@@ -498,18 +543,229 @@ private:
                     size_t after = 0;
                     for (uint8_t x : removed_) if (!x) ++after;
                     if (after < before) {
+                        if (trace)
+                            std::fprintf(stderr,
+                                "II.%d IMPROVE I_%s src=I_%s[%d,%d) add=%d cov=%d  kept %zu->%zu\n",
+                                guard, name_to_string(G_.shape, ivp->name).c_str(),
+                                name_to_string(G_.shape, name_of_rank_(c.src_lo)).c_str(),
+                                c.src_lo, c.src_hi, c.add, c.coverage(), before, after);
                         changed = true;
                         break;   // re-sort / rescan from largest
                     }
                     // No improvement (e.g. replaced with equal) — keep if more
                     // coverage on this name even if global kept count same.
-                    if (c.coverage() > cur_cov) { changed = true; break; }
+                    if (c.coverage() > cur_cov) {
+                        if (trace)
+                            std::fprintf(stderr,
+                                "II.%d REPLACE I_%s cov %d->%d (kept unchanged %zu)\n",
+                                guard, name_to_string(G_.shape, ivp->name).c_str(),
+                                cur_cov, c.coverage(), after);
+                        changed = true;
+                        break;
+                    }
                     // Roll back if no gain.
                     accepted = std::move(acc_snap);
                     removed_ = std::move(rem_snap);
                     pin_count_ = std::move(pin_snap);
                 }
             }
+        }
+        if (trace) {
+            size_t kept = 0; for (auto x : removed_) if (!x) ++kept;
+            std::fprintf(stderr, "after Phase II: kept=%zu accepted=%zu\n", kept, accepted.size());
+        }
+    }
+
+    // Best add=1 candidate for target whose source lies entirely inside source_iv.
+    Candidate best_add1_from_(const Interval& target, const Interval& source,
+                              bool require_avail) const {
+        Candidate best;
+        auto cands = enumerate_candidates_(target.name, target.lo, target.hi, require_avail);
+        for (auto& c : cands) {
+            if (c.add != 1) continue;
+            if (c.src_lo < source.lo || c.src_hi > source.hi) continue;
+            if (c.coverage() > best.coverage()
+                || (c.coverage() == best.coverage() && c.src_lo < best.src_lo))
+                best = c;
+        }
+        return best;
+    }
+
+    // Greedy-DFS: root = interval maximizing total add=+1 outbound coverage to
+    // targets with |I|>2.  DFS along add=+1 links; every reached target points
+    // at the DFS root with cumulative add (depth).  Repeat on leftovers, then
+    // a final availability-aware greedy sweep.
+    void compress_greedy_dfs_(const std::vector<Interval>& intervals,
+                              std::unordered_map<uint64_t, Candidate>& accepted) {
+        const bool trace = (std::getenv("GCSA_TRACE_DFS") != nullptr);
+        std::unordered_map<uint64_t, const Interval*> by_name;
+        for (const auto& iv : intervals) by_name[iv.name] = &iv;
+
+        auto isize = [](const Interval& iv) { return iv.hi - iv.lo; };
+
+        // Outbound add=+1 score for a prospective root.
+        auto root_score = [&](const Interval& R) -> int {
+            int score = 0;
+            for (const auto& T : intervals) {
+                if (T.name == R.name || isize(T) <= 2) continue;
+                if (accepted.count(T.name)) continue;
+                Candidate c = best_add1_from_(T, R, /*avail=*/false);
+                if (c.coverage() >= 2) score += c.coverage();
+            }
+            return score;
+        };
+
+        // Compose child --add1--> parent into child --add'--> root via parent's
+        // accepted-to-root candidate. Returns empty (cov 0) on failure.
+        auto compose_to_root = [&](const Candidate& link_add1,
+                                   const Candidate& parent_to_root) -> Candidate {
+            Candidate out;
+            int32_t nlo = 0, nhi = 0;
+            // Treat link_add1 as a "dependent" whose source is in parent;
+            // parent_to_root.covered lists the parent ranks recovered from root.
+            if (!can_retarget_(link_add1, parent_to_root, nlo, nhi)) return out;
+            out = link_add1;
+            out.src_lo = nlo;
+            out.src_hi = nhi;
+            out.add = parent_to_root.add + 1;
+            if (out.add > max_add_) { out.covered.clear(); return out; }
+            return out;
+        };
+
+        std::unordered_set<uint64_t> is_root;  // roots stay stored (no offset)
+
+        // Grow as many DFS trees as profitable.
+        while (true) {
+            const Interval* root = nullptr;
+            int best = 0;
+            for (const auto& R : intervals) {
+                if (isize(R) <= 2) continue;
+                if (accepted.count(R.name) || is_root.count(R.name)) continue;
+                // Root ranks must still be kept.
+                bool kept = true;
+                for (int32_t r = R.lo; r < R.hi; ++r) if (removed_[r]) { kept = false; break; }
+                if (!kept) continue;
+                int sc = root_score(R);
+                if (sc > best) { best = sc; root = &R; }
+            }
+            if (!root || best <= 0) break;
+
+            is_root.insert(root->name);
+            if (trace)
+                std::fprintf(stderr, "DFS root=I_%s size=%d outbound_cov=%d\n",
+                    name_to_string(G_.shape, root->name).c_str(), isize(*root), best);
+
+            // Identity map for the root: covered = all its ranks, add=0, src=itself.
+            Candidate root_id;
+            root_id.name = root->name;
+            root_id.target_lo = root->lo;
+            root_id.target_hi = root->hi;
+            root_id.add = 0;
+            root_id.src_lo = root->lo;
+            root_id.src_hi = root->hi;
+            root_id.covered.clear();
+            for (int32_t r = root->lo; r < root->hi; ++r) root_id.covered.push_back(r);
+
+            // parent_to_root[name] for nodes in the tree (including root).
+            std::unordered_map<uint64_t, Candidate> to_root;
+            to_root[root->name] = root_id;
+
+            struct Frame { uint64_t name; };
+            std::vector<Frame> stack;
+
+            // Seed stack with add=+1 children of the root (|I|>2).
+            {
+                std::vector<Candidate> kids;
+                for (const auto& T : intervals) {
+                    if (T.name == root->name || isize(T) <= 2) continue;
+                    if (accepted.count(T.name)) continue;
+                    Candidate link = best_add1_from_(T, *root, /*avail=*/true);
+                    if (link.coverage() < 2) continue;
+                    kids.push_back(std::move(link));
+                }
+                std::sort(kids.begin(), kids.end(), [](const Candidate& a, const Candidate& b){
+                    return a.coverage() > b.coverage();
+                });
+                for (auto& link : kids) {
+                    // Directly to root with add=1 (source already inside root).
+                    if (!run_kept_(link.src_lo, link.src_hi)) continue;
+                    bool ok = true;
+                    for (int32_t r : link.covered) if (removed_[r] || pin_count_[r] > 0) { ok = false; break; }
+                    if (!ok) continue;
+                    accept_(link, accepted);
+                    to_root[link.name] = link;
+                    stack.push_back({link.name});
+                    if (trace)
+                        std::fprintf(stderr, "  depth1 I_%s <- root add=1 cov=%d\n",
+                            name_to_string(G_.shape, link.name).c_str(), link.coverage());
+                }
+            }
+
+            // DFS: from each node, attach add=+1 children pointing at root with add+1.
+            while (!stack.empty()) {
+                Frame fr = stack.back();
+                stack.pop_back();
+                const Interval* P = by_name[fr.name];
+                auto itP = to_root.find(fr.name);
+                if (!P || itP == to_root.end()) continue;
+                const Candidate& parent_tr = itP->second;
+
+                std::vector<Candidate> kids;
+                for (const auto& U : intervals) {
+                    if (U.name == fr.name || U.name == root->name) continue;
+                    if (isize(U) <= 2) continue;
+                    if (accepted.count(U.name) || is_root.count(U.name)) continue;
+                    // Link U <- P with add=1 (ignore avail; compose handles pins).
+                    Candidate link = best_add1_from_(U, *P, /*avail=*/false);
+                    if (link.coverage() < 2) continue;
+                    kids.push_back(std::move(link));
+                }
+                std::sort(kids.begin(), kids.end(), [](const Candidate& a, const Candidate& b){
+                    return a.coverage() > b.coverage();
+                });
+
+                for (auto& link : kids) {
+                    Candidate composed = compose_to_root(link, parent_tr);
+                    if (composed.coverage() < 2) continue;
+                    // Availability on composed source (subset of root) and covered.
+                    if (!run_kept_(composed.src_lo, composed.src_hi)) continue;
+                    bool ok = true;
+                    for (int32_t r : composed.covered)
+                        if (removed_[r] || pin_count_[r] > 0) { ok = false; break; }
+                    if (!ok) continue;
+                    accept_(composed, accepted);
+                    to_root[composed.name] = composed;
+                    stack.push_back({composed.name});
+                    if (trace)
+                        std::fprintf(stderr, "  depth%d I_%s <- root add=%d cov=%d (via I_%s)\n",
+                            composed.add,
+                            name_to_string(G_.shape, composed.name).c_str(),
+                            composed.add, composed.coverage(),
+                            name_to_string(G_.shape, fr.name).c_str());
+                }
+            }
+        }
+
+        // Leftover sweep: classic size-greedy on remaining intervals.
+        std::vector<const Interval*> order;
+        for (const auto& iv : intervals)
+            if (isize(iv) > 1 && !accepted.count(iv.name)) order.push_back(&iv);
+        std::sort(order.begin(), order.end(),
+                  [](const Interval* a, const Interval* b){ return (a->hi-a->lo) > (b->hi-b->lo); });
+        for (const Interval* ivp : order) {
+            Candidate c = best_candidate_(ivp->name, ivp->lo, ivp->hi, /*avail=*/true);
+            if (c.coverage() < 2) continue;
+            accept_(c, accepted);
+            if (trace)
+                std::fprintf(stderr, "leftover I_%s <- I_%s add=%d cov=%d\n",
+                    name_to_string(G_.shape, ivp->name).c_str(),
+                    name_to_string(G_.shape, name_of_rank_(c.src_lo)).c_str(),
+                    c.add, c.coverage());
+        }
+        if (trace) {
+            size_t kept = 0; for (auto x : removed_) if (!x) ++kept;
+            std::fprintf(stderr, "greedy-dfs done: kept=%zu accepted=%zu roots=%zu\n",
+                         kept, accepted.size(), is_root.size());
         }
     }
 
@@ -534,6 +790,8 @@ private:
         std::unordered_map<uint64_t, Candidate> accepted;
         if (algo_ == CompressAlgo::DepOrder)
             compress_dep_order_(intervals, accepted);
+        else if (algo_ == CompressAlgo::GreedyDfs)
+            compress_greedy_dfs_(intervals, accepted);
         else
             compress_greedy_(intervals, accepted);
 
