@@ -25,9 +25,12 @@
 #include "shape.hpp"
 #include "sais.hpp"
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <chrono>
 
 namespace gcsa {
 
@@ -52,12 +55,19 @@ struct GappedSA {
 };
 
 inline GappedSA build_gapped_sa(const Shape& shape, std::string text) {
+    using Clock = std::chrono::steady_clock;
+    const bool timing = (std::getenv("GCSA_TIMING") != nullptr);
+    auto ms = [](Clock::time_point a, Clock::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+
     GappedSA G;
     G.shape = shape;
     G.text  = std::move(text);
     G.n     = G.text.size();
 
     // 1) Build the lextext in DisLex (grouped-by-residue) order.
+    auto t0 = Clock::now();
     const int s = shape.span;
     G.lex.reserve(G.n + 1);
     G.lex2orig.reserve(G.n + 1);
@@ -68,6 +78,7 @@ inline GappedSA build_gapped_sa(const Shape& shape, std::string text) {
         }
     }
     const size_t m = G.lex.size();
+    auto t1 = Clock::now();
 
     // 2) Order-preservingly remap the distinct names to compact ranks 0..k-1.
     //    (This keeps the alphabet passed to SA-IS dense; G.lex keeps the
@@ -80,9 +91,11 @@ inline GappedSA build_gapped_sa(const Shape& shape, std::string text) {
     std::vector<int32_t> remapped(m);
     for (size_t i = 0; i < m; ++i)
         remapped[i] = (int32_t)(std::lower_bound(uniq.begin(), uniq.end(), G.lex[i]) - uniq.begin());
+    auto t2 = Clock::now();
 
     // 3) Suffix-sort the integer string directly with SA-IS.
     G.sa = sais_int(remapped, G.alphabet_size);
+    auto t3 = Clock::now();
 
     // 4) Kasai LCP in symbol space.
     std::vector<int32_t> rank(m);
@@ -98,6 +111,12 @@ inline GappedSA build_gapped_sa(const Shape& shape, std::string text) {
         } else {
             h = 0;
         }
+    }
+    auto t4 = Clock::now();
+    if (timing) {
+        std::fprintf(stderr,
+            "[timing] DisLex+name=%.1fms  remap=%.1fms  SA-IS=%.1fms  LCP=%.1fms  m=%zu sigma=%d\n",
+            ms(t0, t1), ms(t1, t2), ms(t2, t3), ms(t3, t4), m, G.alphabet_size);
     }
     return G;
 }

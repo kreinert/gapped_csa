@@ -46,6 +46,7 @@
 #include <algorithm>
 #include <queue>
 #include <string>
+#include <chrono>
 
 namespace gcsa {
 
@@ -80,11 +81,24 @@ class CompressedIndex {
 public:
     void build(const Shape& shape, std::string text,
                int max_add = 8, CompressAlgo algo = CompressAlgo::Greedy) {
+        using Clock = std::chrono::steady_clock;
+        const bool timing = (std::getenv("GCSA_TIMING") != nullptr);
+        auto t0 = Clock::now();
         G_ = build_gapped_sa(shape, std::move(text));
+        auto t1 = Clock::now();
         span_ = shape.span;
         max_add_ = std::max(1, max_add);
         algo_ = algo;
         compress_();
+        auto t2 = Clock::now();
+        if (timing) {
+            auto ms = [](Clock::time_point a, Clock::time_point b) {
+                return std::chrono::duration<double, std::milli>(b - a).count();
+            };
+            std::fprintf(stderr,
+                "[timing] gapped_sa=%.1fms  compress(%s)=%.1fms  m=%zu intervals~kmers later\n",
+                ms(t0, t1), algo_name(algo_), ms(t1, t2), G_.m());
+        }
     }
 
     CompressAlgo algo() const { return algo_; }
@@ -139,6 +153,9 @@ private:
     std::vector<int32_t> rank_of_;
     std::vector<uint8_t> removed_;
     std::vector<int32_t> pin_count_;   // #accepted candidates using this rank as source
+    std::vector<uint64_t> pin_owner_;  // one owner name when pin_count==1 (undef if 0)
+    size_t kept_count_ = 0;            // #ranks with removed_==0
+    int last_pin_path_ = 0;            // 0=none 1=fast 2=multi (debug/timing)
 
     struct Interval { uint64_t name; int32_t lo, hi; };
     struct Candidate {
@@ -148,6 +165,15 @@ private:
         int32_t src_lo = 0, src_hi = 0;
         std::vector<int32_t> covered;   // ranks of I_c, in source order
         int coverage() const { return (int)covered.size(); }
+    };
+
+    // Undo record for a successful try_accept_with_retarget_ (surgical, not O(n)).
+    struct RetargetUndo {
+        bool had_old_self = false;
+        Candidate old_self;
+        std::vector<Candidate> old_deps;   // deps before retarget
+        Candidate applied;
+        std::vector<uint64_t> retargeted;  // names of old_deps / new deps
     };
 
     int64_t pred_lexpos_(int32_t r, int add) const {
@@ -229,18 +255,56 @@ private:
 
     // ---- accept / revoke helpers ------------------------------------------
     void accept_(Candidate& c, std::unordered_map<uint64_t, Candidate>& accepted) {
-        for (int32_t r = c.src_lo; r < c.src_hi; ++r) ++pin_count_[r];
-        for (int32_t r : c.covered) removed_[r] = 1;
-        accepted[c.name] = c;
+        for (int32_t r = c.src_lo; r < c.src_hi; ++r) {
+            if (pin_count_[r] == 0) pin_owner_[r] = c.name;
+            ++pin_count_[r];
+        }
+        for (int32_t r : c.covered) {
+            if (!removed_[r]) {
+                removed_[r] = 1;
+                --kept_count_;
+            } else {
+                removed_[r] = 1;
+            }
+        }
+        accepted[c.name] = std::move(c);
     }
 
     void revoke_(uint64_t name, std::unordered_map<uint64_t, Candidate>& accepted) {
         auto it = accepted.find(name);
         if (it == accepted.end()) return;
         Candidate& c = it->second;
-        for (int32_t r = c.src_lo; r < c.src_hi; ++r) --pin_count_[r];
-        for (int32_t r : c.covered) removed_[r] = 0;
+        for (int32_t r = c.src_lo; r < c.src_hi; ++r) {
+            --pin_count_[r];
+            if (pin_count_[r] == 0) {
+                pin_owner_[r] = 0;
+            } else if (pin_owner_[r] == name) {
+                // Rare multi-pin: pick any remaining owner of r.
+                pin_owner_[r] = 0;
+                for (const auto& kv : accepted) {
+                    if (kv.first == name) continue;
+                    if (r >= kv.second.src_lo && r < kv.second.src_hi) {
+                        pin_owner_[r] = kv.first;
+                        break;
+                    }
+                }
+            }
+        }
+        for (int32_t r : c.covered) {
+            if (removed_[r]) {
+                removed_[r] = 0;
+                ++kept_count_;
+            }
+        }
         accepted.erase(it);
+    }
+
+    void undo_retarget_(RetargetUndo& u,
+                        std::unordered_map<uint64_t, Candidate>& accepted) {
+        revoke_(u.applied.name, accepted);
+        for (uint64_t nm : u.retargeted) revoke_(nm, accepted);
+        for (auto& d : u.old_deps) accept_(d, accepted);
+        if (u.had_old_self) accept_(u.old_self, accepted);
     }
 
     // Can we retarget dependent D through new candidate W_cand?
@@ -266,46 +330,84 @@ private:
 
     // Try to accept `cand` for its target, retargeting any dependents that
     // currently pin ranks inside cand.covered. Returns true on success.
-    bool try_accept_with_retarget_(Candidate cand,
+    // If undo_out != nullptr, fills a surgical undo record (no O(n) snapshots).
+    bool try_accept_with_retarget_(const Candidate& cand,
                                    std::unordered_map<uint64_t, Candidate>& accepted,
-                                   const std::vector<Interval>& /*intervals*/) {
+                                   const std::vector<Interval>& /*intervals*/,
+                                   RetargetUndo* undo_out = nullptr) {
         // Covered ranks must not already be removed.
         for (int32_t r : cand.covered) if (removed_[r]) return false;
         // Source must be kept.
         if (!run_kept_(cand.src_lo, cand.src_hi)) return false;
-        // Source must be disjoint from target (already true from enum).
-        // Find dependents whose source intersects cand.covered.
-        std::vector<uint64_t> to_retarget;
-        for (auto& kv : accepted) {
-            const Candidate& d = kv.second;
-            // Intersection of [d.src_lo,d.src_hi) with cand.covered (as a set of ranks)?
-            // Fast path: any pin in cand.covered means some dependent uses it.
-            bool hits = false;
-            for (int32_t r : cand.covered) if (pin_count_[r] > 0) {
-                // Check if this dependent's source contains r.
-                if (r >= d.src_lo && r < d.src_hi) { hits = true; break; }
-            }
-            if (!hits) continue;
-            int32_t nlo, nhi;
-            if (!can_retarget_(d, cand, nlo, nhi)) return false;
-            to_retarget.push_back(kv.first);
-        }
 
-        // Also: covered ranks that are pinned must ALL belong to retargetable deps
-        // (no leftover pin from a dep we can't retarget — already enforced above).
+        // Collect dependents whose source intersects cand.covered.
+        std::vector<int32_t> pinned;
+        pinned.reserve(8);
+        bool multi_pin = false;
         for (int32_t r : cand.covered) {
             if (pin_count_[r] == 0) continue;
-            // Every pin on r must be from a dep in to_retarget.
-            // pin_count only tells cardinality; verify each accepted dep that
-            // uses r is in to_retarget.
+            pinned.push_back(r);
+            if (pin_count_[r] > 1) multi_pin = true;
+        }
+        last_pin_path_ = pinned.empty() ? 0 : (multi_pin ? 2 : 1);
+
+        std::vector<uint64_t> to_retarget;
+        if (!pinned.empty() && !multi_pin) {
+            // Fast path: each pinned covered rank has a unique owner.
+            std::unordered_set<uint64_t> deps;
+            for (int32_t r : pinned) deps.insert(pin_owner_[r]);
+            to_retarget.assign(deps.begin(), deps.end());
+            for (uint64_t nm : to_retarget) {
+                auto it = accepted.find(nm);
+                if (it == accepted.end()) return false;
+                int32_t nlo, nhi;
+                if (!can_retarget_(it->second, cand, nlo, nhi)) return false;
+            }
+        } else if (!pinned.empty()) {
+            // Multi-pin: scan accepted once against the (usually small) pinned list.
+            std::unordered_set<uint64_t> deps;
             for (auto& kv : accepted) {
                 const Candidate& d = kv.second;
-                if (r >= d.src_lo && r < d.src_hi) {
-                    if (std::find(to_retarget.begin(), to_retarget.end(), kv.first)
-                        == to_retarget.end())
-                        return false;
+                for (int32_t r : pinned) {
+                    if (r >= d.src_lo && r < d.src_hi) {
+                        deps.insert(kv.first);
+                        break;
+                    }
                 }
             }
+            // Every pin on a covered rank must come from a collected dep.
+            for (int32_t r : pinned) {
+                int seen = 0;
+                for (uint64_t nm : deps) {
+                    auto it = accepted.find(nm);
+                    if (it == accepted.end()) continue;
+                    const Candidate& d = it->second;
+                    if (r >= d.src_lo && r < d.src_hi) ++seen;
+                }
+                if (seen != pin_count_[r]) return false;
+            }
+            to_retarget.assign(deps.begin(), deps.end());
+            for (uint64_t nm : to_retarget) {
+                auto it = accepted.find(nm);
+                if (it == accepted.end()) return false;
+                int32_t nlo, nhi;
+                if (!can_retarget_(it->second, cand, nlo, nhi)) return false;
+            }
+        }
+
+        // Snapshot surgical undo state before mutating.
+        if (undo_out) {
+            undo_out->had_old_self = false;
+            undo_out->old_deps.clear();
+            undo_out->retargeted = to_retarget;
+            auto it_old = accepted.find(cand.name);
+            if (it_old != accepted.end()) {
+                undo_out->had_old_self = true;
+                undo_out->old_self = it_old->second;
+            }
+            for (uint64_t nm : to_retarget)
+                undo_out->old_deps.push_back(accepted[nm]);
+            undo_out->applied = cand;
         }
 
         // If this name already has an offset, revoke it first (we'll replace).
@@ -313,6 +415,7 @@ private:
 
         // Retarget dependents: revoke + re-accept with updated src/add.
         std::vector<Candidate> retargeted;
+        retargeted.reserve(to_retarget.size());
         for (uint64_t nm : to_retarget) {
             Candidate d = accepted[nm];
             int32_t nlo, nhi;
@@ -324,14 +427,19 @@ private:
             retargeted.push_back(std::move(d));
         }
 
-        accept_(cand, accepted);
+        Candidate applied = cand;
+        accept_(applied, accepted);
         for (auto& d : retargeted) accept_(d, accepted);
+        if (undo_out) undo_out->applied = accepted[cand.name];
         return true;
     }
 
     // ---- algorithms -------------------------------------------------------
     void compress_greedy_(const std::vector<Interval>& intervals,
                           std::unordered_map<uint64_t, Candidate>& accepted) {
+        using Clock = std::chrono::steady_clock;
+        const bool timing = (std::getenv("GCSA_TIMING") != nullptr);
+        auto t0 = Clock::now();
         std::vector<const Interval*> order;
         for (const auto& iv : intervals) if (iv.hi - iv.lo > 1) order.push_back(&iv);
         std::sort(order.begin(), order.end(),
@@ -372,10 +480,18 @@ private:
             if (c.coverage() < 2) continue;
             accept_(c, accepted);
         }
+        if (timing) {
+            double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+            std::fprintf(stderr, "[timing] greedy: %.1fms  (#I>1=%zu accepted=%zu)\n",
+                         ms, order.size(), accepted.size());
+        }
     }
 
     void compress_dep_order_(const std::vector<Interval>& intervals,
                              std::unordered_map<uint64_t, Candidate>& accepted) {
+        using Clock = std::chrono::steady_clock;
+        const bool timing = (std::getenv("GCSA_TIMING") != nullptr);
+        auto t_all = Clock::now();
         // Preferred candidate per interval (ignore availability — global best).
         struct Pref { const Interval* iv; Candidate cand; uint64_t src_name; };
         std::vector<Pref> prefs;
@@ -384,6 +500,7 @@ private:
             id_of[intervals[i].name] = (int)i;
         const int N = (int)intervals.size();
 
+        auto t0 = Clock::now();
         for (const auto& iv : intervals) {
             if (iv.hi - iv.lo <= 1) continue;
             Candidate c = best_candidate_(iv.name, iv.lo, iv.hi, /*avail=*/false);
@@ -391,6 +508,7 @@ private:
             uint64_t src_name = name_of_rank_(c.src_lo);
             prefs.push_back({&iv, std::move(c), src_name});
         }
+        auto t1 = Clock::now();
 
         // DAG edge: src_name -> target_name (target depends on source).
         std::vector<std::vector<int>> outs(N), ins(N);
@@ -464,6 +582,7 @@ private:
 
         // Pass 1: accept preferred candidates in reverse topo (sinks first),
         // with availability. This pins sources that dependents need.
+        auto t2 = Clock::now();
         int step = 0;
         for (int k = N - 1; k >= 0; --k) {
             uint64_t name = intervals[topo[k]].name;
@@ -482,6 +601,7 @@ private:
             if (c.coverage() < 2) continue;
             accept_(c, accepted);
         }
+        auto t3 = Clock::now();
         if (trace) {
             size_t kept = 0; for (auto x : removed_) if (!x) ++kept;
             std::fprintf(stderr, "after Phase I: kept=%zu accepted=%zu\n", kept, accepted.size());
@@ -491,6 +611,10 @@ private:
         // (including former sources) via deeper candidates, retargeting deps.
         bool changed = true;
         int guard = 0;
+        size_t phase2_enum = 0, phase2_tries = 0;
+        size_t phase2_fail = 0, phase2_improve = 0;
+        size_t phase2_fast_pin = 0, phase2_multi_pin = 0, phase2_no_pin = 0;
+        double ms_enum = 0, ms_try = 0;
         while (changed && guard++ < N + 5) {
             changed = false;
             // Try larger intervals first for bigger wins.
@@ -504,8 +628,11 @@ private:
                 // Enumerate available candidates that may require retargeting:
                 // temporarily ignore pin_count on covered (enumerate without
                 // avail), then filter with try_accept_with_retarget_.
+                auto te0 = Clock::now();
                 auto cands = enumerate_candidates_(ivp->name, ivp->lo, ivp->hi,
                                                    /*require_avail=*/false);
+                if (timing) ms_enum += std::chrono::duration<double, std::milli>(Clock::now() - te0).count();
+                ++phase2_enum;
                 // Prefer higher coverage, then deeper add.
                 std::sort(cands.begin(), cands.end(), [](const Candidate& a, const Candidate& b){
                     if (a.coverage() != b.coverage()) return a.coverage() > b.coverage();
@@ -523,56 +650,63 @@ private:
                     bool ok = true;
                     for (int32_t r : c.covered) if (removed_[r]) { ok = false; break; }
                     if (!ok) continue;
-                    // Snapshot to allow revert on failure — try_accept mutates.
-                    // (try_accept_with_retarget_ is transactional on failure.)
-                    // Count kept positions before.
-                    size_t before = 0;
-                    for (uint8_t x : removed_) if (!x) ++before;
 
-                    // Need a deep copy of accepted for rollback.
-                    auto acc_snap = accepted;
-                    auto rem_snap = removed_;
-                    auto pin_snap = pin_count_;
+                    // try_accept is transactional on failure (no mutation).
+                    // Successful tries always keep: we only consider cov > cur_cov,
+                    // so the old O(n) snapshot / surgical-undo rollback path is dead.
+                    size_t before = kept_count_;
+                    ++phase2_tries;
 
-                    if (!try_accept_with_retarget_(c, accepted, intervals)) {
-                        accepted = std::move(acc_snap);
-                        removed_ = std::move(rem_snap);
-                        pin_count_ = std::move(pin_snap);
+                    auto tt0 = Clock::now();
+                    bool accepted_ok = try_accept_with_retarget_(c, accepted, intervals,
+                                                                /*undo_out=*/nullptr);
+                    if (timing) ms_try += std::chrono::duration<double, std::milli>(Clock::now() - tt0).count();
+                    if (last_pin_path_ == 0) ++phase2_no_pin;
+                    else if (last_pin_path_ == 1) ++phase2_fast_pin;
+                    else ++phase2_multi_pin;
+                    if (!accepted_ok) {
+                        ++phase2_fail;
                         continue;
                     }
-                    size_t after = 0;
-                    for (uint8_t x : removed_) if (!x) ++after;
-                    if (after < before) {
-                        if (trace)
+                    size_t after = kept_count_;
+                    if (trace) {
+                        if (after < before)
                             std::fprintf(stderr,
                                 "II.%d IMPROVE I_%s src=I_%s[%d,%d) add=%d cov=%d  kept %zu->%zu\n",
                                 guard, name_to_string(G_.shape, ivp->name).c_str(),
                                 name_to_string(G_.shape, name_of_rank_(c.src_lo)).c_str(),
                                 c.src_lo, c.src_hi, c.add, c.coverage(), before, after);
-                        changed = true;
-                        break;   // re-sort / rescan from largest
-                    }
-                    // No improvement (e.g. replaced with equal) — keep if more
-                    // coverage on this name even if global kept count same.
-                    if (c.coverage() > cur_cov) {
-                        if (trace)
+                        else
                             std::fprintf(stderr,
                                 "II.%d REPLACE I_%s cov %d->%d (kept unchanged %zu)\n",
                                 guard, name_to_string(G_.shape, ivp->name).c_str(),
                                 cur_cov, c.coverage(), after);
-                        changed = true;
-                        break;
                     }
-                    // Roll back if no gain.
-                    accepted = std::move(acc_snap);
-                    removed_ = std::move(rem_snap);
-                    pin_count_ = std::move(pin_snap);
+                    changed = true;
+                    ++phase2_improve;
+                    break;   // continue pass; while-loop will rescan if needed
                 }
             }
         }
+        auto t4 = Clock::now();
         if (trace) {
             size_t kept = 0; for (auto x : removed_) if (!x) ++kept;
             std::fprintf(stderr, "after Phase II: kept=%zu accepted=%zu\n", kept, accepted.size());
+        }
+        if (timing) {
+            auto ms = [](Clock::time_point a, Clock::time_point b) {
+                return std::chrono::duration<double, std::milli>(b - a).count();
+            };
+            std::fprintf(stderr,
+                "[timing] dep-order prefs=%.1fms phaseI=%.1fms phaseII=%.1fms total=%.1fms\n"
+                "         N=%d prefs=%zu phaseII_iters=%d enums=%zu tries=%zu\n"
+                "         fail=%zu improve=%zu pin_path(none/fast/multi)=%zu/%zu/%zu\n"
+                "         phaseII detail: enum=%.1fms try=%.1fms\n",
+                ms(t0, t1), ms(t2, t3), ms(t3, t4), ms(t_all, t4),
+                N, prefs.size(), guard, phase2_enum, phase2_tries,
+                phase2_fail, phase2_improve,
+                phase2_no_pin, phase2_fast_pin, phase2_multi_pin,
+                ms_enum, ms_try);
         }
     }
 
@@ -597,6 +731,12 @@ private:
     // a final availability-aware greedy sweep.
     void compress_greedy_dfs_(const std::vector<Interval>& intervals,
                               std::unordered_map<uint64_t, Candidate>& accepted) {
+        using Clock = std::chrono::steady_clock;
+        const bool timing = (std::getenv("GCSA_TIMING") != nullptr);
+        auto t_all = Clock::now();
+        double score_ms = 0, grow_ms = 0;
+        size_t score_calls = 0, trees = 0, enum_calls = 0;
+
         const bool trace = (std::getenv("GCSA_TRACE_DFS") != nullptr);
         std::unordered_map<uint64_t, const Interval*> by_name;
         for (const auto& iv : intervals) by_name[iv.name] = &iv;
@@ -605,13 +745,17 @@ private:
 
         // Outbound add=+1 score for a prospective root.
         auto root_score = [&](const Interval& R) -> int {
+            auto ts = Clock::now();
             int score = 0;
             for (const auto& T : intervals) {
                 if (T.name == R.name || isize(T) <= 2) continue;
                 if (accepted.count(T.name)) continue;
+                ++enum_calls;
                 Candidate c = best_add1_from_(T, R, /*avail=*/false);
                 if (c.coverage() >= 2) score += c.coverage();
             }
+            score_ms += std::chrono::duration<double, std::milli>(Clock::now() - ts).count();
+            ++score_calls;
             return score;
         };
 
@@ -650,6 +794,8 @@ private:
             }
             if (!root || best <= 0) break;
 
+            auto tg0 = Clock::now();
+            ++trees;
             is_root.insert(root->name);
             if (trace)
                 std::fprintf(stderr, "DFS root=I_%s size=%d outbound_cov=%d\n",
@@ -679,6 +825,7 @@ private:
                 for (const auto& T : intervals) {
                     if (T.name == root->name || isize(T) <= 2) continue;
                     if (accepted.count(T.name)) continue;
+                    ++enum_calls;
                     Candidate link = best_add1_from_(T, *root, /*avail=*/true);
                     if (link.coverage() < 2) continue;
                     kids.push_back(std::move(link));
@@ -716,6 +863,7 @@ private:
                     if (isize(U) <= 2) continue;
                     if (accepted.count(U.name) || is_root.count(U.name)) continue;
                     // Link U <- P with add=1 (ignore avail; compose handles pins).
+                    ++enum_calls;
                     Candidate link = best_add1_from_(U, *P, /*avail=*/false);
                     if (link.coverage() < 2) continue;
                     kids.push_back(std::move(link));
@@ -744,9 +892,11 @@ private:
                             name_to_string(G_.shape, fr.name).c_str());
                 }
             }
+            grow_ms += std::chrono::duration<double, std::milli>(Clock::now() - tg0).count();
         }
 
         // Leftover sweep: classic size-greedy on remaining intervals.
+        auto tl0 = Clock::now();
         std::vector<const Interval*> order;
         for (const auto& iv : intervals)
             if (isize(iv) > 1 && !accepted.count(iv.name)) order.push_back(&iv);
@@ -762,10 +912,20 @@ private:
                     name_to_string(G_.shape, name_of_rank_(c.src_lo)).c_str(),
                     c.add, c.coverage());
         }
+        auto tl1 = Clock::now();
         if (trace) {
             size_t kept = 0; for (auto x : removed_) if (!x) ++kept;
             std::fprintf(stderr, "greedy-dfs done: kept=%zu accepted=%zu roots=%zu\n",
                          kept, accepted.size(), is_root.size());
+        }
+        if (timing) {
+            double leftover_ms = std::chrono::duration<double, std::milli>(tl1 - tl0).count();
+            double total_ms = std::chrono::duration<double, std::milli>(tl1 - t_all).count();
+            std::fprintf(stderr,
+                "[timing] greedy-dfs score=%.1fms grow=%.1fms leftover=%.1fms total=%.1fms\n"
+                "         trees=%zu score_calls=%zu best_add1_enums=%zu #I=%zu\n",
+                score_ms, grow_ms, leftover_ms, total_ms,
+                trees, score_calls, enum_calls, intervals.size());
         }
     }
 
@@ -775,6 +935,8 @@ private:
         for (size_t r = 0; r < m; ++r) rank_of_[G_.sa[r]] = (int32_t)r;
         removed_.assign(m, 0);
         pin_count_.assign(m, 0);
+        pin_owner_.assign(m, 0);
+        kept_count_ = m;
         table_.clear();
         C_.clear();
 
