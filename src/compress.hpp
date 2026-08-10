@@ -440,6 +440,7 @@ private:
         using Clock = std::chrono::steady_clock;
         const bool timing = (std::getenv("GCSA_TIMING") != nullptr);
         auto t0 = Clock::now();
+        std::fprintf(stderr, "[greedy] size-order accept...\n");
         std::vector<const Interval*> order;
         for (const auto& iv : intervals) if (iv.hi - iv.lo > 1) order.push_back(&iv);
         std::sort(order.begin(), order.end(),
@@ -480,6 +481,7 @@ private:
             if (c.coverage() < 2) continue;
             accept_(c, accepted);
         }
+        std::fprintf(stderr, "[greedy] size-order accept done\n");
         if (timing) {
             double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
             std::fprintf(stderr, "[timing] greedy: %.1fms  (#I>1=%zu accepted=%zu)\n",
@@ -500,6 +502,7 @@ private:
             id_of[intervals[i].name] = (int)i;
         const int N = (int)intervals.size();
 
+        std::fprintf(stderr, "[dep-order] preference / DAG build...\n");
         auto t0 = Clock::now();
         for (const auto& iv : intervals) {
             if (iv.hi - iv.lo <= 1) continue;
@@ -572,6 +575,7 @@ private:
             });
             for (int u : rest) topo.push_back(u);
         }
+        std::fprintf(stderr, "[dep-order] preference / DAG done\n");
 
         if (trace) {
             std::fprintf(stderr, "=== Phase I accept order (reverse topo, sinks first) ===\n  ");
@@ -586,6 +590,7 @@ private:
 
         // Pass 1: accept preferred candidates in reverse topo (sinks first),
         // with availability. This pins sources that dependents need.
+        std::fprintf(stderr, "[dep-order] Phase I: reverse-topo accept...\n");
         auto t2 = Clock::now();
         int step = 0;
         for (int k = N - 1; k >= 0; --k) {
@@ -606,6 +611,7 @@ private:
             accept_(c, accepted);
         }
         auto t3 = Clock::now();
+        std::fprintf(stderr, "[dep-order] Phase I done\n");
         if (trace) {
             size_t kept = 0; for (auto x : removed_) if (!x) ++kept;
             std::fprintf(stderr, "after Phase I: kept=%zu accepted=%zu\n", kept, accepted.size());
@@ -613,6 +619,7 @@ private:
 
         // Pass 2: fixed-point un-pin — try to compress intervals further
         // (including former sources) via deeper candidates, retargeting deps.
+        std::fprintf(stderr, "[dep-order] Phase II: unpin/retarget...\n");
         bool changed = true;
         int guard = 0;
         size_t phase2_enum = 0, phase2_tries = 0;
@@ -693,6 +700,7 @@ private:
             }
         }
         auto t4 = Clock::now();
+        std::fprintf(stderr, "[dep-order] Phase II done\n");
         if (trace) {
             size_t kept = 0; for (auto x : removed_) if (!x) ++kept;
             std::fprintf(stderr, "after Phase II: kept=%zu accepted=%zu\n", kept, accepted.size());
@@ -783,6 +791,7 @@ private:
         std::unordered_set<uint64_t> is_root;  // roots stay stored (no offset)
 
         // Grow as many DFS trees as profitable.
+        std::fprintf(stderr, "[greedy-dfs] DFS trees (score+grow)...\n");
         while (true) {
             const Interval* root = nullptr;
             int best = 0;
@@ -898,8 +907,10 @@ private:
             }
             grow_ms += std::chrono::duration<double, std::milli>(Clock::now() - tg0).count();
         }
+        std::fprintf(stderr, "[greedy-dfs] DFS trees done\n");
 
         // Leftover sweep: classic size-greedy on remaining intervals.
+        std::fprintf(stderr, "[greedy-dfs] leftover greedy sweep...\n");
         auto tl0 = Clock::now();
         std::vector<const Interval*> order;
         for (const auto& iv : intervals)
@@ -917,6 +928,7 @@ private:
                     c.add, c.coverage());
         }
         auto tl1 = Clock::now();
+        std::fprintf(stderr, "[greedy-dfs] leftover sweep done\n");
         if (trace) {
             size_t kept = 0; for (auto x : removed_) if (!x) ++kept;
             std::fprintf(stderr, "greedy-dfs done: kept=%zu accepted=%zu roots=%zu\n",
@@ -944,6 +956,8 @@ private:
         table_.clear();
         C_.clear();
 
+        std::fprintf(stderr, "[%s] compressing...\n", algo_name(algo_));
+
         std::vector<Interval> intervals;
         for (size_t r = 0; r < m; ) {
             uint64_t name = G_.first_symbol((int32_t)r);
@@ -962,6 +976,7 @@ private:
             compress_greedy_(intervals, accepted);
 
         // Build C and hash table.
+        std::fprintf(stderr, "[%s] finalize: build C / hash table...\n", algo_name(algo_));
         rank_to_C_.assign(m, -1);
         C_.reserve(m);
         for (size_t r = 0; r < m; ++r) {
@@ -989,6 +1004,7 @@ private:
             if (cnt > 0) { e.has_rest = true; e.rest_pos = (uint64_t)first; e.rest_num = cnt; }
             table_.emplace(iv.name, e);
         }
+        std::fprintf(stderr, "[%s] finalize done\n", algo_name(algo_));
     }
 };
 
