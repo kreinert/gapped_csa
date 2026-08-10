@@ -511,6 +511,8 @@ private:
         auto t1 = Clock::now();
 
         // DAG edge: src_name -> target_name (target depends on source).
+        // Only introduce an edge when the preferred candidate has cov >= 3
+        // (weak cov=2 prefs still participate in Phase I/II acceptance).
         std::vector<std::vector<int>> outs(N), ins(N);
         std::vector<int> indeg(N, 0);
         auto pref_of = [&](uint64_t name) -> Pref* {
@@ -518,6 +520,7 @@ private:
             return nullptr;
         };
         for (auto& p : prefs) {
+            if (p.cand.coverage() < 3) continue;   // no preference-DAG edge for cov < 3
             int t = id_of[p.iv->name];
             auto it = id_of.find(p.src_name);
             if (it == id_of.end()) continue;
@@ -536,8 +539,9 @@ private:
                     name_to_string(G_.shape, p.iv->name).c_str(),
                     name_to_string(G_.shape, p.src_name).c_str(),
                     p.cand.add, p.cand.coverage(), p.cand.src_lo, p.cand.src_hi);
-            std::fprintf(stderr, "=== DAG edges (src -> target) ===\n");
+            std::fprintf(stderr, "=== DAG edges (src -> target, cov>=3) ===\n");
             for (auto& p : prefs) {
+                if (p.cand.coverage() < 3) continue;
                 if (p.iv->name == p.src_name) continue;
                 std::fprintf(stderr, "  %s -> %s\n",
                     name_to_string(G_.shape, p.src_name).c_str(),

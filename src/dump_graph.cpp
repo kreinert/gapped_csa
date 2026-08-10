@@ -135,8 +135,9 @@ int main(int argc, char** argv) {
         std::cout << "]\n";
     }
 
-    std::cout << "\n=== Dependency DAG  (edge: source_kmer → target_kmer) ===\n";
-    std::cout << "Meaning: target prefers a differential source inside source_kmer.\n\n";
+    std::cout << "\n=== Dependency DAG  (edge: source_kmer → target_kmer, cov>=3) ===\n";
+    std::cout << "Meaning: target prefers a differential source inside source_kmer.\n"
+              << "Edges only for preferred candidates with coverage >= 3.\n\n";
 
     // Collect all nodes that appear
     std::map<std::string, std::vector<std::string>> outs;
@@ -144,6 +145,7 @@ int main(int argc, char** argv) {
     for (auto& c : prefs) {
         indeg[c.kmer]; // ensure node
         indeg[c.src_kmer];
+        if (c.coverage < 3) continue;  // no preference-DAG edge for cov < 3
         if (c.kmer == c.src_kmer) continue;
         outs[c.src_kmer].push_back(c.kmer + "(add=" + std::to_string(c.add)
                                    + ",cov=" + std::to_string(c.coverage) + ")");
@@ -157,6 +159,7 @@ int main(int argc, char** argv) {
         indeg[c.src_kmer] = 0;
     }
     for (auto& c : prefs) {
+        if (c.coverage < 3) continue;
         if (c.kmer == c.src_kmer) continue;
         indeg[c.kmer]++;
     }
@@ -198,6 +201,7 @@ int main(int argc, char** argv) {
     std::cout << "\n=== Mermaid diagram ===\n";
     std::cout << "```mermaid\nflowchart LR\n";
     for (auto& c : prefs) {
+        if (c.coverage < 3) continue;
         if (c.kmer == c.src_kmer) continue;
         std::cout << "  " << c.src_kmer << " -->|add=" << c.add
                   << " cov=" << c.coverage << "| " << c.kmer << "\n";
