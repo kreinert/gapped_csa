@@ -525,6 +525,7 @@ int main(int argc, char** argv) {
     size_t Cf = heuristic_C(sh, text, max_add, CompressAlgo::GreedyDfs);
     size_t Ct = heuristic_C(sh, text, max_add, CompressAlgo::TreeDp);
     size_t Ct2 = heuristic_C(sh, text, max_add, CompressAlgo::TreeDp2);
+    size_t Cp = heuristic_C(sh, text, max_add, CompressAlgo::ProductGreedy);
 
     IlpSolution sol = solve_with_external(lp_out, P, n_vars, n_cons);
 
@@ -535,7 +536,8 @@ int main(int argc, char** argv) {
                   << " dep-order=" << Cd
                   << " greedy-dfs=" << Cf
                   << " tree-dp=" << Ct
-                  << " tree-dp2=" << Ct2 << "\n"
+                  << " tree-dp2=" << Ct2
+                  << " product-greedy=" << Cp << "\n"
                   << "Open " << lp_out << " with cbc/glpsol/gurobi to get optimal |C|.\n";
         return 2;
     }
@@ -560,12 +562,14 @@ int main(int argc, char** argv) {
               << " dep-order=" << Cd
               << " greedy-dfs=" << Cf
               << " tree-dp=" << Ct
-              << " tree-dp2=" << Ct2 << "\n"
+              << " tree-dp2=" << Ct2
+              << " product-greedy=" << Cp << "\n"
               << "gap vs opt (%): greedy=" << gap(Cg)
               << " dep-order=" << gap(Cd)
               << " greedy-dfs=" << gap(Cf)
               << " tree-dp=" << gap(Ct)
-              << " tree-dp2=" << gap(Ct2) << "\n"
+              << " tree-dp2=" << gap(Ct2)
+              << " product-greedy=" << gap(Cp) << "\n"
               << "self-check: " << (ok ? "OK" : ("FAIL (" + err + ")")) << "\n";
 
     return ok ? 0 : 3;

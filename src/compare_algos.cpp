@@ -1,8 +1,8 @@
 // compare_algos.cpp
 //
 // Side-by-side comparison of CompressAlgo::Greedy, DepOrder, GreedyDfs,
-// TreeDp, TreeDp2 on the note's #.# example, the GCCTTTAAAG×3 demo, short
-// repetitive DNA, and the weight-30 repetition suite.
+// TreeDp, TreeDp2, ProductGreedy on the note's #.# example, the GCCTTTAAAG×3
+// demo, short repetitive DNA, and the weight-30 repetition suite.
 //
 // Build:  make compare_algos
 // Usage:  ./compare_algos [--min-rep N] [--max-rep N] [--step S] [--seed S]
@@ -121,27 +121,32 @@ static void print_header() {
               << std::setw(6)  << "t%"
               << std::setw(7)  << "t2|C|"
               << std::setw(6)  << "t2%"
-              << std::setw(12) << "best"
+              << std::setw(7)  << "p|C|"
+              << std::setw(6)  << "p%"
+              << std::setw(14) << "best"
               << std::setw(4)  << "g"
               << std::setw(4)  << "d"
               << std::setw(4)  << "f"
               << std::setw(4)  << "t"
               << std::setw(4)  << "t2"
+              << std::setw(4)  << "p"
               << "\n";
 }
 
-// g=greedy, d=dep-order, f=greedy-dfs, t=tree-dp, t2=tree-dp2 (no Phase II)
+// g=greedy, d=dep-order, f=greedy-dfs, t=tree-dp, t2=tree-dp2, p=product-greedy
 static void print_row(const std::string& tag,
                       const Result& g, const Result& d,
-                      const Result& f, const Result& t, const Result& t2) {
-    size_t bC = std::min({g.C, d.C, f.C, t.C, t2.C});
+                      const Result& f, const Result& t, const Result& t2,
+                      const Result& p) {
+    size_t bC = std::min({g.C, d.C, f.C, t.C, t2.C, p.C});
     std::string best;
     if (g.C == bC) best += (best.empty() ? "" : "/") + std::string("g");
     if (d.C == bC) best += (best.empty() ? "" : "/") + std::string("d");
     if (f.C == bC) best += (best.empty() ? "" : "/") + std::string("f");
     if (t.C == bC) best += (best.empty() ? "" : "/") + std::string("t");
     if (t2.C == bC) best += (best.empty() ? "" : "/") + std::string("t2");
-    if (best == "g/d/f/t/t2") best = "tie";
+    if (p.C == bC) best += (best.empty() ? "" : "/") + std::string("p");
+    if (best == "g/d/f/t/t2/p") best = "tie";
 
     auto ok = [](const Result& r) { return (r.ok && r.rt) ? "ok" : "FAIL"; };
     std::cout << std::left << std::setw(28) << tag
@@ -155,38 +160,44 @@ static void print_row(const std::string& tag,
               << std::setw(6) << t.keep_pct
               << std::setw(7) << t2.C
               << std::setw(6) << t2.keep_pct
-              << std::setw(12) << best
+              << std::setw(7) << p.C
+              << std::setw(6) << p.keep_pct
+              << std::setw(14) << best
               << std::setw(4) << ok(g)
               << std::setw(4) << ok(d)
               << std::setw(4) << ok(f)
               << std::setw(4) << ok(t)
               << std::setw(4) << ok(t2)
+              << std::setw(4) << ok(p)
               << "\n";
 }
 
 struct Totals {
-    long long sum_g = 0, sum_d = 0, sum_f = 0, sum_t = 0, sum_t2 = 0;
-    int win_g = 0, win_d = 0, win_f = 0, win_t = 0, win_t2 = 0, tie = 0;
+    long long sum_g = 0, sum_d = 0, sum_f = 0, sum_t = 0, sum_t2 = 0, sum_p = 0;
+    int win_g = 0, win_d = 0, win_f = 0, win_t = 0, win_t2 = 0, win_p = 0, tie = 0;
     int fails = 0, n = 0;
 
     void add(const Result& g, const Result& d, const Result& f,
-             const Result& t, const Result& t2) {
+             const Result& t, const Result& t2, const Result& p) {
         ++n;
         sum_g += (long long)g.C;
         sum_d += (long long)d.C;
         sum_f += (long long)f.C;
         sum_t += (long long)t.C;
         sum_t2 += (long long)t2.C;
+        sum_p += (long long)p.C;
         if (!g.ok || !g.rt || !d.ok || !d.rt || !f.ok || !f.rt ||
-            !t.ok || !t.rt || !t2.ok || !t2.rt) ++fails;
-        size_t b = std::min({g.C, d.C, f.C, t.C, t2.C});
-        int winners = (g.C == b) + (d.C == b) + (f.C == b) + (t.C == b) + (t2.C == b);
+            !t.ok || !t.rt || !t2.ok || !t2.rt || !p.ok || !p.rt) ++fails;
+        size_t b = std::min({g.C, d.C, f.C, t.C, t2.C, p.C});
+        int winners = (g.C == b) + (d.C == b) + (f.C == b) + (t.C == b)
+                    + (t2.C == b) + (p.C == b);
         if (winners > 1) ++tie;
         else if (g.C == b) ++win_g;
         else if (d.C == b) ++win_d;
         else if (f.C == b) ++win_f;
         else if (t.C == b) ++win_t;
-        else ++win_t2;
+        else if (t2.C == b) ++win_t2;
+        else ++win_p;
     }
 };
 
@@ -216,10 +227,10 @@ int main(int argc, char** argv) {
         }
     }
 
-    std::cout << "Comparing greedy | dep-order | greedy-dfs | tree-dp | tree-dp2"
+    std::cout << "Comparing greedy | dep-order | greedy-dfs | tree-dp | tree-dp2 | product-greedy"
               << "  (max_add=" << max_add << ")\n"
               << "columns: g=greedy  d=dep-order  f=greedy-dfs  t=tree-dp"
-              << "  t2=tree-dp2 (no Phase II)\n\n";
+              << "  t2=tree-dp2  p=product-greedy (ℓ×len source order)\n\n";
     print_header();
 
     Totals tot;
@@ -230,9 +241,10 @@ int main(int argc, char** argv) {
         Result f = run_algo(sh, text, max_add, CompressAlgo::GreedyDfs);
         Result t = run_algo(sh, text, max_add, CompressAlgo::TreeDp);
         Result t2 = run_algo(sh, text, max_add, CompressAlgo::TreeDp2);
-        print_row(tag, g, d, f, t, t2);
+        Result p = run_algo(sh, text, max_add, CompressAlgo::ProductGreedy);
+        print_row(tag, g, d, f, t, t2, p);
         std::cout.flush();
-        tot.add(g, d, f, t, t2);
+        tot.add(g, d, f, t, t2, p);
     };
 
     // --- Hand examples -----------------------------------------------------
@@ -285,17 +297,20 @@ int main(int argc, char** argv) {
               << "  greedy-dfs=" << tot.win_f
               << "  tree-dp=" << tot.win_t
               << "  tree-dp2=" << tot.win_t2
+              << "  product-greedy=" << tot.win_p
               << "  ties/shared=" << tot.tie << "\n"
               << "total |C|:  greedy=" << tot.sum_g
               << "  dep-order=" << tot.sum_d
               << "  greedy-dfs=" << tot.sum_f
               << "  tree-dp=" << tot.sum_t
-              << "  tree-dp2=" << tot.sum_t2 << "\n"
+              << "  tree-dp2=" << tot.sum_t2
+              << "  product-greedy=" << tot.sum_p << "\n"
               << "vs greedy:  dep-order " << std::fixed << std::setprecision(2)
               << pct(tot.sum_d, tot.sum_g) << "% fewer"
               << "  greedy-dfs " << pct(tot.sum_f, tot.sum_g) << "% fewer"
               << "  tree-dp " << pct(tot.sum_t, tot.sum_g) << "% fewer"
-              << "  tree-dp2 " << pct(tot.sum_t2, tot.sum_g) << "% fewer\n"
+              << "  tree-dp2 " << pct(tot.sum_t2, tot.sum_g) << "% fewer"
+              << "  product-greedy " << pct(tot.sum_p, tot.sum_g) << "% fewer\n"
               << "correctness failures: " << tot.fails << "\n";
     return tot.fails ? 1 : 0;
 }

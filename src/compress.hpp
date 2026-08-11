@@ -37,6 +37,9 @@
 //               for each source hub, choose KEEP vs COMPRESS knowing how
 //               dependents' costs change; then Phase II unpin/retarget.
 //   TreeDp2   – same as TreeDp but without Phase II (forest DP + accept + leftover).
+//   ProductGreedy – source-centric: enumerate SA LCP-intervals, process in
+//               descending (ℓ × length) order, pin each as a source and try
+//               differential links with add = 1..ℓ (no Phase II; like Greedy).
 
 #pragma once
 
@@ -102,20 +105,22 @@ inline void gcsa_parallel_for(size_t n, Fn&& fn) {
 }
 
 enum class CompressAlgo {
-    Greedy,    // size-first, pin sources
-    DepOrder,  // dependency-order + un-pin / retarget
-    GreedyDfs, // DFS from best add=+1 hub, cumulative add to root
-    TreeDp,    // preference-forest DP (KEEP vs COMPRESS per hub) + Phase II
-    TreeDp2,   // same as TreeDp without Phase II
+    Greedy,        // size-first, pin sources
+    DepOrder,      // dependency-order + un-pin / retarget
+    GreedyDfs,     // DFS from best add=+1 hub, cumulative add to root
+    TreeDp,        // preference-forest DP (KEEP vs COMPRESS per hub) + Phase II
+    TreeDp2,       // same as TreeDp without Phase II
+    ProductGreedy, // LCP-interval product (ℓ×len) source-greedy; no Phase II
 };
 
 inline const char* algo_name(CompressAlgo a) {
     switch (a) {
-        case CompressAlgo::Greedy:   return "greedy";
-        case CompressAlgo::DepOrder: return "dep-order";
-        case CompressAlgo::GreedyDfs: return "greedy-dfs";
-        case CompressAlgo::TreeDp:   return "tree-dp";
-        case CompressAlgo::TreeDp2:  return "tree-dp2";
+        case CompressAlgo::Greedy:        return "greedy";
+        case CompressAlgo::DepOrder:      return "dep-order";
+        case CompressAlgo::GreedyDfs:     return "greedy-dfs";
+        case CompressAlgo::TreeDp:        return "tree-dp";
+        case CompressAlgo::TreeDp2:       return "tree-dp2";
+        case CompressAlgo::ProductGreedy: return "product-greedy";
     }
     return "?";
 }
@@ -275,6 +280,16 @@ private:
         int64_t y = x - add;
         if (y < 0) return -1;
         if (G_.lex2orig[y] != G_.lex2orig[x] - (int64_t)add * span_) return -1;
+        return y;
+    }
+
+    // Inverse of pred_lexpos_: lextext position add symbols after sa[r], if the
+    // original-text shift is exactly +add*span (same residue class / window).
+    int64_t succ_lexpos_(int32_t r, int add) const {
+        int64_t x = G_.sa[r];
+        int64_t y = x + add;
+        if (y >= (int64_t)G_.m()) return -1;
+        if (G_.lex2orig[y] != G_.lex2orig[x] + (int64_t)add * span_) return -1;
         return y;
     }
 
@@ -867,6 +882,225 @@ private:
             double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
             std::fprintf(stderr, "[timing] greedy: %.1fms  (#I>1=%zu accepted=%zu)\n",
                          ms, order.size(), accepted.size());
+        }
+    }
+
+    // Abouelhoda-style LCP-interval: [lo, hi) with value ℓ means
+    //   min_{k=lo+1..hi-1} lcp[k] = ℓ, and the interval is inclusion-maximal
+    //   for that ℓ (lcp[lo] < ℓ if lo>0; lcp[hi] < ℓ if hi<m).
+    // String depth ℓ admits differential sources with add satisfying
+    //   ℓ >= add+1  (same check as enumerate_candidates_).
+    struct LcpInterval {
+        int32_t lo = 0, hi = 0;
+        int32_t lcp = 0;  // ℓ-value
+        int32_t length() const { return hi - lo; }
+        int64_t product() const { return (int64_t)lcp * (int64_t)(hi - lo); }
+    };
+
+    // All proper LCP-intervals with ℓ >= 1 and length >= 2 (suffix-tree internals).
+    std::vector<LcpInterval> enumerate_lcp_intervals_() const {
+        const int32_t m = (int32_t)G_.m();
+        std::vector<LcpInterval> out;
+        // stack: (ℓ, left boundary). Sentinel (0, 0).
+        std::vector<std::pair<int32_t, int32_t>> st;
+        st.push_back({0, 0});
+        for (int32_t i = 1; i <= m; ++i) {
+            int32_t lb = i - 1;
+            int32_t cur = (i < m) ? G_.lcp[i] : 0;
+            while (!st.empty() && cur < st.back().first) {
+                auto top = st.back();
+                st.pop_back();
+                // Popped interval [top.second, i) with value top.first.
+                if (top.first > 0 && i - top.second >= 2)
+                    out.push_back({top.second, i, top.first});
+                lb = top.second;
+            }
+            if (st.empty() || cur > st.back().first) {
+                st.push_back({cur, lb});
+            }
+            // cur == top.ℓ: extend existing interval (left boundary unchanged).
+        }
+        return out;
+    }
+
+    // Source-centric candidates: from kept LCP-interval [s_lo,s_hi) with fixed
+    // add, emit every maximal contiguous sub-run that maps onto a name interval
+    // I_c (same validity rules as enumerate_candidates_).
+    std::vector<Candidate> candidates_from_source_(
+            int32_t s_lo, int32_t s_hi, int add,
+            const std::unordered_map<uint64_t, Interval>& by_name) const {
+        std::vector<Candidate> out;
+        if (s_hi - s_lo < kMinCoverage || add < 1) return out;
+
+        int32_t r = s_lo;
+        while (r < s_hi) {
+            int64_t y = succ_lexpos_(r, add);
+            if (y < 0) { ++r; continue; }
+            int32_t t0 = rank_of_[(size_t)y];
+            uint64_t name = G_.first_symbol(t0);
+
+            int32_t r2 = r + 1;
+            int32_t expect_t = t0 + 1;
+            while (r2 < s_hi) {
+                if (G_.lcp[r2] < add + 1) break;
+                int64_t y2 = succ_lexpos_(r2, add);
+                if (y2 < 0) break;
+                int32_t t2 = rank_of_[(size_t)y2];
+                if (t2 != expect_t) break;
+                if (G_.first_symbol(t2) != name) break;
+                ++r2;
+                ++expect_t;
+            }
+            const int cov = r2 - r;
+            const int32_t t_lo = t0, t_hi = t0 + cov;
+            const bool disjoint = (r2 <= t_lo || r >= t_hi);
+            if (disjoint && cov >= kMinCoverage) {
+                Candidate c;
+                c.name = name;
+                c.add = add;
+                c.src_lo = r;
+                c.src_hi = r2;
+                auto it = by_name.find(name);
+                if (it != by_name.end()) {
+                    c.target_lo = it->second.lo;
+                    c.target_hi = it->second.hi;
+                } else {
+                    c.target_lo = t_lo;
+                    c.target_hi = t_hi;
+                }
+                c.covered.reserve(cov);
+                for (int32_t t = t_lo; t < t_hi; ++t) c.covered.push_back(t);
+                out.push_back(std::move(c));
+            }
+            r = (r2 > r) ? r2 : r + 1;
+        }
+        return out;
+    }
+
+    // Product-greedy (CLI: product-greedy / pl-greedy):
+    //   1. Enumerate SA LCP-intervals (suffix-tree internal nodes).
+    //   2. Process in descending (ℓ × length); ties: smaller lo, then longer,
+    //      then larger ℓ.
+    //   3. For each still-kept interval, treat it as a pinned source hub and
+    //      try add = 1, 2, …, min(ℓ, max_add).  A tight ℓ-interval only yields
+    //      links for add ≤ ℓ−1 (need internal LCP ≥ add+1); add==ℓ is attempted
+    //      per the user's wording but finds nothing on a tight interval.
+    //   4. Accept every still-available cov≥kMinCoverage link (one offset per
+    //      name, first-wins in coverage order). Then a size-order leftover
+    //      sweep on uncompressed name intervals (like greedy-dfs leftover).
+    //      No Phase II — same family as plain Greedy.
+    void compress_product_greedy_(const std::vector<Interval>& intervals,
+                                  std::unordered_map<uint64_t, Candidate>& accepted) {
+        using Clock = std::chrono::steady_clock;
+        const bool timing = (std::getenv("GCSA_TIMING") != nullptr);
+        const bool trace = (std::getenv("GCSA_TRACE_PRODUCT") != nullptr);
+        auto t0 = Clock::now();
+
+        std::unordered_map<uint64_t, Interval> by_name;
+        by_name.reserve(intervals.size() * 2);
+        for (const auto& iv : intervals) by_name[iv.name] = iv;
+
+        std::fprintf(stderr, "[product-greedy] enumerate LCP-intervals...\n");
+        std::vector<LcpInterval> lcp_ivs = enumerate_lcp_intervals_();
+        // Only intervals that can ever source an add≥1 link (need ℓ ≥ 2).
+        lcp_ivs.erase(std::remove_if(lcp_ivs.begin(), lcp_ivs.end(),
+                        [](const LcpInterval& iv) {
+                            return iv.lcp < 2 || iv.length() < kMinCoverage;
+                        }),
+                      lcp_ivs.end());
+        std::sort(lcp_ivs.begin(), lcp_ivs.end(),
+                  [](const LcpInterval& a, const LcpInterval& b) {
+                      if (a.product() != b.product()) return a.product() > b.product();
+                      if (a.lo != b.lo) return a.lo < b.lo;
+                      if (a.length() != b.length()) return a.length() > b.length();
+                      return a.lcp > b.lcp;
+                  });
+
+        std::fprintf(stderr, "[product-greedy] product-order accept (%zu intervals)...\n",
+                     lcp_ivs.size());
+        int step = 0, used = 0;
+        for (const auto& S : lcp_ivs) {
+            ++step;
+            // Skip if already partially consumed as a target — cannot pin as source.
+            if (!run_kept_(S.lo, S.hi)) {
+                if (trace)
+                    std::fprintf(stderr, "step %d: LCP[%d,%d) ℓ=%d |I|=%d prod=%lld -> SKIP (not kept)\n",
+                                 step, S.lo, S.hi, S.lcp, S.length(),
+                                 (long long)S.product());
+                continue;
+            }
+
+            if (trace)
+                std::fprintf(stderr, "step %d: LCP[%d,%d) ℓ=%d |I|=%d prod=%lld pin+scan adds 1..%d\n",
+                             step, S.lo, S.hi, S.lcp, S.length(),
+                             (long long)S.product(),
+                             std::min(S.lcp, max_add_));
+
+            // "Pin" = reserve this run as a source hub for this step. accept_()
+            // increments pin_count_ on the chosen src sub-run; we never remove
+            // ranks inside S while scanning its adds.
+            const int add_hi = std::min(S.lcp, max_add_);
+            for (int add = 1; add <= add_hi; ++add) {
+                // Need string depth ≥ add+1; tight ℓ-interval ⇒ add ≤ ℓ−1.
+                if (S.lcp < add + 1) continue;
+
+                auto cands = candidates_from_source_(S.lo, S.hi, add, by_name);
+                std::sort(cands.begin(), cands.end(),
+                          [](const Candidate& a, const Candidate& b) {
+                              if (a.coverage() != b.coverage())
+                                  return a.coverage() > b.coverage();
+                              if (a.name != b.name) return a.name < b.name;
+                              return a.src_lo < b.src_lo;
+                          });
+                for (auto& c : cands) {
+                    if (accepted.count(c.name)) continue;
+                    if (c.coverage() < kMinCoverage) continue;
+                    if (!cand_available_(c)) continue;
+                    if (trace)
+                        std::fprintf(stderr,
+                            "  ACCEPT I_%s <- src[%d,%d) add=%d cov=%d\n",
+                            name_to_string(G_.shape, c.name).c_str(),
+                            c.src_lo, c.src_hi, c.add, c.coverage());
+                    accept_(c, accepted);
+                    ++used;
+                }
+            }
+        }
+        std::fprintf(stderr, "[product-greedy] product-order done (accepted=%zu)\n",
+                     accepted.size());
+
+        // Leftover: same size-order availability-aware sweep as plain greedy /
+        // greedy-dfs leftover — product pass is source-centric and can leave
+        // compressible name intervals untouched. Not Phase II (no unpin/retarget).
+        std::fprintf(stderr, "[product-greedy] leftover greedy sweep...\n");
+        std::vector<const Interval*> leftover;
+        for (const auto& iv : intervals) {
+            if (iv.hi - iv.lo <= 1) continue;
+            if (accepted.count(iv.name)) continue;
+            leftover.push_back(&iv);
+        }
+        std::sort(leftover.begin(), leftover.end(),
+                  [](const Interval* a, const Interval* b) {
+                      return (a->hi - a->lo) > (b->hi - b->lo);
+                  });
+        for (const Interval* ivp : leftover) {
+            Candidate c = best_candidate_(ivp->name, ivp->lo, ivp->hi, /*avail=*/true);
+            if (c.coverage() < kMinCoverage) continue;
+            if (trace)
+                std::fprintf(stderr, "leftover I_%s <- src[%d,%d) add=%d cov=%d\n",
+                    name_to_string(G_.shape, ivp->name).c_str(),
+                    c.src_lo, c.src_hi, c.add, c.coverage());
+            accept_(c, accepted);
+            ++used;
+        }
+
+        std::fprintf(stderr, "[product-greedy] done (scanned=%d accepts=%d kept=%zu)\n",
+                     step, used, kept_count_);
+        if (timing) {
+            double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+            std::fprintf(stderr,
+                "[timing] product-greedy: %.1fms  lcp_ivs=%zu accepts=%d kept=%zu\n",
+                ms, lcp_ivs.size(), used, kept_count_);
         }
     }
 
@@ -1622,6 +1856,8 @@ private:
             compress_tree_dp_(intervals, accepted, /*skip_phase2=*/false);
         else if (algo_ == CompressAlgo::TreeDp2)
             compress_tree_dp_(intervals, accepted, /*skip_phase2=*/true);
+        else if (algo_ == CompressAlgo::ProductGreedy)
+            compress_product_greedy_(intervals, accepted);
         else
             compress_greedy_(intervals, accepted);
 

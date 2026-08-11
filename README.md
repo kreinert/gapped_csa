@@ -54,15 +54,17 @@ make
 ./bench_repetition
 ./bench_repetition --min-rep 10 --max-rep 100 --step 10 --seed 1
 
-# Compare / choose compression heuristic (g / d / f / t / t2)
+# Compare / choose compression heuristic (g / d / f / t / t2 / p)
 ./compare_algos
 ./gcsa --algo greedy
 ./gcsa --algo dep-order
 ./gcsa --algo greedy-dfs          # DFS from best add=+1 hub, cumulative add
 ./gcsa --algo tree-dp             # preference-forest DP + Phase II
 ./gcsa --algo tree-dp2            # same as tree-dp without Phase II
+./gcsa --algo product-greedy      # LCP-interval ℓ×length product source-greedy (alias: pl-greedy)
 GCSA_TRACE_DFS=1 ./gcsa -g /tmp/ex.fa -s "#.#" --algo greedy-dfs
 GCSA_TRACE_DP=1  ./gcsa -g /tmp/ex.fa -s "#.#" --algo tree-dp
+GCSA_TRACE_PRODUCT=1 ./gcsa -g /tmp/ex.fa -s "#.#" --algo product-greedy
 GCSA_TIMING=1    ./gcsa -g genome.fasta -s "#####" --algo tree-dp   # stage timings
 GCSA_THREADS=8   ./gcsa -g genome.fasta -s "#####" --algo tree-dp   # parallel pref/DP (default=hw)
 # Optional Phase II dirty-generation cap (default min(|I|+5, 32); may increase |C|):
@@ -154,10 +156,13 @@ compression on a 180 kb repetitive input: `####.####` → **40% of the full SA**
 
 ## Limitations & research extensions
 
-- **Source selection**: five heuristics — `greedy`, `dep-order`, `greedy-dfs`,
+- **Source selection**: six heuristics — `greedy`, `dep-order`, `greedy-dfs`,
   `tree-dp` (preference-forest DP KEEP vs COMPRESS, then Phase II
-  unpin/retarget), and `tree-dp2` (same forest DP without Phase II).
-  Use `./gcsa --algo tree-dp2` or `./compare_algos`.
+  unpin/retarget), `tree-dp2` (same forest DP without Phase II), and
+  `product-greedy` / `pl-greedy` (enumerate SA LCP-intervals, process in
+  descending `ℓ × length` order, pin each as a source and try adds
+  `1..ℓ`, then a size-order leftover sweep; no Phase II). Use
+  `./gcsa --algo product-greedy` or `./compare_algos`.
   Tree-dp preference enumeration and per-root forest DP are parallelized via
   `std::thread` (`GCSA_THREADS=N`, default=`hardware_concurrency`). Set
   `GCSA_TIMING=1` for per-phase ms (pref / forest / dp / accept / leftover /
