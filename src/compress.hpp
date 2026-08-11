@@ -52,15 +52,53 @@
 #include <string>
 #include <chrono>
 #include <functional>
-#include <map>
 #include <utility>
 #include <limits>
+#include <thread>
+#include <atomic>
 
 namespace gcsa {
 
 // Minimum coverage to accept a compression link (all algos + Phase II).
 // Preference-forest / DAG *edges* use the same floor (see DepOrder / TreeDp).
 constexpr int kMinCoverage = 3;
+
+// Parallelism for independent work (pref enum, per-root forest DP).
+// Override with GCSA_THREADS=N (N=1 disables).
+inline int gcsa_num_threads() {
+    int n = (int)std::thread::hardware_concurrency();
+    if (n < 1) n = 1;
+    if (const char* e = std::getenv("GCSA_THREADS")) {
+        int v = std::atoi(e);
+        if (v > 0) n = v;
+    }
+    return n;
+}
+
+// Run fn(i) for i in [0, n). Uses std::thread (portable on Apple clang).
+template <class Fn>
+inline void gcsa_parallel_for(size_t n, Fn&& fn) {
+    if (n == 0) return;
+    int nt = gcsa_num_threads();
+    if (nt <= 1 || n == 1) {
+        for (size_t i = 0; i < n; ++i) fn(i);
+        return;
+    }
+    if ((size_t)nt > n) nt = (int)n;
+    std::atomic<size_t> next{0};
+    auto worker = [&]() {
+        for (;;) {
+            size_t i = next.fetch_add(1, std::memory_order_relaxed);
+            if (i >= n) break;
+            fn(i);
+        }
+    };
+    std::vector<std::thread> pool;
+    pool.reserve((size_t)nt - 1);
+    for (int t = 1; t < nt; ++t) pool.emplace_back(worker);
+    worker();
+    for (auto& th : pool) th.join();
+}
 
 enum class CompressAlgo {
     Greedy,    // size-first, pin sources
@@ -310,6 +348,25 @@ private:
 
     Candidate best_candidate_(uint64_t name, int32_t lo, int32_t hi, bool require_avail) const {
         return pick_best_(enumerate_candidates_(name, lo, hi, require_avail));
+    }
+
+    // Availability filter matching enumerate_candidates_(..., require_avail=true).
+    bool cand_available_(const Candidate& c) const {
+        if (!run_kept_(c.src_lo, c.src_hi)) return false;
+        for (int32_t r : c.covered)
+            if (removed_[r] || pin_count_[r] > 0) return false;
+        return true;
+    }
+
+    // First viable candidate from a coverage-desc / add-desc sorted list.
+    Candidate best_from_sorted_cache_(const std::vector<Candidate>& cands,
+                                      bool require_avail) const {
+        for (const auto& c : cands) {
+            if (c.coverage() < kMinCoverage) continue;
+            if (require_avail && !cand_available_(c)) continue;
+            return c;
+        }
+        return Candidate{};
     }
 
     // First-symbol name of an SA rank.
@@ -1143,6 +1200,11 @@ private:
     // (drop cov ranks via the preferred candidate; children lose that source).
     // Exact for |C| on this forest model; leftover names get an avail. greedy.
     // skip_phase2: TreeDp2 — forest DP + accept + leftover only (no unpin/retarget).
+    //
+    // Hot-path notes (large N):
+    //   - Preference enum is independent per interval → GCSA_THREADS parallel.
+    //   - cand_cache reused for leftover + Phase II (no re-enum).
+    //   - Forest DP uses dense node ids + vector memo; roots are independent.
     void compress_tree_dp_(const std::vector<Interval>& intervals,
                            std::unordered_map<uint64_t, Candidate>& accepted,
                            bool skip_phase2 = false) {
@@ -1151,60 +1213,95 @@ private:
         const bool trace = (std::getenv("GCSA_TRACE_DP") != nullptr);
         const char* label = algo_name(algo_);
         auto t_all = Clock::now();
+        const int nthreads = gcsa_num_threads();
 
         std::unordered_map<uint64_t, const Interval*> by_name;
+        by_name.reserve(intervals.size() * 2);
         for (const auto& iv : intervals) by_name[iv.name] = &iv;
 
         struct Pref { const Interval* iv; Candidate cand; uint64_t src_name; };
         std::unordered_map<uint64_t, Pref> prefs;   // target -> preferred
-        // Static (avail=false) candidate lists — reused by Phase II.
+        // Static (avail=false) candidate lists — reused by leftover + Phase II.
         // Prefs use pick_best_ on enum order (stable tie-break); Phase II wants
         // coverage-desc order, so we sort only after recording the preferred.
         std::unordered_map<uint64_t, std::vector<Candidate>> cand_cache;
 
         std::fprintf(stderr, "[%s] preference forest build...\n", label);
-        for (const auto& iv : intervals) {
-            if (iv.hi - iv.lo <= 1) continue;
+        if (timing)
+            std::fprintf(stderr, "[timing] %s pref threads=%d\n", label, nthreads);
+        auto t_pref0 = Clock::now();
+
+        std::vector<const Interval*> big_ivs;
+        big_ivs.reserve(intervals.size());
+        for (const auto& iv : intervals)
+            if (iv.hi - iv.lo > 1) big_ivs.push_back(&iv);
+
+        struct PrefWork {
+            std::vector<Candidate> cands;
+            bool has_pref = false;
+            Candidate best;
+            uint64_t src_name = 0;
+        };
+        std::vector<PrefWork> work(big_ivs.size());
+        gcsa_parallel_for(big_ivs.size(), [&](size_t i) {
+            const Interval& iv = *big_ivs[i];
             auto cands = enumerate_candidates_(iv.name, iv.lo, iv.hi, /*avail=*/false);
+            PrefWork w;
             if (iv.hi - iv.lo > 2) {
                 Candidate best = pick_best_(cands);
                 if (best.coverage() >= kMinCoverage) {
-                    uint64_t src = name_of_rank_(best.src_lo);
-                    prefs.emplace(iv.name, Pref{&iv, std::move(best), src});
+                    w.has_pref = true;
+                    w.src_name = name_of_rank_(best.src_lo);
+                    w.best = std::move(best);
                 }
             }
             std::sort(cands.begin(), cands.end(), [](const Candidate& a, const Candidate& b){
                 if (a.coverage() != b.coverage()) return a.coverage() > b.coverage();
                 return a.add > b.add;
             });
-            cand_cache.emplace(iv.name, std::move(cands));
+            w.cands = std::move(cands);
+            work[i] = std::move(w);
+        });
+        prefs.reserve(work.size());
+        cand_cache.reserve(work.size() * 2);
+        for (size_t i = 0; i < work.size(); ++i) {
+            const Interval* iv = big_ivs[i];
+            if (work[i].has_pref)
+                prefs.emplace(iv->name, Pref{iv, std::move(work[i].best), work[i].src_name});
+            cand_cache.emplace(iv->name, std::move(work[i].cands));
         }
+        work.clear();
+        work.shrink_to_fit();
+        auto t_pref1 = Clock::now();
 
         // Forest edges: only cov>=kMinCoverage (same threshold as DepOrder DAG edges).
         std::unordered_map<uint64_t, std::vector<uint64_t>> children;
         std::unordered_map<uint64_t, uint64_t> parent;
-        auto reaches = [&](uint64_t from, uint64_t to) {
-            std::unordered_set<uint64_t> seen;
-            std::vector<uint64_t> st = {from};
-            while (!st.empty()) {
-                uint64_t u = st.back(); st.pop_back();
-                if (!seen.insert(u).second) continue;
-                if (u == to) return true;
-                auto it = children.find(u);
-                if (it == children.end()) continue;
-                for (uint64_t v : it->second) st.push_back(v);
+        // Cycle check: t->s would cycle iff s already has t as an ancestor
+        // (parent-chain walk). Equivalent to the old downward DFS reaches(t,s).
+        auto has_ancestor = [&](uint64_t s, uint64_t t) {
+            for (uint64_t u = s; ;) {
+                if (u == t) return true;
+                auto it = parent.find(u);
+                if (it == parent.end()) return false;
+                u = it->second;
             }
-            return false;
         };
 
-        for (auto& kv : prefs) {
-            uint64_t t = kv.first;
-            uint64_t s = kv.second.src_name;
-            if (kv.second.cand.coverage() < kMinCoverage) continue;
+        auto t_forest0 = Clock::now();
+        // Deterministic edge order (name asc) so parallel pref build does not
+        // change which cycle-breaking edges survive.
+        std::vector<uint64_t> pref_names;
+        pref_names.reserve(prefs.size());
+        for (auto& kv : prefs) pref_names.push_back(kv.first);
+        std::sort(pref_names.begin(), pref_names.end());
+        for (uint64_t t : pref_names) {
+            auto& p = prefs[t];
+            uint64_t s = p.src_name;
+            if (p.cand.coverage() < kMinCoverage) continue;
             if (s == t) continue;
             if (!by_name.count(s)) continue;
-            // Skip edge if it would create a cycle in the forest.
-            if (reaches(t, s)) continue;
+            if (has_ancestor(s, t)) continue;
             parent[t] = s;
             children[s].push_back(t);
         }
@@ -1218,6 +1315,8 @@ private:
         std::vector<uint64_t> roots;
         for (uint64_t n : nodes)
             if (!parent.count(n)) roots.push_back(n);
+        std::sort(roots.begin(), roots.end());
+        auto t_forest1 = Clock::now();
 
         if (trace) {
             std::fprintf(stderr, "=== %s forest (src -> dependents) ===\n", label);
@@ -1235,111 +1334,145 @@ private:
             std::fprintf(stderr, "\n");
         }
 
-        auto isize = [&](uint64_t n) -> int {
-            auto it = by_name.find(n);
-            if (it == by_name.end()) return 0;
-            return it->second->hi - it->second->lo;
-        };
+        // Dense forest arrays for DP.
+        std::vector<uint64_t> node_of;
+        node_of.reserve(nodes.size());
+        for (uint64_t n : nodes) node_of.push_back(n);
+        std::sort(node_of.begin(), node_of.end());
+        std::unordered_map<uint64_t, int> id_of;
+        id_of.reserve(node_of.size() * 2);
+        for (size_t i = 0; i < node_of.size(); ++i) id_of[node_of[i]] = (int)i;
+        const int NN = (int)node_of.size();
 
-        // Memo: (node, source_available_for_this_node) -> (cost, compress?)
+        std::vector<std::vector<int>> ch(NN);
+        std::vector<int> isize_arr(NN, 0);
+        std::vector<int> pref_cov(NN, -1);          // -1 = cannot compress via pref
+        std::vector<const Candidate*> pref_ptr(NN, nullptr);
+        for (int i = 0; i < NN; ++i) {
+            auto it = by_name.find(node_of[i]);
+            if (it != by_name.end())
+                isize_arr[i] = it->second->hi - it->second->lo;
+            auto pit = prefs.find(node_of[i]);
+            if (pit != prefs.end() && pit->second.cand.coverage() >= kMinCoverage) {
+                pref_cov[i] = pit->second.cand.coverage();
+                pref_ptr[i] = &pit->second.cand;
+            }
+        }
+        for (auto& kv : children) {
+            int p = id_of[kv.first];
+            for (uint64_t c : kv.second) ch[p].push_back(id_of[c]);
+        }
+
         struct Cell { int cost; bool compress; };
-        std::map<std::pair<uint64_t, int>, Cell> memo;
-
-        std::function<Cell(uint64_t, bool)> solve = [&](uint64_t v, bool src_ok) -> Cell {
-            auto key = std::make_pair(v, src_ok ? 1 : 0);
-            auto it = memo.find(key);
-            if (it != memo.end()) return it->second;
-
-            const auto& ch = children[v];
-            // KEEP v: all ranks stored; children may compress against v.
-            int cost_keep = isize(v);
-            for (uint64_t w : ch) cost_keep += solve(w, /*src_ok=*/true).cost;
-
-            // COMPRESS v via preferred candidate, only if that source is available.
-            int cost_comp = std::numeric_limits<int>::max();
-            bool can_comp = false;
-            if (src_ok) {
-                auto pit = prefs.find(v);
-                if (pit != prefs.end() && pit->second.cand.coverage() >= kMinCoverage) {
-                    can_comp = true;
-                    int cc = isize(v) - pit->second.cand.coverage();
-                    for (uint64_t w : ch) cc += solve(w, /*src_ok=*/false).cost;
-                    cost_comp = cc;
-                }
-            }
-
-            Cell cell;
-            if (can_comp && cost_comp < cost_keep) {
-                cell = {cost_comp, true};
-            } else {
-                cell = {cost_keep, false};
-            }
-            memo[key] = cell;
-            return cell;
-        };
-
-        // Chosen compressions (target name -> candidate).
-        std::unordered_map<uint64_t, Candidate> chosen;
-
-        std::function<void(uint64_t, bool)> apply = [&](uint64_t v, bool src_ok) {
-            Cell cell = solve(v, src_ok);
-            if (cell.compress) {
-                chosen[v] = prefs[v].cand;
-                for (uint64_t w : children[v]) apply(w, /*src_ok=*/false);
-            } else {
-                for (uint64_t w : children[v]) apply(w, /*src_ok=*/true);
-            }
-        };
+        // Per-root DP (disjoint trees) — parallelize over roots.
+        std::vector<std::vector<std::pair<int, Candidate>>> chosen_by_root(roots.size());
 
         std::fprintf(stderr, "[%s] DP on forest...\n", label);
-        for (uint64_t r : roots) {
-            // Root: KEEP, or COMPRESS if it has a preferred source outside its subtree.
-            int cost_keep = isize(r);
-            for (uint64_t w : children[r]) cost_keep += solve(w, true).cost;
+        auto t_dp0 = Clock::now();
+        gcsa_parallel_for(roots.size(), [&](size_t ri) {
+            const int root = id_of.at(roots[ri]);
+            // memo[2*v + src_ok]: cost < 0 => empty
+            std::vector<Cell> memo((size_t)NN * 2, Cell{-1, false});
+
+            std::function<Cell(int, bool)> solve = [&](int v, bool src_ok) -> Cell {
+                Cell& slot = memo[(size_t)v * 2 + (src_ok ? 1 : 0)];
+                if (slot.cost >= 0) return slot;
+
+                const auto& kids = ch[v];
+                int cost_keep = isize_arr[v];
+                for (int w : kids) cost_keep += solve(w, /*src_ok=*/true).cost;
+
+                int cost_comp = std::numeric_limits<int>::max();
+                bool can_comp = false;
+                if (src_ok && pref_cov[v] >= kMinCoverage) {
+                    can_comp = true;
+                    int cc = isize_arr[v] - pref_cov[v];
+                    for (int w : kids) cc += solve(w, /*src_ok=*/false).cost;
+                    cost_comp = cc;
+                }
+
+                if (can_comp && cost_comp < cost_keep)
+                    slot = {cost_comp, true};
+                else
+                    slot = {cost_keep, false};
+                return slot;
+            };
+
+            auto& local = chosen_by_root[ri];
+            std::function<void(int, bool)> apply = [&](int v, bool src_ok) {
+                Cell cell = solve(v, src_ok);
+                if (cell.compress) {
+                    local.push_back({v, *pref_ptr[v]});
+                    for (int w : ch[v]) apply(w, /*src_ok=*/false);
+                } else {
+                    for (int w : ch[v]) apply(w, /*src_ok=*/true);
+                }
+            };
+
+            // Root: KEEP, or COMPRESS if preferred source is outside this tree.
+            const auto& kids = ch[root];
+            int cost_keep = isize_arr[root];
+            for (int w : kids) cost_keep += solve(w, true).cost;
 
             int cost_comp = std::numeric_limits<int>::max();
             bool can_comp = false;
-            auto pit = prefs.find(r);
-            if (pit != prefs.end() && pit->second.cand.coverage() >= kMinCoverage) {
+            if (pref_cov[root] >= kMinCoverage) {
+                auto pit = prefs.find(node_of[root]);
                 uint64_t s = pit->second.src_name;
-                // Source must not lie in this preference subtree.
-                if (s != r && !reaches(r, s)) {
+                if (s != node_of[root] && !has_ancestor(s, node_of[root])) {
                     can_comp = true;
-                    int cc = isize(r) - pit->second.cand.coverage();
-                    for (uint64_t w : children[r]) cc += solve(w, false).cost;
+                    int cc = isize_arr[root] - pref_cov[root];
+                    for (int w : kids) cc += solve(w, false).cost;
                     cost_comp = cc;
                 }
             }
 
             if (trace) {
-                std::fprintf(stderr, "root %s: keep=%d comp=%s\n",
-                             name_to_string(G_.shape, r).c_str(), cost_keep,
-                             can_comp ? std::to_string(cost_comp).c_str() : "n/a");
+                // fprintf is not great under parallel; only print when single-threaded.
+                if (nthreads <= 1)
+                    std::fprintf(stderr, "root %s: keep=%d comp=%s\n",
+                                 name_to_string(G_.shape, node_of[root]).c_str(), cost_keep,
+                                 can_comp ? std::to_string(cost_comp).c_str() : "n/a");
             }
 
             if (can_comp && cost_comp < cost_keep) {
-                chosen[r] = pit->second.cand;
-                for (uint64_t w : children[r]) apply(w, false);
+                local.push_back({root, *pref_ptr[root]});
+                for (int w : kids) apply(w, false);
             } else {
-                for (uint64_t w : children[r]) apply(w, true);
+                for (int w : kids) apply(w, true);
             }
-        }
+        });
+
+        std::unordered_map<uint64_t, Candidate> chosen;
+        chosen.reserve(nodes.size());
+        for (auto& vec : chosen_by_root)
+            for (auto& p : vec)
+                chosen.emplace(node_of[p.first], std::move(p.second));
+        auto t_dp1 = Clock::now();
         std::fprintf(stderr, "[%s] DP done\n", label);
 
         // Materialize: accept deepest dependents first (pins hubs before hubs decide).
         std::fprintf(stderr, "[%s] accept chosen...\n", label);
+        auto t_acc0 = Clock::now();
+        const std::vector<uint64_t> kEmptyKids;
+        auto children_of = [&](uint64_t v) -> const std::vector<uint64_t>& {
+            auto it = children.find(v);
+            return it == children.end() ? kEmptyKids : it->second;
+        };
         std::function<void(uint64_t)> accept_subtree = [&](uint64_t v) {
-            for (uint64_t w : children[v]) accept_subtree(w);
+            for (uint64_t w : children_of(v)) accept_subtree(w);
             auto it = chosen.find(v);
             if (it == chosen.end()) return;
-            // Re-validate under availability; fall back to best available.
             Candidate c = it->second;
-            bool ok = run_kept_(c.src_lo, c.src_hi);
-            for (int32_t rr : c.covered)
-                if (removed_[rr] || pin_count_[rr] > 0) ok = false;
+            bool ok = cand_available_(c);
             if (!ok) {
-                const Interval* iv = by_name[v];
-                c = best_candidate_(iv->name, iv->lo, iv->hi, /*avail=*/true);
+                auto cit = cand_cache.find(v);
+                if (cit != cand_cache.end())
+                    c = best_from_sorted_cache_(cit->second, /*require_avail=*/true);
+                else {
+                    const Interval* iv = by_name[v];
+                    c = best_candidate_(iv->name, iv->lo, iv->hi, /*avail=*/true);
+                }
             }
             if (c.coverage() >= kMinCoverage) {
                 if (trace) {
@@ -1352,9 +1485,11 @@ private:
             }
         };
         for (uint64_t r : roots) accept_subtree(r);
+        auto t_acc1 = Clock::now();
 
-        // Leftover intervals (not decided / not compressed): greedy with availability.
+        // Leftover intervals: greedy with availability, using static cand_cache.
         std::fprintf(stderr, "[%s] leftover greedy...\n", label);
+        auto t_left0 = Clock::now();
         std::vector<const Interval*> leftover;
         for (const auto& iv : intervals) {
             if (iv.hi - iv.lo <= 1) continue;
@@ -1366,21 +1501,38 @@ private:
                       return (a->hi - a->lo) > (b->hi - b->lo);
                   });
         for (const Interval* ivp : leftover) {
-            Candidate c = best_candidate_(ivp->name, ivp->lo, ivp->hi, /*avail=*/true);
+            Candidate c;
+            auto cit = cand_cache.find(ivp->name);
+            if (cit != cand_cache.end())
+                c = best_from_sorted_cache_(cit->second, /*require_avail=*/true);
+            else
+                c = best_candidate_(ivp->name, ivp->lo, ivp->hi, /*avail=*/true);
             if (c.coverage() < kMinCoverage) continue;
             accept_(c, accepted);
         }
+        auto t_left1 = Clock::now();
         std::fprintf(stderr, "[%s] leftover done\n", label);
 
         // Phase II: same unpin/retarget fixed point as DepOrder (reuse cand_cache).
+        auto t_p2_0 = Clock::now();
         if (!skip_phase2)
             run_phase2_(intervals, accepted, label, trace, timing, &cand_cache);
+        auto t_p2_1 = Clock::now();
 
         if (timing) {
-            double ms = std::chrono::duration<double, std::milli>(Clock::now() - t_all).count();
+            auto ms = [](Clock::time_point a, Clock::time_point b) {
+                return std::chrono::duration<double, std::milli>(b - a).count();
+            };
             std::fprintf(stderr,
-                "[timing] %s total: %.1fms  roots=%zu forest_nodes=%zu accepted=%zu kept=%zu\n",
-                label, ms, roots.size(), nodes.size(), accepted.size(), kept_count_);
+                "[timing] %s pref=%.1fms forest=%.1fms dp=%.1fms accept=%.1fms "
+                "leftover=%.1fms phase2=%.1fms total=%.1fms\n"
+                "         roots=%zu forest_nodes=%zu prefs=%zu #I>1=%zu "
+                "accepted=%zu kept=%zu threads=%d\n",
+                label, ms(t_pref0, t_pref1), ms(t_forest0, t_forest1),
+                ms(t_dp0, t_dp1), ms(t_acc0, t_acc1), ms(t_left0, t_left1),
+                ms(t_p2_0, t_p2_1), ms(t_all, Clock::now()),
+                roots.size(), nodes.size(), prefs.size(), cand_cache.size(),
+                accepted.size(), kept_count_, nthreads);
         }
     }
 

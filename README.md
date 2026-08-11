@@ -64,6 +64,7 @@ make
 GCSA_TRACE_DFS=1 ./gcsa -g /tmp/ex.fa -s "#.#" --algo greedy-dfs
 GCSA_TRACE_DP=1  ./gcsa -g /tmp/ex.fa -s "#.#" --algo tree-dp
 GCSA_TIMING=1    ./gcsa -g genome.fasta -s "#####" --algo tree-dp   # stage timings
+GCSA_THREADS=8   ./gcsa -g genome.fasta -s "#####" --algo tree-dp   # parallel pref/DP (default=hw)
 # Optional Phase II dirty-generation cap (default min(|I|+5, 32); may increase |C|):
 GCSA_PHASE2_MAX_ITERS=2 ./gcsa -g genome.fasta -s "#####" --algo tree-dp
 
@@ -152,6 +153,11 @@ compression on a 180 kb repetitive input: `####.####` → **40% of the full SA**
   `tree-dp` (preference-forest DP KEEP vs COMPRESS, then Phase II
   unpin/retarget), and `tree-dp2` (same forest DP without Phase II).
   Use `./gcsa --algo tree-dp2` or `./compare_algos`.
+  Tree-dp preference enumeration and per-root forest DP are parallelized via
+  `std::thread` (`GCSA_THREADS=N`, default=`hardware_concurrency`). Set
+  `GCSA_TIMING=1` for per-phase ms (pref / forest / dp / accept / leftover /
+  Phase II). Leftover greedy reuses the static candidate cache (no re-enum).
+  Forest cycle checks walk the parent chain; DP uses dense node ids.
 - **ILP baseline (exact |C| on small instances)**: `make ilp_baseline` builds
   `./ilp_baseline`, which enumerates the same candidates as `compress.hpp`
   (`kMinCoverage=3`, `--max-add` default 8), writes a CPLEX `.lp`, and solves

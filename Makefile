@@ -1,5 +1,5 @@
 CXX      ?= clang++
-CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra
+CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -pthread
 INCLUDES := -Isrc
 
 BIN := validate gcsa bench_repetition simulate_repeats compare_algos ilp_baseline
