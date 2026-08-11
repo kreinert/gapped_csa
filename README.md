@@ -60,6 +60,9 @@ make
 ./gcsa --algo tree-dp             # preference-forest DP (KEEP vs COMPRESS)
 GCSA_TRACE_DFS=1 ./gcsa -g /tmp/ex.fa -s "#.#" --algo greedy-dfs
 GCSA_TRACE_DP=1  ./gcsa -g /tmp/ex.fa -s "#.#" --algo tree-dp
+GCSA_TIMING=1    ./gcsa -g genome.fasta -s "#####" --algo tree-dp   # stage timings
+# Optional Phase II sweep cap (default = full fixed point; may increase |C|):
+GCSA_PHASE2_MAX_ITERS=2 ./gcsa -g genome.fasta -s "#####" --algo tree-dp
 ```
 
 Shapes use `#` (care) and `.` (don't care), e.g. `#.#`, `##.##`, `#..#..#`.
