@@ -56,6 +56,7 @@
 #include <limits>
 #include <thread>
 #include <atomic>
+#include <cstring>
 
 namespace gcsa {
 
@@ -568,10 +569,17 @@ private:
     //   failures, exhausted tries with best-cached > cur, or suboptimal
     //   accepts). Avoids re-scanning skip_best / saturated names.
     //   Each interval is processed at most once per generation; generations
-    //   stop when next_dirty is empty (fixed point) or max_iters is hit.
+    //   stop when next_dirty is empty (fixed point), max_iters is hit, or
+    //   adaptive stall triggers (low |C| gain for a streak of generations).
     //
     // Env GCSA_PHASE2_MAX_ITERS=K (optional): hard-cap dirty generations.
     // Default is min(|I|+5, 32). A cap may leave |C| slightly larger.
+    //
+    // Adaptive early-stop (cuts long REPLACE-only plateaus; hard cap still applies):
+    //   GCSA_PHASE2_MIN_GAIN=G  – min total kept-drop (|C| reduction) per dirty
+    //                             generation to count as progress (default 1).
+    //   GCSA_PHASE2_STALL=S     – consecutive generations with kept-drop < G
+    //                             before stopping (default 3). S=0 disables.
     void run_phase2_(const std::vector<Interval>& intervals,
                      std::unordered_map<uint64_t, Candidate>& accepted,
                      const char* label,
@@ -585,6 +593,17 @@ private:
             int v = std::atoi(env);
             if (v > 0) max_iters = v;
         }
+        int min_gain = 1;
+        if (const char* env = std::getenv("GCSA_PHASE2_MIN_GAIN")) {
+            int v = std::atoi(env);
+            if (v >= 0) min_gain = v;
+        }
+        int stall_limit = 3;
+        if (const char* env = std::getenv("GCSA_PHASE2_STALL")) {
+            int v = std::atoi(env);
+            if (v >= 0) stall_limit = v;
+        }
+        const bool adaptive = (stall_limit > 0);
         std::fprintf(stderr, "[%s] Phase II: unpin/retarget...\n", label);
         if (timing && precomputed) {
             std::fprintf(stderr, "[timing] %s Phase II precomputed cache size=%zu\n",
@@ -656,12 +675,21 @@ private:
         };
 
         int guard = 0;
-        while (!dirty.empty() && guard++ < max_iters) {
+        int stall = 0;
+        int last_gen_kept_drop = 0;
+        const char* stop_reason = "fixed-point";
+        while (!dirty.empty()) {
+            if (guard >= max_iters) {
+                stop_reason = "max-iters";
+                break;
+            }
+            ++guard;
             next_dirty.clear();
             std::fill(in_next.begin(), in_next.end(), 0);
             for (int oi : pin_blocked) in_pin_blocked[oi] = 0;
             pin_blocked.clear();
             bool improved_gen = false;
+            int gen_kept_drop = 0;
             std::vector<int> still_open; // best-cached > cur after this visit
             still_open.reserve(64);
 
@@ -708,6 +736,7 @@ private:
                         continue;
                     }
                     size_t after = kept_count_;
+                    if (after < before) gen_kept_drop += (int)(before - after);
                     if (trace) {
                         if (after < before)
                             std::fprintf(stderr,
@@ -732,11 +761,28 @@ private:
                 if (best_cov > got_cov) still_open.push_back(oi);
             }
 
+            last_gen_kept_drop = gen_kept_drop;
             if (improved_gen) {
                 for (int oi : pin_blocked) mark_next(oi);
                 for (int oi : still_open) mark_next(oi);
             }
             dirty.swap(next_dirty);
+
+            // Adaptive stall: generations that still churn (dirty non-empty next)
+            // but save fewer than min_gain kept positions. Pure REPLACE plateaus
+            // (coverage up, |C| unchanged) count toward the stall streak.
+            if (adaptive && !dirty.empty()) {
+                if (gen_kept_drop < min_gain) {
+                    if (++stall >= stall_limit) {
+                        stop_reason = "adaptive-stall";
+                        break;
+                    }
+                } else {
+                    stall = 0;
+                }
+            } else {
+                stall = 0;
+            }
         }
         auto t1 = Clock::now();
         std::fprintf(stderr, "[%s] Phase II done\n", label);
@@ -747,16 +793,25 @@ private:
         if (timing) {
             double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
             std::fprintf(stderr,
-                "[timing] %s Phase II: %.1fms  iters=%d enums=%zu cache_hits=%zu "
+                "[timing] %s Phase II: %.1fms  iters=%d stop=%s "
+                "enums=%zu cache_hits=%zu "
                 "skip_sat=%zu skip_best=%zu tries=%zu "
                 "fail=%zu improve=%zu dirty_marks=%zu "
                 "pin(none/fast/multi)=%zu/%zu/%zu "
-                "enum=%.1fms try=%.1fms\n",
-                label, ms, guard, phase2_enum, phase2_cache_hits,
+                "enum=%.1fms try=%.1fms",
+                label, ms, guard, stop_reason, phase2_enum, phase2_cache_hits,
                 phase2_skip_sat, phase2_skip_best, phase2_tries,
                 phase2_fail, phase2_improve, phase2_dirty_marks,
                 phase2_no_pin, phase2_fast_pin, phase2_multi_pin,
                 ms_enum, ms_try);
+            if (std::strcmp(stop_reason, "adaptive-stall") == 0) {
+                std::fprintf(stderr,
+                    "  (kept_drop=%d < min_gain=%d for stall=%d/%d)",
+                    last_gen_kept_drop, min_gain, stall, stall_limit);
+            } else if (std::strcmp(stop_reason, "max-iters") == 0) {
+                std::fprintf(stderr, "  (hit GCSA_PHASE2_MAX_ITERS=%d)", max_iters);
+            }
+            std::fprintf(stderr, "\n");
         }
     }
 

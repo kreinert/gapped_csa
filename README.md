@@ -67,6 +67,11 @@ GCSA_TIMING=1    ./gcsa -g genome.fasta -s "#####" --algo tree-dp   # stage timi
 GCSA_THREADS=8   ./gcsa -g genome.fasta -s "#####" --algo tree-dp   # parallel pref/DP (default=hw)
 # Optional Phase II dirty-generation cap (default min(|I|+5, 32); may increase |C|):
 GCSA_PHASE2_MAX_ITERS=2 ./gcsa -g genome.fasta -s "#####" --algo tree-dp
+# Adaptive Phase II early-stop (defaults: MIN_GAIN=1, STALL=3). Stops when
+# consecutive dirty generations each reduce |C| by < MIN_GAIN kept positions.
+# Hard MAX_ITERS still applies. Set STALL=0 to disable adaptive stop only:
+# GCSA_PHASE2_STALL=0 ./gcsa ...
+# GCSA_PHASE2_MIN_GAIN=2 GCSA_PHASE2_STALL=2 ./gcsa -g genome.fasta -s "#####" --algo tree-dp
 
 # Exact |C| ILP baseline on small texts (needs cbc or glpsol on PATH)
 ./ilp_baseline "ACGTCTTAAACCCTCGTCTTAAACCCAACGTCTTAAACCC" "#.#"
@@ -156,8 +161,12 @@ compression on a 180 kb repetitive input: `####.####` → **40% of the full SA**
   Tree-dp preference enumeration and per-root forest DP are parallelized via
   `std::thread` (`GCSA_THREADS=N`, default=`hardware_concurrency`). Set
   `GCSA_TIMING=1` for per-phase ms (pref / forest / dp / accept / leftover /
-  Phase II). Leftover greedy reuses the static candidate cache (no re-enum).
+  Phase II; Phase II also prints `stop=fixed-point|max-iters|adaptive-stall`).
+  Leftover greedy reuses the static candidate cache (no re-enum).
   Forest cycle checks walk the parent chain; DP uses dense node ids.
+  Phase II adaptive early-stop (`GCSA_PHASE2_MIN_GAIN`, `GCSA_PHASE2_STALL`;
+  defaults 1 / 3) ends dirty generations when kept-drop plateaus; set
+  `GCSA_PHASE2_STALL=0` to disable. `GCSA_PHASE2_MAX_ITERS` remains the hard cap.
 - **ILP baseline (exact |C| on small instances)**: `make ilp_baseline` builds
   `./ilp_baseline`, which enumerates the same candidates as `compress.hpp`
   (`kMinCoverage=3`, `--max-add` default 8), writes a CPLEX `.lp`, and solves
