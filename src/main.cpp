@@ -162,7 +162,8 @@ int main(int argc, char** argv) {
             else if (a == "dep-order" || a == "dep") algo = CompressAlgo::DepOrder;
             else if (a == "greedy-dfs" || a == "dfs") algo = CompressAlgo::GreedyDfs;
             else if (a == "tree-dp" || a == "dp") algo = CompressAlgo::TreeDp;
-            else { std::cerr << "--algo must be greedy|dep-order|greedy-dfs|tree-dp\n"; return 1; }
+            else if (a == "tree-dp2" || a == "dp2") algo = CompressAlgo::TreeDp2;
+            else { std::cerr << "--algo must be greedy|dep-order|greedy-dfs|tree-dp|tree-dp2\n"; return 1; }
         }
         else { std::cerr << "unknown arg: " << k << "\n"; return 1; }
     }

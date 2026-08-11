@@ -22,6 +22,8 @@ gapped_csa/
 │   ├── compress.hpp     # LCP-interval differential compression + query
 │   ├── serialize.hpp    # byte-level H array + select bitvector (S_H) encoding
 │   ├── main.cpp         # CLI: build / validate / query / size report
+│   ├── compare_algos.cpp
+│   ├── ilp_baseline.cpp # exact |C| ILP over candidate set (cbc/glpsol)
 │   └── validate.cpp     # prints the full SA/LCP table (reproduces the note)
 ├── external/            # (legacy) libdivsufsort — no longer a build dependency
 └── Makefile
@@ -52,17 +54,22 @@ make
 ./bench_repetition
 ./bench_repetition --min-rep 10 --max-rep 100 --step 10 --seed 1
 
-# Compare / choose compression heuristic (g / d / f / t = greedy, dep-order, dfs, tree-dp)
+# Compare / choose compression heuristic (g / d / f / t / t2)
 ./compare_algos
 ./gcsa --algo greedy
 ./gcsa --algo dep-order
 ./gcsa --algo greedy-dfs          # DFS from best add=+1 hub, cumulative add
-./gcsa --algo tree-dp             # preference-forest DP (KEEP vs COMPRESS)
+./gcsa --algo tree-dp             # preference-forest DP + Phase II
+./gcsa --algo tree-dp2            # same as tree-dp without Phase II
 GCSA_TRACE_DFS=1 ./gcsa -g /tmp/ex.fa -s "#.#" --algo greedy-dfs
 GCSA_TRACE_DP=1  ./gcsa -g /tmp/ex.fa -s "#.#" --algo tree-dp
 GCSA_TIMING=1    ./gcsa -g genome.fasta -s "#####" --algo tree-dp   # stage timings
 # Optional Phase II dirty-generation cap (default min(|I|+5, 32); may increase |C|):
 GCSA_PHASE2_MAX_ITERS=2 ./gcsa -g genome.fasta -s "#####" --algo tree-dp
+
+# Exact |C| ILP baseline on small texts (needs cbc or glpsol on PATH)
+./ilp_baseline "ACGTCTTAAACCCTCGTCTTAAACCCAACGTCTTAAACCC" "#.#"
+./ilp_baseline "GCCTTTAAAGGCCTTTAAAGGCCTTTAAAG" "#.#" --max-add 8
 ```
 
 Shapes use `#` (care) and `.` (don't care), e.g. `#.#`, `##.##`, `#..#..#`.
@@ -107,7 +114,7 @@ those positions and store a single pointer:
 selection is an availability-aware greedy that prefers the largest coverage and,
 on ties, the deeper LCP interval (so intervals fall back to deep, stable sources
 — exactly the trick in the note). Links are accepted only when coverage is
-**≥ 3** (`kMinCoverage` in `compress.hpp`; all four heuristics + Phase II share
+**≥ 3** (`kMinCoverage` in `compress.hpp`; all heuristics + Phase II share
 this floor). On the note's example it keeps **29/41** positions and returns
 identical query results.
 
@@ -141,9 +148,20 @@ compression on a 180 kb repetitive input: `####.####` → **40% of the full SA**
 
 ## Limitations & research extensions
 
-- **Source selection**: four heuristics — `greedy`, `dep-order`, `greedy-dfs`,
-  and `tree-dp` (preference-forest DP KEEP vs COMPRESS, then Phase II
-  unpin/retarget). Use `./gcsa --algo tree-dp` or `./compare_algos`.
+- **Source selection**: five heuristics — `greedy`, `dep-order`, `greedy-dfs`,
+  `tree-dp` (preference-forest DP KEEP vs COMPRESS, then Phase II
+  unpin/retarget), and `tree-dp2` (same forest DP without Phase II).
+  Use `./gcsa --algo tree-dp2` or `./compare_algos`.
+- **ILP baseline (exact |C| on small instances)**: `make ilp_baseline` builds
+  `./ilp_baseline`, which enumerates the same candidates as `compress.hpp`
+  (`kMinCoverage=3`, `--max-add` default 8), writes a CPLEX `.lp`, and solves
+  with `cbc` / `glpsol` on `PATH` (else brute-force when tiny, else LP-only).
+  Reports optimal `|C|`, heuristic `|C|`, optimality gap, and a keep-set
+  self-check:
+  ```
+  ./ilp_baseline "ACGTCTTAAACCCTCGTCTTAAACCCAACGTCTTAAACCC" "#.#"
+  ./ilp_baseline "GCCTTTAAAGGCCTTTAAAGGCCTTTAAAG" "#.#"
+  ```
 - **Suffix array construction**: a linear-time integer-alphabet SA-IS
   (`src/sais.hpp`) is the default; libdivsufsort is no longer a build dependency.
   SA-IS and its indices are currently `int32_t`; for texts longer than 2³¹,

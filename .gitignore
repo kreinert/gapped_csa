@@ -3,10 +3,12 @@
 /validate
 /bench_repetition
 /compare_algos
+/ilp_baseline
 /simulate_repeats
 /dump_graph
 /find_minimal_gap
 *.o
+*.lp
 a.out
 
 # optional vendored libdivsufsort (not required; SA-IS is header-only)

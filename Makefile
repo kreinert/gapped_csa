@@ -2,7 +2,7 @@ CXX      ?= clang++
 CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra
 INCLUDES := -Isrc
 
-BIN := validate gcsa bench_repetition simulate_repeats compare_algos
+BIN := validate gcsa bench_repetition simulate_repeats compare_algos ilp_baseline
 
 all: $(BIN)
 
@@ -20,6 +20,9 @@ simulate_repeats: src/simulate_repeats.cpp
 
 compare_algos: src/compare_algos.cpp src/shape.hpp src/gapped_sa.hpp src/sais.hpp src/compress.hpp src/serialize.hpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) src/compare_algos.cpp -o $@
+
+ilp_baseline: src/ilp_baseline.cpp src/shape.hpp src/gapped_sa.hpp src/sais.hpp src/compress.hpp
+	$(CXX) $(CXXFLAGS) $(INCLUDES) src/ilp_baseline.cpp -o $@
 
 clean:
 	rm -f $(BIN)
