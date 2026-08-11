@@ -61,7 +61,7 @@ make
 GCSA_TRACE_DFS=1 ./gcsa -g /tmp/ex.fa -s "#.#" --algo greedy-dfs
 GCSA_TRACE_DP=1  ./gcsa -g /tmp/ex.fa -s "#.#" --algo tree-dp
 GCSA_TIMING=1    ./gcsa -g genome.fasta -s "#####" --algo tree-dp   # stage timings
-# Optional Phase II sweep cap (default = full fixed point; may increase |C|):
+# Optional Phase II dirty-generation cap (default min(|I|+5, 32); may increase |C|):
 GCSA_PHASE2_MAX_ITERS=2 ./gcsa -g genome.fasta -s "#####" --algo tree-dp
 ```
 
@@ -106,8 +106,10 @@ those positions and store a single pointer:
 `C` is the compressed suffix array (kept positions in rank order). The v1 source
 selection is an availability-aware greedy that prefers the largest coverage and,
 on ties, the deeper LCP interval (so intervals fall back to deep, stable sources
-— exactly the trick in the note). On the note's example it keeps **23/41**
-positions (better than the hand-made 27) and returns identical query results.
+— exactly the trick in the note). Links are accepted only when coverage is
+**≥ 3** (`kMinCoverage` in `compress.hpp`; all four heuristics + Phase II share
+this floor). On the note's example it keeps **29/41** positions and returns
+identical query results.
 
 **Choosing the LCP intervals optimally is the open research core of the project**
 (see below); the greedy here is a correct, reasonable baseline.

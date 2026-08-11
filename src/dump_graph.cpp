@@ -66,7 +66,7 @@ static std::vector<Cand> best_per_interval(const GappedSA& G, int max_add) {
                 int32_t s_lo = pr[i].first, s_hi = pr[j-1].first + 1;
                 bool disjoint = (s_hi <= lo || s_lo >= hi);
                 int cov = (int)(j - i);
-                if (disjoint && cov >= 2
+                if (disjoint && cov >= kMinCoverage
                     && (cov > best.coverage || (cov == best.coverage && add > best.add))) {
                     best.name = name;
                     best.kmer = name_to_string(G.shape, name);
@@ -82,7 +82,7 @@ static std::vector<Cand> best_per_interval(const GappedSA& G, int max_add) {
                 i = j;
             }
         }
-        if (best.coverage >= 2) prefs.push_back(best);
+        if (best.coverage >= kMinCoverage) prefs.push_back(best);
         r = r2;
     }
     return prefs;
@@ -136,9 +136,11 @@ int main(int argc, char** argv) {
         std::cout << "]\n";
     }
 
-    std::cout << "\n=== Dependency DAG  (edge: source_kmer → target_kmer, cov>=3) ===\n";
+    std::cout << "\n=== Dependency DAG  (edge: source_kmer → target_kmer, cov>="
+              << kMinCoverage << ") ===\n";
     std::cout << "Meaning: target prefers a differential source inside source_kmer.\n"
-              << "Edges only for preferred candidates with coverage >= 3.\n\n";
+              << "Edges only for preferred candidates with coverage >= "
+              << kMinCoverage << ".\n\n";
 
     // Collect all nodes that appear
     std::map<std::string, std::vector<std::string>> outs;
@@ -146,7 +148,7 @@ int main(int argc, char** argv) {
     for (auto& c : prefs) {
         indeg[c.kmer]; // ensure node
         indeg[c.src_kmer];
-        if (c.coverage < 3) continue;  // no preference-DAG edge for cov < 3
+        if (c.coverage < kMinCoverage) continue;  // no preference-DAG edge below floor
         if (c.kmer == c.src_kmer) continue;
         outs[c.src_kmer].push_back(c.kmer + "(add=" + std::to_string(c.add)
                                    + ",cov=" + std::to_string(c.coverage) + ")");
@@ -160,7 +162,7 @@ int main(int argc, char** argv) {
         indeg[c.src_kmer] = 0;
     }
     for (auto& c : prefs) {
-        if (c.coverage < 3) continue;
+        if (c.coverage < kMinCoverage) continue;
         if (c.kmer == c.src_kmer) continue;
         indeg[c.kmer]++;
     }
@@ -202,7 +204,7 @@ int main(int argc, char** argv) {
     std::cout << "\n=== Mermaid diagram ===\n";
     std::cout << "```mermaid\nflowchart LR\n";
     for (auto& c : prefs) {
-        if (c.coverage < 3) continue;
+        if (c.coverage < kMinCoverage) continue;
         if (c.kmer == c.src_kmer) continue;
         std::cout << "  " << c.src_kmer << " -->|add=" << c.add
                   << " cov=" << c.coverage << "| " << c.kmer << "\n";

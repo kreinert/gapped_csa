@@ -130,7 +130,7 @@ enumerates all viable sources for \(a=1,\ldots,a_{\max}\) (default
 \item Sort by source rank and group into maximal contiguous runs where
   consecutive source ranks differ by~1 and \(\mathrm{LCP}\ge a+1\).
 \item Retain a run only if it is \textbf{disjoint} from \(I_c\) and has
-  coverage at least~2.
+  coverage at least~3.
 \end{enumerate}
 Among all such candidates, the \textbf{preferred} candidate for
 \(I_c\) maximises coverage, breaking ties by preferring larger \(a\)
@@ -148,7 +148,7 @@ DepOrder has three conceptual stages.
 
 \subsection{Preference DAG}
 
-For every interval with a preferred candidate of coverage \(\ge 2\),
+For every interval with a preferred candidate of coverage \(\ge 3\),
 draw a directed edge
 \[
 \text{source name}\;\longrightarrow\;\text{target name}
@@ -228,7 +228,7 @@ dependents~/ sinks before sources.
 For each name in that order, the algorithm recomputes the best
 candidate \emph{under current availability} (source run must be fully
 kept; covered ranks must be free of pins and not already removed) and,
-if coverage \(\ge 2\), accepts it: pin the source ranks, mark covered
+if coverage \(\ge 3\), accepts it: pin the source ranks, mark covered
 ranks removed.
 
 \paragraph{Why sinks first helps hubs.}
