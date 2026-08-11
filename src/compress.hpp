@@ -33,6 +33,9 @@
 //   GreedyDfs – pick the add=+1 source hub of greatest total coverage; DFS to
 //               its add=+1 targets (|I|>2), then their add=+1 targets, etc.,
 //               always pointing at the DFS root with cumulative add (1,2,3,...).
+//   TreeDp    – DP on the preference forest (strong cov>=3 edges, |I_c|>2):
+//               for each source hub, choose KEEP vs COMPRESS knowing how
+//               dependents' costs change; then Phase II unpin/retarget.
 
 #pragma once
 
@@ -47,6 +50,10 @@
 #include <queue>
 #include <string>
 #include <chrono>
+#include <functional>
+#include <map>
+#include <utility>
+#include <limits>
 
 namespace gcsa {
 
@@ -54,6 +61,7 @@ enum class CompressAlgo {
     Greedy,    // size-first, pin sources
     DepOrder,  // dependency-order + un-pin / retarget
     GreedyDfs, // DFS from best add=+1 hub, cumulative add to root
+    TreeDp,    // preference-forest DP (KEEP vs COMPRESS per hub)
 };
 
 inline const char* algo_name(CompressAlgo a) {
@@ -61,6 +69,7 @@ inline const char* algo_name(CompressAlgo a) {
         case CompressAlgo::Greedy:   return "greedy";
         case CompressAlgo::DepOrder: return "dep-order";
         case CompressAlgo::GreedyDfs: return "greedy-dfs";
+        case CompressAlgo::TreeDp:   return "tree-dp";
     }
     return "?";
 }
@@ -434,6 +443,105 @@ private:
         return true;
     }
 
+    // Fixed-point unpin / retarget: try higher-coverage candidates (including
+    // former sources), retargeting dependents with transitive add when needed.
+    // Shared by DepOrder Phase II and TreeDp Phase II.
+    void run_phase2_(const std::vector<Interval>& intervals,
+                     std::unordered_map<uint64_t, Candidate>& accepted,
+                     const char* label,
+                     bool trace,
+                     bool timing) {
+        using Clock = std::chrono::steady_clock;
+        const int N = (int)intervals.size();
+        std::fprintf(stderr, "[%s] Phase II: unpin/retarget...\n", label);
+        auto t0 = Clock::now();
+        bool changed = true;
+        int guard = 0;
+        size_t phase2_enum = 0, phase2_tries = 0;
+        size_t phase2_fail = 0, phase2_improve = 0;
+        size_t phase2_fast_pin = 0, phase2_multi_pin = 0, phase2_no_pin = 0;
+        double ms_enum = 0, ms_try = 0;
+        while (changed && guard++ < N + 5) {
+            changed = false;
+            std::vector<const Interval*> order;
+            for (const auto& iv : intervals) if (iv.hi - iv.lo > 1) order.push_back(&iv);
+            std::sort(order.begin(), order.end(),
+                      [](const Interval* a, const Interval* b){
+                          return (a->hi-a->lo) > (b->hi-b->lo);
+                      });
+            for (const Interval* ivp : order) {
+                auto te0 = Clock::now();
+                auto cands = enumerate_candidates_(ivp->name, ivp->lo, ivp->hi,
+                                                   /*require_avail=*/false);
+                if (timing) ms_enum += std::chrono::duration<double, std::milli>(Clock::now() - te0).count();
+                ++phase2_enum;
+                std::sort(cands.begin(), cands.end(), [](const Candidate& a, const Candidate& b){
+                    if (a.coverage() != b.coverage()) return a.coverage() > b.coverage();
+                    return a.add > b.add;
+                });
+                int cur_cov = 0;
+                auto it = accepted.find(ivp->name);
+                if (it != accepted.end()) cur_cov = it->second.coverage();
+
+                for (auto& c : cands) {
+                    if (c.coverage() <= cur_cov) break;
+                    if (!run_kept_(c.src_lo, c.src_hi)) continue;
+                    bool ok = true;
+                    for (int32_t r : c.covered) if (removed_[r]) { ok = false; break; }
+                    if (!ok) continue;
+
+                    size_t before = kept_count_;
+                    ++phase2_tries;
+                    auto tt0 = Clock::now();
+                    bool accepted_ok = try_accept_with_retarget_(c, accepted, intervals,
+                                                                /*undo_out=*/nullptr);
+                    if (timing) ms_try += std::chrono::duration<double, std::milli>(Clock::now() - tt0).count();
+                    if (last_pin_path_ == 0) ++phase2_no_pin;
+                    else if (last_pin_path_ == 1) ++phase2_fast_pin;
+                    else ++phase2_multi_pin;
+                    if (!accepted_ok) {
+                        ++phase2_fail;
+                        continue;
+                    }
+                    size_t after = kept_count_;
+                    if (trace) {
+                        if (after < before)
+                            std::fprintf(stderr,
+                                "II.%d IMPROVE I_%s src=I_%s[%d,%d) add=%d cov=%d  kept %zu->%zu\n",
+                                guard, name_to_string(G_.shape, ivp->name).c_str(),
+                                name_to_string(G_.shape, name_of_rank_(c.src_lo)).c_str(),
+                                c.src_lo, c.src_hi, c.add, c.coverage(), before, after);
+                        else
+                            std::fprintf(stderr,
+                                "II.%d REPLACE I_%s cov %d->%d (kept unchanged %zu)\n",
+                                guard, name_to_string(G_.shape, ivp->name).c_str(),
+                                cur_cov, c.coverage(), after);
+                    }
+                    changed = true;
+                    ++phase2_improve;
+                    break;
+                }
+            }
+        }
+        auto t1 = Clock::now();
+        std::fprintf(stderr, "[%s] Phase II done\n", label);
+        if (trace) {
+            std::fprintf(stderr, "after Phase II: kept=%zu accepted=%zu\n",
+                         kept_count_, accepted.size());
+        }
+        if (timing) {
+            double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            std::fprintf(stderr,
+                "[timing] %s Phase II: %.1fms  iters=%d enums=%zu tries=%zu "
+                "fail=%zu improve=%zu pin(none/fast/multi)=%zu/%zu/%zu "
+                "enum=%.1fms try=%.1fms\n",
+                label, ms, guard, phase2_enum, phase2_tries,
+                phase2_fail, phase2_improve,
+                phase2_no_pin, phase2_fast_pin, phase2_multi_pin,
+                ms_enum, ms_try);
+        }
+    }
+
     // ---- algorithms -------------------------------------------------------
     void compress_greedy_(const std::vector<Interval>& intervals,
                           std::unordered_map<uint64_t, Candidate>& accepted) {
@@ -619,108 +727,17 @@ private:
             std::fprintf(stderr, "after Phase I: kept=%zu accepted=%zu\n", kept, accepted.size());
         }
 
-        // Pass 2: fixed-point un-pin — try to compress intervals further
-        // (including former sources) via deeper candidates, retargeting deps.
-        std::fprintf(stderr, "[dep-order] Phase II: unpin/retarget...\n");
-        bool changed = true;
-        int guard = 0;
-        size_t phase2_enum = 0, phase2_tries = 0;
-        size_t phase2_fail = 0, phase2_improve = 0;
-        size_t phase2_fast_pin = 0, phase2_multi_pin = 0, phase2_no_pin = 0;
-        double ms_enum = 0, ms_try = 0;
-        while (changed && guard++ < N + 5) {
-            changed = false;
-            // Try larger intervals first for bigger wins.
-            std::vector<const Interval*> order;
-            for (const auto& iv : intervals) if (iv.hi - iv.lo > 1) order.push_back(&iv);
-            std::sort(order.begin(), order.end(),
-                      [](const Interval* a, const Interval* b){
-                          return (a->hi-a->lo) > (b->hi-b->lo);
-                      });
-            for (const Interval* ivp : order) {
-                // Enumerate available candidates that may require retargeting:
-                // temporarily ignore pin_count on covered (enumerate without
-                // avail), then filter with try_accept_with_retarget_.
-                auto te0 = Clock::now();
-                auto cands = enumerate_candidates_(ivp->name, ivp->lo, ivp->hi,
-                                                   /*require_avail=*/false);
-                if (timing) ms_enum += std::chrono::duration<double, std::milli>(Clock::now() - te0).count();
-                ++phase2_enum;
-                // Prefer higher coverage, then deeper add.
-                std::sort(cands.begin(), cands.end(), [](const Candidate& a, const Candidate& b){
-                    if (a.coverage() != b.coverage()) return a.coverage() > b.coverage();
-                    return a.add > b.add;
-                });
-                int cur_cov = 0;
-                auto it = accepted.find(ivp->name);
-                if (it != accepted.end()) cur_cov = it->second.coverage();
-
-                for (auto& c : cands) {
-                    if (c.coverage() <= cur_cov) break;   // sorted; no better left
-                    // Source must currently be kept (not removed).
-                    if (!run_kept_(c.src_lo, c.src_hi)) continue;
-                    // Covered must not include already-removed ranks.
-                    bool ok = true;
-                    for (int32_t r : c.covered) if (removed_[r]) { ok = false; break; }
-                    if (!ok) continue;
-
-                    // try_accept is transactional on failure (no mutation).
-                    // Successful tries always keep: we only consider cov > cur_cov,
-                    // so the old O(n) snapshot / surgical-undo rollback path is dead.
-                    size_t before = kept_count_;
-                    ++phase2_tries;
-
-                    auto tt0 = Clock::now();
-                    bool accepted_ok = try_accept_with_retarget_(c, accepted, intervals,
-                                                                /*undo_out=*/nullptr);
-                    if (timing) ms_try += std::chrono::duration<double, std::milli>(Clock::now() - tt0).count();
-                    if (last_pin_path_ == 0) ++phase2_no_pin;
-                    else if (last_pin_path_ == 1) ++phase2_fast_pin;
-                    else ++phase2_multi_pin;
-                    if (!accepted_ok) {
-                        ++phase2_fail;
-                        continue;
-                    }
-                    size_t after = kept_count_;
-                    if (trace) {
-                        if (after < before)
-                            std::fprintf(stderr,
-                                "II.%d IMPROVE I_%s src=I_%s[%d,%d) add=%d cov=%d  kept %zu->%zu\n",
-                                guard, name_to_string(G_.shape, ivp->name).c_str(),
-                                name_to_string(G_.shape, name_of_rank_(c.src_lo)).c_str(),
-                                c.src_lo, c.src_hi, c.add, c.coverage(), before, after);
-                        else
-                            std::fprintf(stderr,
-                                "II.%d REPLACE I_%s cov %d->%d (kept unchanged %zu)\n",
-                                guard, name_to_string(G_.shape, ivp->name).c_str(),
-                                cur_cov, c.coverage(), after);
-                    }
-                    changed = true;
-                    ++phase2_improve;
-                    break;   // continue pass; while-loop will rescan if needed
-                }
-            }
-        }
+        run_phase2_(intervals, accepted, "dep-order", trace, timing);
         auto t4 = Clock::now();
-        std::fprintf(stderr, "[dep-order] Phase II done\n");
-        if (trace) {
-            size_t kept = 0; for (auto x : removed_) if (!x) ++kept;
-            std::fprintf(stderr, "after Phase II: kept=%zu accepted=%zu\n", kept, accepted.size());
-        }
         if (timing) {
             auto ms = [](Clock::time_point a, Clock::time_point b) {
                 return std::chrono::duration<double, std::milli>(b - a).count();
             };
             std::fprintf(stderr,
                 "[timing] dep-order prefs=%.1fms phaseI=%.1fms phaseII=%.1fms total=%.1fms\n"
-                "         N=%d prefs=%zu phaseII_iters=%d enums=%zu tries=%zu\n"
-                "         fail=%zu improve=%zu pin_path(none/fast/multi)=%zu/%zu/%zu\n"
-                "         phaseII detail: enum=%.1fms try=%.1fms\n",
+                "         N=%d prefs=%zu\n",
                 ms(t0, t1), ms(t2, t3), ms(t3, t4), ms(t_all, t4),
-                N, prefs.size(), guard, phase2_enum, phase2_tries,
-                phase2_fail, phase2_improve,
-                phase2_no_pin, phase2_fast_pin, phase2_multi_pin,
-                ms_enum, ms_try);
+                N, prefs.size());
         }
     }
 
@@ -947,6 +964,236 @@ private:
         }
     }
 
+    // Preference-forest DP: each strong preference edge (cov>=3, |I|>2) makes
+    // the target a child of its preferred source.  For every node we choose
+    // KEEP (all ranks stored, children may compress against us) vs COMPRESS
+    // (drop cov ranks via the preferred candidate; children lose that source).
+    // Exact for |C| on this forest model; leftover names get an avail. greedy.
+    void compress_tree_dp_(const std::vector<Interval>& intervals,
+                           std::unordered_map<uint64_t, Candidate>& accepted) {
+        using Clock = std::chrono::steady_clock;
+        const bool timing = (std::getenv("GCSA_TIMING") != nullptr);
+        const bool trace = (std::getenv("GCSA_TRACE_DP") != nullptr);
+        auto t_all = Clock::now();
+
+        std::unordered_map<uint64_t, const Interval*> by_name;
+        for (const auto& iv : intervals) by_name[iv.name] = &iv;
+
+        struct Pref { const Interval* iv; Candidate cand; uint64_t src_name; };
+        std::unordered_map<uint64_t, Pref> prefs;   // target -> preferred
+
+        std::fprintf(stderr, "[tree-dp] preference forest build...\n");
+        for (const auto& iv : intervals) {
+            if (iv.hi - iv.lo <= 2) continue;
+            Candidate c = best_candidate_(iv.name, iv.lo, iv.hi, /*avail=*/false);
+            if (c.coverage() < 2) continue;
+            uint64_t src = name_of_rank_(c.src_lo);
+            prefs.emplace(iv.name, Pref{&iv, std::move(c), src});
+        }
+
+        // Forest edges: only cov>=3 (same threshold as DepOrder DAG edges).
+        std::unordered_map<uint64_t, std::vector<uint64_t>> children;
+        std::unordered_map<uint64_t, uint64_t> parent;
+        auto reaches = [&](uint64_t from, uint64_t to) {
+            std::unordered_set<uint64_t> seen;
+            std::vector<uint64_t> st = {from};
+            while (!st.empty()) {
+                uint64_t u = st.back(); st.pop_back();
+                if (!seen.insert(u).second) continue;
+                if (u == to) return true;
+                auto it = children.find(u);
+                if (it == children.end()) continue;
+                for (uint64_t v : it->second) st.push_back(v);
+            }
+            return false;
+        };
+
+        for (auto& kv : prefs) {
+            uint64_t t = kv.first;
+            uint64_t s = kv.second.src_name;
+            if (kv.second.cand.coverage() < 3) continue;
+            if (s == t) continue;
+            if (!by_name.count(s)) continue;
+            // Skip edge if it would create a cycle in the forest.
+            if (reaches(t, s)) continue;
+            parent[t] = s;
+            children[s].push_back(t);
+        }
+
+        std::unordered_set<uint64_t> nodes;
+        for (auto& kv : prefs) nodes.insert(kv.first);
+        for (auto& kv : children) {
+            nodes.insert(kv.first);
+            for (uint64_t c : kv.second) nodes.insert(c);
+        }
+        std::vector<uint64_t> roots;
+        for (uint64_t n : nodes)
+            if (!parent.count(n)) roots.push_back(n);
+
+        if (trace) {
+            std::fprintf(stderr, "=== tree-dp forest (src -> dependents) ===\n");
+            for (auto& kv : children) {
+                std::fprintf(stderr, "  %s ->",
+                             name_to_string(G_.shape, kv.first).c_str());
+                for (uint64_t c : kv.second)
+                    std::fprintf(stderr, " %s",
+                                 name_to_string(G_.shape, c).c_str());
+                std::fprintf(stderr, "\n");
+            }
+            std::fprintf(stderr, "roots:");
+            for (uint64_t r : roots)
+                std::fprintf(stderr, " %s", name_to_string(G_.shape, r).c_str());
+            std::fprintf(stderr, "\n");
+        }
+
+        auto isize = [&](uint64_t n) -> int {
+            auto it = by_name.find(n);
+            if (it == by_name.end()) return 0;
+            return it->second->hi - it->second->lo;
+        };
+
+        // Memo: (node, source_available_for_this_node) -> (cost, compress?)
+        struct Cell { int cost; bool compress; };
+        std::map<std::pair<uint64_t, int>, Cell> memo;
+
+        std::function<Cell(uint64_t, bool)> solve = [&](uint64_t v, bool src_ok) -> Cell {
+            auto key = std::make_pair(v, src_ok ? 1 : 0);
+            auto it = memo.find(key);
+            if (it != memo.end()) return it->second;
+
+            const auto& ch = children[v];
+            // KEEP v: all ranks stored; children may compress against v.
+            int cost_keep = isize(v);
+            for (uint64_t w : ch) cost_keep += solve(w, /*src_ok=*/true).cost;
+
+            // COMPRESS v via preferred candidate, only if that source is available.
+            int cost_comp = std::numeric_limits<int>::max();
+            bool can_comp = false;
+            if (src_ok) {
+                auto pit = prefs.find(v);
+                if (pit != prefs.end() && pit->second.cand.coverage() >= 2) {
+                    can_comp = true;
+                    int cc = isize(v) - pit->second.cand.coverage();
+                    for (uint64_t w : ch) cc += solve(w, /*src_ok=*/false).cost;
+                    cost_comp = cc;
+                }
+            }
+
+            Cell cell;
+            if (can_comp && cost_comp < cost_keep) {
+                cell = {cost_comp, true};
+            } else {
+                cell = {cost_keep, false};
+            }
+            memo[key] = cell;
+            return cell;
+        };
+
+        // Chosen compressions (target name -> candidate).
+        std::unordered_map<uint64_t, Candidate> chosen;
+
+        std::function<void(uint64_t, bool)> apply = [&](uint64_t v, bool src_ok) {
+            Cell cell = solve(v, src_ok);
+            if (cell.compress) {
+                chosen[v] = prefs[v].cand;
+                for (uint64_t w : children[v]) apply(w, /*src_ok=*/false);
+            } else {
+                for (uint64_t w : children[v]) apply(w, /*src_ok=*/true);
+            }
+        };
+
+        std::fprintf(stderr, "[tree-dp] DP on forest...\n");
+        for (uint64_t r : roots) {
+            // Root: KEEP, or COMPRESS if it has a preferred source outside its subtree.
+            int cost_keep = isize(r);
+            for (uint64_t w : children[r]) cost_keep += solve(w, true).cost;
+
+            int cost_comp = std::numeric_limits<int>::max();
+            bool can_comp = false;
+            auto pit = prefs.find(r);
+            if (pit != prefs.end() && pit->second.cand.coverage() >= 2) {
+                uint64_t s = pit->second.src_name;
+                // Source must not lie in this preference subtree.
+                if (s != r && !reaches(r, s)) {
+                    can_comp = true;
+                    int cc = isize(r) - pit->second.cand.coverage();
+                    for (uint64_t w : children[r]) cc += solve(w, false).cost;
+                    cost_comp = cc;
+                }
+            }
+
+            if (trace) {
+                std::fprintf(stderr, "root %s: keep=%d comp=%s\n",
+                             name_to_string(G_.shape, r).c_str(), cost_keep,
+                             can_comp ? std::to_string(cost_comp).c_str() : "n/a");
+            }
+
+            if (can_comp && cost_comp < cost_keep) {
+                chosen[r] = pit->second.cand;
+                for (uint64_t w : children[r]) apply(w, false);
+            } else {
+                for (uint64_t w : children[r]) apply(w, true);
+            }
+        }
+        std::fprintf(stderr, "[tree-dp] DP done\n");
+
+        // Materialize: accept deepest dependents first (pins hubs before hubs decide).
+        std::fprintf(stderr, "[tree-dp] accept chosen...\n");
+        std::function<void(uint64_t)> accept_subtree = [&](uint64_t v) {
+            for (uint64_t w : children[v]) accept_subtree(w);
+            auto it = chosen.find(v);
+            if (it == chosen.end()) return;
+            // Re-validate under availability; fall back to best available.
+            Candidate c = it->second;
+            bool ok = run_kept_(c.src_lo, c.src_hi);
+            for (int32_t rr : c.covered)
+                if (removed_[rr] || pin_count_[rr] > 0) ok = false;
+            if (!ok) {
+                const Interval* iv = by_name[v];
+                c = best_candidate_(iv->name, iv->lo, iv->hi, /*avail=*/true);
+            }
+            if (c.coverage() >= 2) {
+                if (trace) {
+                    std::fprintf(stderr, "  ACCEPT %s <- %s add=%d cov=%d\n",
+                        name_to_string(G_.shape, v).c_str(),
+                        name_to_string(G_.shape, name_of_rank_(c.src_lo)).c_str(),
+                        c.add, c.coverage());
+                }
+                accept_(c, accepted);
+            }
+        };
+        for (uint64_t r : roots) accept_subtree(r);
+
+        // Leftover intervals (not decided / not compressed): greedy with availability.
+        std::fprintf(stderr, "[tree-dp] leftover greedy...\n");
+        std::vector<const Interval*> leftover;
+        for (const auto& iv : intervals) {
+            if (iv.hi - iv.lo <= 1) continue;
+            if (accepted.count(iv.name)) continue;
+            leftover.push_back(&iv);
+        }
+        std::sort(leftover.begin(), leftover.end(),
+                  [](const Interval* a, const Interval* b) {
+                      return (a->hi - a->lo) > (b->hi - b->lo);
+                  });
+        for (const Interval* ivp : leftover) {
+            Candidate c = best_candidate_(ivp->name, ivp->lo, ivp->hi, /*avail=*/true);
+            if (c.coverage() < 2) continue;
+            accept_(c, accepted);
+        }
+        std::fprintf(stderr, "[tree-dp] leftover done\n");
+
+        // Phase II: same unpin/retarget fixed point as DepOrder.
+        run_phase2_(intervals, accepted, "tree-dp", trace, timing);
+
+        if (timing) {
+            double ms = std::chrono::duration<double, std::milli>(Clock::now() - t_all).count();
+            std::fprintf(stderr,
+                "[timing] tree-dp total: %.1fms  roots=%zu forest_nodes=%zu accepted=%zu kept=%zu\n",
+                ms, roots.size(), nodes.size(), accepted.size(), kept_count_);
+        }
+    }
+
     void compress_() {
         const size_t m = G_.m();
         rank_of_.assign(m, 0);
@@ -974,6 +1221,8 @@ private:
             compress_dep_order_(intervals, accepted);
         else if (algo_ == CompressAlgo::GreedyDfs)
             compress_greedy_dfs_(intervals, accepted);
+        else if (algo_ == CompressAlgo::TreeDp)
+            compress_tree_dp_(intervals, accepted);
         else
             compress_greedy_(intervals, accepted);
 

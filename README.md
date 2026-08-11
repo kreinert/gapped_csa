@@ -52,12 +52,14 @@ make
 ./bench_repetition
 ./bench_repetition --min-rep 10 --max-rep 100 --step 10 --seed 1
 
-# Compare / choose compression heuristic
+# Compare / choose compression heuristic (g / d / f / t = greedy, dep-order, dfs, tree-dp)
 ./compare_algos
 ./gcsa --algo greedy
 ./gcsa --algo dep-order
 ./gcsa --algo greedy-dfs          # DFS from best add=+1 hub, cumulative add
+./gcsa --algo tree-dp             # preference-forest DP (KEEP vs COMPRESS)
 GCSA_TRACE_DFS=1 ./gcsa -g /tmp/ex.fa -s "#.#" --algo greedy-dfs
+GCSA_TRACE_DP=1  ./gcsa -g /tmp/ex.fa -s "#.#" --algo tree-dp
 ```
 
 Shapes use `#` (care) and `.` (don't care), e.g. `#.#`, `##.##`, `#..#..#`.
@@ -134,8 +136,9 @@ compression on a 180 kb repetitive input: `####.####` → **40% of the full SA**
 
 ## Limitations & research extensions
 
-- **Optimal source selection** (the internship's core): the greedy is a baseline;
-  an LCP-interval / suffix-tree DP could globally minimize stored positions.
+- **Source selection**: four heuristics — `greedy`, `dep-order`, `greedy-dfs`,
+  and `tree-dp` (preference-forest DP KEEP vs COMPRESS, then Phase II
+  unpin/retarget). Use `./gcsa --algo tree-dp` or `./compare_algos`.
 - **Suffix array construction**: a linear-time integer-alphabet SA-IS
   (`src/sais.hpp`) is the default; libdivsufsort is no longer a build dependency.
   SA-IS and its indices are currently `int32_t`; for texts longer than 2³¹,
