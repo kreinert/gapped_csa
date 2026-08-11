@@ -200,8 +200,9 @@ int main(int argc, char** argv) {
             else if (a == "tree-dp2" || a == "dp2") algo = CompressAlgo::TreeDp2;
             else if (a == "tree-dp3" || a == "dp3") algo = CompressAlgo::TreeDp3;
             else if (a == "tree-dp4" || a == "dp4") algo = CompressAlgo::TreeDp4;
+            else if (a == "pseudoforest-dp" || a == "pf-dp" || a == "pfdp") algo = CompressAlgo::PseudoforestDp;
             else {
-                std::cerr << "--algo must be greedy|dep-order|tree-dp|tree-dp2|tree-dp3|tree-dp4\n";
+                std::cerr << "--algo must be greedy|dep-order|tree-dp|tree-dp2|tree-dp3|tree-dp4|pseudoforest-dp\n";
                 return 1;
             }
         }

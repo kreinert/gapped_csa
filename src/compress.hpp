@@ -64,6 +64,11 @@
 //               for each source hub, choose KEEP vs COMPRESS knowing how
 //               dependents' costs change; then Phase II unpin/retarget.
 //   TreeDp2   – same as TreeDp but without Phase II (forest DP + accept + leftover).
+//   PseudoforestDp – DP on the *whole* preference graph (out-degree<=1, no
+//               cov/size threshold): tree components use the same KEEP vs
+//               COMPRESS recurrence; unicyclic components (e.g. a mutual
+//               pair) are solved exactly by folding the cycle instead of
+//               dropping an edge to force acyclicity; then Phase II.
 
 #pragma once
 
@@ -86,6 +91,7 @@
 #include <mutex>
 #include <cstring>
 #include <cmath>
+#include <map>
 
 namespace gcsa {
 
@@ -188,6 +194,7 @@ enum class CompressAlgo {
     TreeDp2,       // same as TreeDp without Phase II
     TreeDp3,       // same as TreeDp with the cluster-LNS Phase II
     TreeDp4,       // same as TreeDp with value-based cycle repair in Phase I
+    PseudoforestDp, // exact DP on the full out-degree<=1 preference graph
 };
 
 inline const char* algo_name(CompressAlgo a) {
@@ -198,6 +205,7 @@ inline const char* algo_name(CompressAlgo a) {
         case CompressAlgo::TreeDp2:       return "tree-dp2";
         case CompressAlgo::TreeDp3:       return "tree-dp3";
         case CompressAlgo::TreeDp4:       return "tree-dp4";
+        case CompressAlgo::PseudoforestDp: return "pseudoforest-dp";
     }
     return "?";
 }
@@ -2301,6 +2309,303 @@ private:
         }
     }
 
+    // Pseudoforest DP: every interval with |I_c|>=2 and a preferred candidate
+    // of coverage>=2 gets exactly one outgoing "prefers" edge, to whichever
+    // shape holds its source (a candidate's source always lies entirely
+    // inside a single shape's interval, since LCP>=add+1>=2 forces every
+    // source rank to share its own first symbol). A graph with out-degree<=1
+    // per node is a pseudoforest: every connected component is either a tree
+    // (rooted at a node with no preference) or unicyclic (exactly one cycle,
+    // with trees hanging off each cycle node) -- never anything worse.
+    //
+    // Unlike TreeDp, no edge is ever dropped to force acyclicity. Tree
+    // components use the same KEEP/COMPRESS recurrence as TreeDp; unicyclic
+    // components are solved exactly by folding the cycle into two forced
+    // sub-cases (anchor node forced KEEP, or forced COMPRESS with its
+    // successor forced KEEP) and taking whichever is cheaper. Because
+    // cycles are solved rather than avoided, no cov>=3 or |I_c|>2 threshold
+    // is needed either -- every compressible interval participates.
+    void compress_pseudoforest_dp_(const std::vector<Interval>& intervals,
+                                   std::unordered_map<uint64_t, Candidate>& accepted) {
+        using Clock = std::chrono::steady_clock;
+        const bool timing = (std::getenv("GCSA_TIMING") != nullptr);
+        const bool trace = (std::getenv("GCSA_TRACE_PFDP") != nullptr);
+        auto t_all = Clock::now();
+
+        std::unordered_map<uint64_t, const Interval*> by_name;
+        for (const auto& iv : intervals) by_name[iv.name] = &iv;
+
+        struct Pref { Candidate cand; uint64_t src_name; };
+        std::unordered_map<uint64_t, Pref> prefs;   // node -> its unique preference
+        std::unordered_map<uint64_t, std::vector<Candidate>> cand_cache;  // reused by Phase II
+
+        std::fprintf(stderr, "[pseudoforest-dp] preference graph build...\n");
+        for (const auto& iv : intervals) {
+            if (iv.hi - iv.lo < 2) continue;
+            auto cands = enumerate_candidates_(iv.name, iv.lo, iv.hi, /*avail=*/false);
+            Candidate best = pick_best_(cands);
+            if (best.coverage() >= 2) {
+                uint64_t src = name_of_rank_(best.src_lo);
+                if (src != iv.name && by_name.count(src))
+                    prefs.emplace(iv.name, Pref{best, src});
+            }
+            std::sort(cands.begin(), cands.end(), [](const Candidate& a, const Candidate& b){
+                if (a.coverage() != b.coverage()) return a.coverage() > b.coverage();
+                return a.add > b.add;
+            });
+            cand_cache.emplace(iv.name, std::move(cands));
+        }
+
+        std::unordered_set<uint64_t> all_nodes;
+        for (const auto& iv : intervals) if (iv.hi - iv.lo >= 2) all_nodes.insert(iv.name);
+
+        auto isize = [&](uint64_t n) -> int {
+            auto it = by_name.find(n);
+            return it == by_name.end() ? 0 : (it->second->hi - it->second->lo);
+        };
+        auto has_pref = [&](uint64_t n) { return prefs.count(n) != 0; };
+        auto pref_src = [&](uint64_t n) { return prefs.at(n).src_name; };
+
+        // ---- pure graph decomposition: find every cycle up front ----------
+        // (independent of the DP; identifies exactly which single incoming
+        // edge per cycle node is "cycle-internal" so it can be excluded from
+        // the generic children[] map used by solve()/apply() below -- that
+        // edge is instead handled explicitly by fold_cycle's scenario walk,
+        // never both, which would double count it.)
+        enum class Color : uint8_t { White, Gray, Black };
+        std::unordered_map<uint64_t, Color> color;
+        for (uint64_t n : all_nodes) color[n] = Color::White;
+        std::vector<std::vector<uint64_t>> cycles;
+        std::unordered_map<uint64_t, uint64_t> cycle_pred;  // cyc[i] -> cyc[i-1] (to exclude)
+
+        for (uint64_t start : all_nodes) {
+            if (color[start] != Color::White) continue;
+            std::vector<uint64_t> path;
+            uint64_t v = start;
+            bool hit_cycle = false;
+            uint64_t cycle_entry = 0;
+            while (true) {
+                if (color[v] == Color::Black) break;
+                if (color[v] == Color::Gray) { hit_cycle = true; cycle_entry = v; break; }
+                color[v] = Color::Gray;
+                path.push_back(v);
+                if (!has_pref(v)) break;   // tree root: end of chain
+                v = pref_src(v);
+            }
+            if (hit_cycle) {
+                auto it = std::find(path.begin(), path.end(), cycle_entry);
+                std::vector<uint64_t> cyc(it, path.end());
+                int L = (int)cyc.size();
+                for (int i = 0; i < L; ++i)
+                    cycle_pred[cyc[i]] = cyc[(i + L - 1) % L];
+                cycles.push_back(std::move(cyc));
+            }
+            for (uint64_t u : path) color[u] = Color::Black;
+        }
+
+        // children[w] = dependents of w, EXCLUDING the one cycle-internal
+        // edge per cycle node (handled explicitly by fold_cycle instead).
+        std::unordered_map<uint64_t, std::vector<uint64_t>> children;
+        for (auto& kv : prefs) {
+            uint64_t v = kv.first, src = kv.second.src_name;
+            auto it = cycle_pred.find(src);
+            if (it != cycle_pred.end() && it->second == v) continue;
+            children[src].push_back(v);
+        }
+
+        if (trace) {
+            std::fprintf(stderr, "=== pseudoforest-dp preference graph ===\n");
+            for (uint64_t v : all_nodes) {
+                if (!has_pref(v)) continue;
+                std::fprintf(stderr, "  %s -> %s (cov=%d)\n",
+                    name_to_string(G_.shape, v).c_str(),
+                    name_to_string(G_.shape, pref_src(v)).c_str(),
+                    prefs.at(v).cand.coverage());
+            }
+            std::fprintf(stderr, "cycles found: %zu\n", cycles.size());
+            for (auto& cyc : cycles) {
+                std::fprintf(stderr, "  [");
+                for (size_t i = 0; i < cyc.size(); ++i)
+                    std::fprintf(stderr, "%s%s", i ? "," : "",
+                                 name_to_string(G_.shape, cyc[i]).c_str());
+                std::fprintf(stderr, "]\n");
+            }
+        }
+
+        // ---- KEEP / COMPRESS DP (identical recurrence to TreeDp) ----------
+        struct Cell { long long cost; bool compress; };
+        std::map<std::pair<uint64_t, int>, Cell> memo;
+
+        std::function<Cell(uint64_t, bool)> solve = [&](uint64_t v, bool src_ok) -> Cell {
+            auto key = std::make_pair(v, src_ok ? 1 : 0);
+            auto it = memo.find(key);
+            if (it != memo.end()) return it->second;
+
+            const auto& ch = children[v];
+            long long cost_keep = isize(v);
+            for (uint64_t w : ch) cost_keep += solve(w, /*src_ok=*/true).cost;
+
+            long long cost_comp = std::numeric_limits<long long>::max();
+            bool can_comp = false;
+            if (src_ok && has_pref(v)) {
+                can_comp = true;
+                long long cc = isize(v) - prefs.at(v).cand.coverage();
+                for (uint64_t w : ch) cc += solve(w, /*src_ok=*/false).cost;
+                cost_comp = cc;
+            }
+
+            Cell cell = (can_comp && cost_comp < cost_keep) ? Cell{cost_comp, true}
+                                                             : Cell{cost_keep, false};
+            memo[key] = cell;
+            return cell;
+        };
+
+        std::unordered_map<uint64_t, Candidate> chosen;  // node -> compressed-via candidate
+
+        std::function<void(uint64_t, bool)> apply = [&](uint64_t v, bool src_ok) {
+            Cell cell = solve(v, src_ok);
+            if (cell.compress) {
+                chosen[v] = prefs.at(v).cand;
+                for (uint64_t w : children[v]) apply(w, /*src_ok=*/false);
+            } else {
+                for (uint64_t w : children[v]) apply(w, /*src_ok=*/true);
+            }
+        };
+
+        // Fold a unicyclic component's cycle cyc[0]->cyc[1]->...->cyc[L-1]->cyc[0]
+        // (cyc[i]'s preferred source is cyc[i+1 mod L]) into two forced
+        // sub-cases. cyc[0]'s own compress-ability requires walking all the
+        // way around and back to itself -- a circular dependency broken by
+        // fixing cyc[0]'s status externally instead of deriving it.
+        auto fold_cycle = [&](const std::vector<uint64_t>& cyc) {
+            int L = (int)cyc.size();
+
+            // Scenario A: cyc[0] forced KEEP (always valid on its own).
+            long long costA = isize(cyc[0]);
+            for (uint64_t w : children[cyc[0]]) costA += solve(w, true).cost;
+            std::vector<char> statusA(L, 1);
+            {
+                bool avail = true;   // cyc[0] is available
+                for (int i = L - 1; i >= 1; --i) {
+                    Cell cell = solve(cyc[i], avail);
+                    costA += cell.cost;
+                    statusA[i] = cell.compress ? 0 : 1;
+                    avail = (statusA[i] == 1);
+                }
+            }
+
+            // Scenario B: cyc[0] forced COMPRESS -> cyc[1] forced KEEP (must
+            // be physically stored for cyc[0] to point at). Walk the rest of
+            // the cycle from cyc[L-1] with cyc[0] unavailable.
+            long long costB = isize(cyc[0]) - prefs.at(cyc[0]).cand.coverage();
+            for (uint64_t w : children[cyc[0]]) costB += solve(w, false).cost;
+            {
+                long long cyc1_keep = isize(cyc[1]);
+                for (uint64_t w : children[cyc[1]]) cyc1_keep += solve(w, true).cost;
+                costB += cyc1_keep;
+            }
+            std::vector<char> statusB(L, 1);
+            statusB[0] = 0;
+            {
+                bool avail = false;  // cyc[0] unavailable
+                for (int i = L - 1; i >= 2; --i) {
+                    Cell cell = solve(cyc[i], avail);
+                    costB += cell.cost;
+                    statusB[i] = cell.compress ? 0 : 1;
+                    avail = (statusB[i] == 1);
+                }
+            }
+
+            bool use_a = (costA <= costB);
+            const std::vector<char>& status = use_a ? statusA : statusB;
+            if (trace) {
+                std::fprintf(stderr,
+                    "cycle(len=%d) anchor-keep=%lld anchor-compress=%lld -> %s\n",
+                    L, costA, costB, use_a ? "keep anchor" : "compress anchor");
+            }
+
+            for (int i = 0; i < L; ++i) {
+                uint64_t v = cyc[i];
+                if (status[i] == 0) {
+                    chosen[v] = prefs.at(v).cand;
+                    for (uint64_t w : children[v]) apply(w, /*src_ok=*/false);
+                } else {
+                    for (uint64_t w : children[v]) apply(w, /*src_ok=*/true);
+                }
+            }
+        };
+
+        std::fprintf(stderr, "[pseudoforest-dp] DP on components...\n");
+        size_t n_roots = 0;
+        for (uint64_t v : all_nodes) {
+            if (has_pref(v)) continue;
+            apply(v, /*src_ok=*/true);
+            ++n_roots;
+        }
+        for (auto& cyc : cycles) fold_cycle(cyc);
+        std::fprintf(stderr, "[pseudoforest-dp] DP done (roots=%zu cycles=%zu)\n",
+                     n_roots, cycles.size());
+
+        // Materialize. Every accepted candidate's source shape is, by DP
+        // construction, never itself compressed in the same solution (a
+        // compress choice is only ever taken under src_ok=true, i.e. when
+        // the source was already decided KEPT), so accept order across
+        // `chosen` cannot conflict -- no dependency ordering is required.
+        std::fprintf(stderr, "[pseudoforest-dp] accept chosen...\n");
+        for (auto& kv : chosen) {
+            uint64_t v = kv.first;
+            Candidate c = kv.second;
+            bool ok = run_kept_(c.src_lo, c.src_hi);
+            for (int32_t rr : c.covered)
+                if (removed_[rr] || pin_count_[rr] > 0) ok = false;
+            if (!ok) {
+                const Interval* iv = by_name[v];
+                c = best_candidate_(iv->name, iv->lo, iv->hi, /*avail=*/true);
+            }
+            if (c.coverage() >= 2) {
+                if (trace) {
+                    std::fprintf(stderr, "  ACCEPT %s <- %s add=%d cov=%d\n",
+                        name_to_string(G_.shape, v).c_str(),
+                        name_to_string(G_.shape, name_of_rank_(c.src_lo)).c_str(),
+                        c.add, c.coverage());
+                }
+                accept_(c, accepted);
+            }
+        }
+
+        // Leftover: should be empty by construction (every |I_c|>=2 interval
+        // is either a root or belongs to exactly one component above); kept
+        // only as defensive insurance, matching the other algorithms.
+        std::fprintf(stderr, "[pseudoforest-dp] leftover greedy...\n");
+        std::vector<const Interval*> leftover;
+        for (const auto& iv : intervals) {
+            if (iv.hi - iv.lo <= 1) continue;
+            if (accepted.count(iv.name)) continue;
+            leftover.push_back(&iv);
+        }
+        std::sort(leftover.begin(), leftover.end(),
+                  [](const Interval* a, const Interval* b) {
+                      return (a->hi - a->lo) > (b->hi - b->lo);
+                  });
+        for (const Interval* ivp : leftover) {
+            Candidate c = best_candidate_(ivp->name, ivp->lo, ivp->hi, /*avail=*/true);
+            if (c.coverage() < 2) continue;
+            accept_(c, accepted);
+        }
+        std::fprintf(stderr, "[pseudoforest-dp] leftover done\n");
+
+        // Phase II: same unpin/retarget fixed point as DepOrder/TreeDp.
+        run_phase2_(intervals, accepted, "pseudoforest-dp", trace, timing, &cand_cache);
+
+        if (timing) {
+            double ms = std::chrono::duration<double, std::milli>(Clock::now() - t_all).count();
+            std::fprintf(stderr,
+                "[timing] pseudoforest-dp total: %.1fms  roots=%zu cycles=%zu "
+                "nodes=%zu accepted=%zu kept=%zu\n",
+                ms, n_roots, cycles.size(), all_nodes.size(), accepted.size(), kept_count_);
+        }
+    }
+
     void compress_() {
         const size_t m = G_.m();
         rank_of_.assign(m, 0);
@@ -2337,6 +2642,8 @@ private:
         else if (algo_ == CompressAlgo::TreeDp4)
             compress_tree_dp_(intervals, accepted, Phase2Mode::Greedy,
                               /*cycle_repair=*/true);
+        else if (algo_ == CompressAlgo::PseudoforestDp)
+            compress_pseudoforest_dp_(intervals, accepted);
         else
             compress_greedy_(intervals, accepted);
 
