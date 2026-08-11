@@ -13,8 +13,8 @@
 \usepackage{tabularx}
 \usepackage{hyperref}
 
-\title{Dependency-order differential compression\\
-of the gapped suffix array}
+\title{Dependency-order and preference-forest DP\\
+differential compression of the gapped suffix array}
 \author{}
 \date{}
 
@@ -393,5 +393,221 @@ The \(\mathtt{GCCTTTAAAG}{\times}3\)~/ \(\mathtt{\#\,.\,\#}\) instance
 is the minimal didactic witness of the hub-protection phenomenon: CT
 and GC must stay in \(C\), and every other multi-occurrence name
 collapses onto them, yielding \(|C|=14\) against greedy's \(22\).
+
+\section{The Tree-DP algorithm
+(preference-forest DP)}
+
+Tree-DP attacks the same objective --- minimise \(|C|\) --- by an exact
+dynamic program on a \emph{preference forest} extracted from the same
+static preferences, followed by the shared Phase~II pass.
+
+\subsection{From preference DAG to preference forest}
+
+Recall that each interval \(I_c\) with \(|I_c|>1\) has a preferred
+differential candidate (maximising coverage, then \(a\)). Tree-DP
+retains a candidate for name \(c\) only if
+\[
+|I_c|>2
+\]
+(singletons and size-\(2\) intervals are left to a later leftover
+pass). A directed preference \(w\to c\) (``\(c\) prefers a source
+inside \(I_w\)'') becomes a \textbf{forest edge} only when its
+coverage satisfies
+\[
+\mathrm{cov}\ge 3.
+\]
+Self-loops are dropped, and an edge is skipped if it would close a
+cycle in the forest under construction. The resulting graph is
+therefore a forest of rooted trees: each non-root \(c\) has a unique
+parent \(\mathrm{parent}(c)=w\), the preferred source of \(c\).
+
+Weak mutual preferences of coverage~$2$ (such as
+\(\mathrm{CT}\leftrightarrow\mathrm{GC}\) on the running example) are
+filtered out by the \(\mathrm{cov}\ge 3\) threshold, so cycles in the
+full preference DAG typically dissolve into independent high-coverage
+stars.
+
+\subsection{KEEP versus COMPRESS}
+
+Write \(\mathrm{isize}(v)=|I_v|\). For a node \(v\) whose preferred
+source is currently available (\(\mathit{src\_ok}=\mathsf{true}\)),
+Tree-DP chooses between two local decisions:
+
+\begin{itemize}
+\item \textbf{KEEP} \(v\): store all \(\mathrm{isize}(v)\) ranks of
+  \(I_v\). Every child \(w\) may then treat \(v\) as an available
+  source:
+  \[
+  \mathrm{cost}_{\mathrm{keep}}(v)
+  =
+  \mathrm{isize}(v)
+  +
+  \sum_{w\,\mathrm{child\,of}\,v}
+    \mathrm{DP}(w,\,\mathit{src\_ok}=\mathsf{true}).
+  \]
+\item \textbf{COMPRESS} \(v\): accept the preferred candidate of
+  coverage \(\mathrm{cov}(v)\), paying only the uncovered ranks
+  \(\mathrm{isize}(v)-\mathrm{cov}(v)\). Children lose \(v\) as a
+  source:
+  \[
+  \mathrm{cost}_{\mathrm{comp}}(v)
+  =
+  \mathrm{isize}(v)-\mathrm{cov}(v)
+  +
+  \sum_{w\,\mathrm{child\,of}\,v}
+    \mathrm{DP}(w,\,\mathit{src\_ok}=\mathsf{false}).
+  \]
+\end{itemize}
+The recurrence returns the cheaper option (KEEP on a tie). If
+\(\mathit{src\_ok}=\mathsf{false}\), COMPRESS is forbidden and the
+node is forced to KEEP. Roots are handled identically, except that
+COMPRESS is allowed only when the preferred source lies
+\emph{outside} the root's preference subtree (so the source is not
+itself a forest descendant of the root).
+
+The DP is exact for the \(|C|\) contribution of all forest nodes under
+this KEEP~/ COMPRESS model. Intervals that never entered the forest
+(or remain uncompressed after the DP choice) are finished by a
+size-ordered availability greedy; then the shared Phase~II
+unpin~/ retarget fixed point of DepOrder is run unchanged.
+
+\subsection{Worked example on the preference forest}
+
+On \(T=(\mathtt{GCCTTTAAAG})^3\), \(S=\mathtt{\#\,.\,\#}\), the
+\(\mathrm{cov}\ge 3\) filter retains exactly four edges and yields two
+stars:
+
+\begin{center}
+\begin{tabular}{@{}llll@{}}
+\toprule
+parent (source) & child (target) & \(a\) & cov \\
+\midrule
+GC & AA & 2 & 3 \\
+GC & TT & 1 & 3 \\
+CT & AG & 2 & 5 \\
+CT & TA & 1 & 6 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[
+  hub/.style={draw, thick, circle, minimum size=1.1cm,
+              font=\bfseries},
+  leaf/.style={draw, rounded corners=2pt, minimum width=0.9cm,
+               minimum height=0.7cm},
+  every edge/.style={draw, -{Latex[length=2mm]}},
+  lbl/.style={font=\scriptsize, fill=white, inner sep=1pt}
+]
+  \node[hub]  (GC) at (0,0)  {GC};
+  \node[leaf] (AA) at (-1.5,1.5) {AA};
+  \node[leaf] (TT) at (1.5,1.5)  {TT};
+
+  \node[hub]  (CT) at (5.5,0)  {CT};
+  \node[leaf] (AG) at (4.0,1.5) {AG};
+  \node[leaf] (TA) at (7.0,1.5) {TA};
+
+  \draw (GC) edge node[lbl, left]  {\(a{=}2\), cov\({\,=}3\)} (AA);
+  \draw (GC) edge node[lbl, right] {\(a{=}1\), cov\({\,=}3\)} (TT);
+  \draw (CT) edge node[lbl, left]  {\(a{=}2\), cov\({\,=}5\)} (AG);
+  \draw (CT) edge node[lbl, right] {\(a{=}1\), cov\({\,=}6\)} (TA);
+\end{tikzpicture}
+\caption{Preference forest for the running example: two stars
+\(\mathrm{GC}\to\{\mathrm{AA},\mathrm{TT}\}\) and
+\(\mathrm{CT}\to\{\mathrm{AG},\mathrm{TA}\}\). The weak hub--hub
+edges of coverage~$2$ do not enter the forest.}
+\label{fig:pref-forest}
+\end{figure}
+
+\paragraph{Leaves under an available hub.}
+With \(\mathit{src\_ok}=\mathsf{true}\), each leaf prefers COMPRESS:
+e.g.\ \(\mathrm{cost}_{\mathrm{comp}}(\mathrm{AA})=3-3=0\)
+(versus KEEP~$3$), and likewise TT, AG, TA all compress to cost~$0$.
+
+\paragraph{Root GC.}
+\[
+\begin{aligned}
+\mathrm{cost}_{\mathrm{keep}}(\mathrm{GC})
+  &= 5 + 0 + 0 = 5,\\
+\mathrm{cost}_{\mathrm{comp}}(\mathrm{GC})
+  &= (5-2) + \underbrace{3}_{\mathrm{AA\,KEEP}}
+           + \underbrace{3}_{\mathrm{TT\,KEEP}} = 9
+\end{aligned}
+\]
+(compressing GC via CT would deny the children their hub, forcing
+them to KEEP). Since \(5<9\), the DP \textbf{KEEPs} GC.
+
+\paragraph{Root CT.}
+\[
+\begin{aligned}
+\mathrm{cost}_{\mathrm{keep}}(\mathrm{CT})
+  &= 6 + 0 + 0 = 6,\\
+\mathrm{cost}_{\mathrm{comp}}(\mathrm{CT})
+  &= (6-2) + 5 + 6 = 15.
+\end{aligned}
+\]
+Again KEEP wins. Materialisation accepts the four leaf compressions
+(deepest first), leftover greedy finds nothing further, and Phase~II
+is a no-op --- exactly as under DepOrder --- yielding
+\[
+|C|=14.
+\]
+
+\subsection{Contrast with DepOrder}
+
+Both algorithms protect the same hubs on this instance and reach the
+same \(|C|=14\). They differ in mechanism:
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{2.8cm}p{5.6cm}p{5.6cm}@{}}
+\toprule
+ & DepOrder & Tree-DP \\
+\midrule
+Graph model &
+  preference DAG (cycles allowed) &
+  preference forest:
+  nodes with \(|I_c|>2\);
+  edges only if \(\mathrm{cov}\ge 3\)
+  (cycle-breaking) \\
+Phase~I &
+  reverse-topo acceptance with live
+  availability~/ pins (sinks first) &
+  exact KEEP~/ COMPRESS DP per tree;
+  materialise deepest-first \\
+Hub--hub cov~$2$ &
+  present in the DAG; sinks-first
+  pinning forces hubs to SKIP &
+  omitted from the forest; DP compares
+  \(\mathrm{cost}_{\mathrm{keep}}\)
+  (\(5\)~/ \(6\)) to the costly COMPRESS
+  alternative \\
+Phase~II &
+  unpin~/ retarget~/ transitive add &
+  same shared Phase~II \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+DepOrder reasons operationally (who pins whom, in which order).
+Tree-DP reasons globally on a simplified forest: the numeric comparison
+\(\mathrm{cost}_{\mathrm{keep}}<\mathrm{cost}_{\mathrm{comp}}\) is
+precisely the statement that keeping a hub is cheaper than
+compressing it at the expense of its high-coverage dependents --- the
+same structural insight DepOrder realises by sinks-first pinning.
+
+\section{Summary}
+
+On the didactic instance
+\(\mathtt{GCCTTTAAAG}{\times}3\)~/ \(\mathtt{\#\,.\,\#}\), both
+DepOrder and Tree-DP store the hubs CT and GC in full, differentially
+recover AA, TT, AG, and TA from them, and finish at \(|C|=14\)
+(against size-order greedy's~$22$). Phase~II is common to both and
+idle here; it matters when a kept hub should later be lifted onto a
+deeper source after dependents have been retargeted. Tree-DP's
+filters \(|I_c|>2\) and \(\mathrm{cov}\ge 3\) turn the cyclic
+preference DAG into a clean two-star forest on which KEEP versus
+COMPRESS is decided by dynamic programming.
 
 \end{document}
