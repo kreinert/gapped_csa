@@ -200,10 +200,17 @@ private:
 
     // Enumerate all viable source runs for I_c = [lo,hi). Optionally require
     // sources kept and covered ranks free of pins (availability filter).
+    // If only_add >= 1, enumerate that single add only (used by best_add1).
+    // If min_cov > 2, skip emitting candidates with coverage < min_cov.
     std::vector<Candidate> enumerate_candidates_(uint64_t name, int32_t lo, int32_t hi,
-                                                  bool require_avail) const {
+                                                  bool require_avail,
+                                                  int only_add = -1,
+                                                  int min_cov = 2) const {
         std::vector<Candidate> out;
-        for (int add = 1; add <= max_add_; ++add) {
+        const int add_lo = (only_add >= 1) ? only_add : 1;
+        const int add_hi = (only_add >= 1) ? only_add : max_add_;
+        const int cov_floor = std::max(2, min_cov);
+        for (int add = add_lo; add <= add_hi; ++add) {
             std::vector<std::pair<int32_t,int32_t>> pr;
             pr.reserve(hi - lo);
             for (int32_t r = lo; r < hi; ++r) {
@@ -221,7 +228,7 @@ private:
                 int32_t s_lo = pr[i].first, s_hi = pr[j-1].first + 1;
                 bool disjoint = (s_hi <= lo || s_lo >= hi);
                 int cov = (int)(j - i);
-                if (disjoint && cov >= 2) {
+                if (disjoint && cov >= cov_floor) {
                     bool ok = true;
                     if (require_avail) {
                         ok = run_kept_(s_lo, s_hi);
@@ -446,44 +453,89 @@ private:
     // Fixed-point unpin / retarget: try higher-coverage candidates (including
     // former sources), retargeting dependents with transitive add when needed.
     // Shared by DepOrder Phase II and TreeDp Phase II.
+    //
+    // Candidates with require_avail=false depend only on SA/LCP structure, so we
+    // enumerate once per interval and reuse across iterations. Optional
+    // `precomputed` cache (e.g. from TreeDp preference build) avoids re-enum.
+    //
+    // Env GCSA_PHASE2_MAX_ITERS=K (optional): hard-cap Phase II sweeps. Default
+    // is |I|+5 (full fixed point). A cap may leave |C| slightly larger.
     void run_phase2_(const std::vector<Interval>& intervals,
                      std::unordered_map<uint64_t, Candidate>& accepted,
                      const char* label,
                      bool trace,
-                     bool timing) {
+                     bool timing,
+                     std::unordered_map<uint64_t, std::vector<Candidate>>* precomputed = nullptr) {
         using Clock = std::chrono::steady_clock;
         const int N = (int)intervals.size();
+        int max_iters = N + 5;
+        if (const char* env = std::getenv("GCSA_PHASE2_MAX_ITERS")) {
+            int v = std::atoi(env);
+            if (v > 0) max_iters = v;
+        }
         std::fprintf(stderr, "[%s] Phase II: unpin/retarget...\n", label);
+        if (timing && precomputed) {
+            std::fprintf(stderr, "[timing] %s Phase II precomputed cache size=%zu\n",
+                         label, precomputed->size());
+        }
         auto t0 = Clock::now();
-        bool changed = true;
-        int guard = 0;
-        size_t phase2_enum = 0, phase2_tries = 0;
+
+        // Size-order once; static candidate lists (avail ignored) cached once.
+        std::vector<const Interval*> order;
+        for (const auto& iv : intervals) if (iv.hi - iv.lo > 1) order.push_back(&iv);
+        std::sort(order.begin(), order.end(),
+                  [](const Interval* a, const Interval* b){
+                      return (a->hi-a->lo) > (b->hi-b->lo);
+                  });
+
+        std::unordered_map<uint64_t, std::vector<Candidate>> local_cache;
+        auto& cand_cache = precomputed ? *precomputed : local_cache;
+        size_t phase2_enum = 0, phase2_cache_hits = 0, phase2_skip_sat = 0;
+        size_t phase2_skip_best = 0, phase2_tries = 0;
         size_t phase2_fail = 0, phase2_improve = 0;
         size_t phase2_fast_pin = 0, phase2_multi_pin = 0, phase2_no_pin = 0;
         double ms_enum = 0, ms_try = 0;
-        while (changed && guard++ < N + 5) {
+
+        auto get_cands = [&](const Interval& iv) -> const std::vector<Candidate>& {
+            auto it = cand_cache.find(iv.name);
+            if (it != cand_cache.end()) {
+                ++phase2_cache_hits;
+                return it->second;
+            }
+            auto te0 = Clock::now();
+            auto cands = enumerate_candidates_(iv.name, iv.lo, iv.hi,
+                                               /*require_avail=*/false);
+            if (timing) ms_enum += std::chrono::duration<double, std::milli>(Clock::now() - te0).count();
+            ++phase2_enum;
+            std::sort(cands.begin(), cands.end(), [](const Candidate& a, const Candidate& b){
+                if (a.coverage() != b.coverage()) return a.coverage() > b.coverage();
+                return a.add > b.add;
+            });
+            auto& slot = cand_cache[iv.name];
+            slot = std::move(cands);
+            return slot;
+        };
+
+        // Fixed-point sweeps over all |I|>1 intervals (size order). Candidate
+        // lists are cached; skips below avoid redundant try work.
+        bool changed = true;
+        int guard = 0;
+        while (changed && guard++ < max_iters) {
             changed = false;
-            std::vector<const Interval*> order;
-            for (const auto& iv : intervals) if (iv.hi - iv.lo > 1) order.push_back(&iv);
-            std::sort(order.begin(), order.end(),
-                      [](const Interval* a, const Interval* b){
-                          return (a->hi-a->lo) > (b->hi-b->lo);
-                      });
             for (const Interval* ivp : order) {
-                auto te0 = Clock::now();
-                auto cands = enumerate_candidates_(ivp->name, ivp->lo, ivp->hi,
-                                                   /*require_avail=*/false);
-                if (timing) ms_enum += std::chrono::duration<double, std::milli>(Clock::now() - te0).count();
-                ++phase2_enum;
-                std::sort(cands.begin(), cands.end(), [](const Candidate& a, const Candidate& b){
-                    if (a.coverage() != b.coverage()) return a.coverage() > b.coverage();
-                    return a.add > b.add;
-                });
+                const int isize = ivp->hi - ivp->lo;
                 int cur_cov = 0;
                 auto it = accepted.find(ivp->name);
                 if (it != accepted.end()) cur_cov = it->second.coverage();
+                if (cur_cov >= isize) { ++phase2_skip_sat; continue; }
 
-                for (auto& c : cands) {
+                const auto& cands = get_cands(*ivp);
+                if (cands.empty() || cands.front().coverage() <= cur_cov) {
+                    ++phase2_skip_best;
+                    continue;
+                }
+
+                for (const auto& c : cands) {
                     if (c.coverage() <= cur_cov) break;
                     if (!run_kept_(c.src_lo, c.src_hi)) continue;
                     bool ok = true;
@@ -532,10 +584,12 @@ private:
         if (timing) {
             double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
             std::fprintf(stderr,
-                "[timing] %s Phase II: %.1fms  iters=%d enums=%zu tries=%zu "
+                "[timing] %s Phase II: %.1fms  iters=%d enums=%zu cache_hits=%zu "
+                "skip_sat=%zu skip_best=%zu tries=%zu "
                 "fail=%zu improve=%zu pin(none/fast/multi)=%zu/%zu/%zu "
                 "enum=%.1fms try=%.1fms\n",
-                label, ms, guard, phase2_enum, phase2_tries,
+                label, ms, guard, phase2_enum, phase2_cache_hits,
+                phase2_skip_sat, phase2_skip_best, phase2_tries,
                 phase2_fail, phase2_improve,
                 phase2_no_pin, phase2_fast_pin, phase2_multi_pin,
                 ms_enum, ms_try);
@@ -612,14 +666,25 @@ private:
 
         // Preference relation: only intervals with |I_c| > 2 participate
         // (cardinality-2 intervals are ignored for prefs / DAG / Phase I).
+        // Static cand lists for all |I|>1 are reused by Phase II.
+        std::unordered_map<uint64_t, std::vector<Candidate>> cand_cache;
         std::fprintf(stderr, "[dep-order] preference / DAG build...\n");
         auto t0 = Clock::now();
         for (const auto& iv : intervals) {
-            if (iv.hi - iv.lo <= 2) continue;
-            Candidate c = best_candidate_(iv.name, iv.lo, iv.hi, /*avail=*/false);
-            if (c.coverage() < 2) continue;
-            uint64_t src_name = name_of_rank_(c.src_lo);
-            prefs.push_back({&iv, std::move(c), src_name});
+            if (iv.hi - iv.lo <= 1) continue;
+            auto cands = enumerate_candidates_(iv.name, iv.lo, iv.hi, /*avail=*/false);
+            if (iv.hi - iv.lo > 2) {
+                Candidate c = pick_best_(cands);
+                if (c.coverage() >= 2) {
+                    uint64_t src_name = name_of_rank_(c.src_lo);
+                    prefs.push_back({&iv, std::move(c), src_name});
+                }
+            }
+            std::sort(cands.begin(), cands.end(), [](const Candidate& a, const Candidate& b){
+                if (a.coverage() != b.coverage()) return a.coverage() > b.coverage();
+                return a.add > b.add;
+            });
+            cand_cache.emplace(iv.name, std::move(cands));
         }
         auto t1 = Clock::now();
 
@@ -727,7 +792,7 @@ private:
             std::fprintf(stderr, "after Phase I: kept=%zu accepted=%zu\n", kept, accepted.size());
         }
 
-        run_phase2_(intervals, accepted, "dep-order", trace, timing);
+        run_phase2_(intervals, accepted, "dep-order", trace, timing, &cand_cache);
         auto t4 = Clock::now();
         if (timing) {
             auto ms = [](Clock::time_point a, Clock::time_point b) {
@@ -745,9 +810,10 @@ private:
     Candidate best_add1_from_(const Interval& target, const Interval& source,
                               bool require_avail) const {
         Candidate best;
-        auto cands = enumerate_candidates_(target.name, target.lo, target.hi, require_avail);
+        // Only enumerate add=1 — callers never accept other adds here.
+        auto cands = enumerate_candidates_(target.name, target.lo, target.hi,
+                                           require_avail, /*only_add=*/1);
         for (auto& c : cands) {
-            if (c.add != 1) continue;
             if (c.src_lo < source.lo || c.src_hi > source.hi) continue;
             if (c.coverage() > best.coverage()
                 || (c.coverage() == best.coverage() && c.src_lo < best.src_lo))
@@ -981,14 +1047,27 @@ private:
 
         struct Pref { const Interval* iv; Candidate cand; uint64_t src_name; };
         std::unordered_map<uint64_t, Pref> prefs;   // target -> preferred
+        // Static (avail=false) candidate lists — reused by Phase II.
+        // Prefs use pick_best_ on enum order (stable tie-break); Phase II wants
+        // coverage-desc order, so we sort only after recording the preferred.
+        std::unordered_map<uint64_t, std::vector<Candidate>> cand_cache;
 
         std::fprintf(stderr, "[tree-dp] preference forest build...\n");
         for (const auto& iv : intervals) {
-            if (iv.hi - iv.lo <= 2) continue;
-            Candidate c = best_candidate_(iv.name, iv.lo, iv.hi, /*avail=*/false);
-            if (c.coverage() < 2) continue;
-            uint64_t src = name_of_rank_(c.src_lo);
-            prefs.emplace(iv.name, Pref{&iv, std::move(c), src});
+            if (iv.hi - iv.lo <= 1) continue;
+            auto cands = enumerate_candidates_(iv.name, iv.lo, iv.hi, /*avail=*/false);
+            if (iv.hi - iv.lo > 2) {
+                Candidate best = pick_best_(cands);
+                if (best.coverage() >= 2) {
+                    uint64_t src = name_of_rank_(best.src_lo);
+                    prefs.emplace(iv.name, Pref{&iv, std::move(best), src});
+                }
+            }
+            std::sort(cands.begin(), cands.end(), [](const Candidate& a, const Candidate& b){
+                if (a.coverage() != b.coverage()) return a.coverage() > b.coverage();
+                return a.add > b.add;
+            });
+            cand_cache.emplace(iv.name, std::move(cands));
         }
 
         // Forest edges: only cov>=3 (same threshold as DepOrder DAG edges).
@@ -1183,8 +1262,8 @@ private:
         }
         std::fprintf(stderr, "[tree-dp] leftover done\n");
 
-        // Phase II: same unpin/retarget fixed point as DepOrder.
-        run_phase2_(intervals, accepted, "tree-dp", trace, timing);
+        // Phase II: same unpin/retarget fixed point as DepOrder (reuse cand_cache).
+        run_phase2_(intervals, accepted, "tree-dp", trace, timing, &cand_cache);
 
         if (timing) {
             double ms = std::chrono::duration<double, std::milli>(Clock::now() - t_all).count();
