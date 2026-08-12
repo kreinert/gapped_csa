@@ -2555,6 +2555,25 @@ private:
         std::fprintf(stderr, "[pseudoforest-dp] DP done (roots=%zu cycles=%zu)\n",
                      n_roots, cycles.size());
 
+        // iter_dp groundwork: how many shapes with a preferred candidate
+        // (a `prefs` entry) actually got compressed via it (`chosen`)? Every
+        // prefs entry is visited exactly once by apply()/fold_cycle() above,
+        // and only ever lands in `chosen` when the DP picked compress=true
+        // for it, so prefs.size()-chosen.size() is exactly the number of
+        // shapes whose preferred candidate lost to KEEP in this pseudoforest
+        // -- the population an iterative second round would re-examine.
+        // Reported before Materialize/leftover/Phase II so it isn't muddied
+        // by their separate (non-preferred-candidate) fixups.
+        {
+            const size_t n_prefs = prefs.size();
+            const size_t n_orphaned = n_prefs - chosen.size();
+            std::fprintf(stderr,
+                "[pseudoforest-dp] preferred candidates: total=%zu accepted_by_dp=%zu "
+                "orphaned=%zu (%.1f%% orphaned)\n",
+                n_prefs, chosen.size(), n_orphaned,
+                n_prefs ? 100.0 * (double)n_orphaned / (double)n_prefs : 0.0);
+        }
+
         // Materialize. Every accepted candidate's source shape is, by DP
         // construction, never itself compressed in the same solution (a
         // compress choice is only ever taken under src_ok=true, i.e. when
