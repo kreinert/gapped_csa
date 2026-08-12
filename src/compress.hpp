@@ -83,6 +83,7 @@
 #include <limits>
 #include <thread>
 #include <atomic>
+#include <mutex>
 #include <cstring>
 #include <cmath>
 
@@ -117,6 +118,16 @@ constexpr int kMinCoverage = 3;
 // first. Callers override it per build (CompressedIndex::build's phase2_iters,
 // i.e. --phase2-iters), or process-wide with GCSA_PHASE2_MAX_ITERS.
 constexpr int kPhase2DefaultIters = 100;
+
+// Above this SA length, Phase II defaults to a single dirty generation (same as
+// GCSA_PHASE2_FAST) unless the caller overrides the budget. Keeps Phase II from
+// dominating wall time on large DNA / skmer concatenations.
+constexpr size_t kPhase2AutoFastM = 1000000;
+
+// Max candidates retained per interval in the shared Phase II / leftover cache.
+// Preference pick runs on the full enum first; the cache only needs coverage-
+// descending heads for try_accept. Override with GCSA_CAND_CACHE_CAP.
+constexpr int kCandCacheDefaultCap = 64;
 
 // Cluster size the LNS Phase II falls back to when a cluster's exact solve
 // blows the enumeration budget (see run_phase2_local_).
@@ -849,10 +860,15 @@ private:
 
     // Phase II iteration budget, in precedence order: --phase2-iters (the
     // caller's phase2_iters) if > 0, else GCSA_PHASE2_MAX_ITERS, else
-    // kPhase2DefaultIters. Shared by both Phase II implementations.
+    // GCSA_PHASE2_FAST / auto-large-m (1 gen), else kPhase2DefaultIters.
+    // Shared by both Phase II implementations.
     int phase2_budget_(const char*& src) const {
         int iters = kPhase2DefaultIters;
         src = "default";
+        if (G_.m() >= kPhase2AutoFastM) {
+            iters = 1;
+            src = "auto-large-m";
+        }
         if (const char* env = std::getenv("GCSA_PHASE2_FAST")) {
             if (std::atoi(env) != 0) {
                 iters = 1;
@@ -868,6 +884,12 @@ private:
             src = "--phase2-iters";
         }
         return iters;
+    }
+
+    // Truncate a coverage-desc candidate list for the shared cache.
+    static void trim_cand_cache_(std::vector<Candidate>& cands) {
+        int cap = gcsa_env_int("GCSA_CAND_CACHE_CAP", kCandCacheDefaultCap);
+        if (cap > 0 && (int)cands.size() > cap) cands.resize((size_t)cap);
     }
 
     // ---- Phase II (local): exact cluster large-neighborhood search ---------
@@ -1289,26 +1311,37 @@ private:
             if (v >= 0.0) min_ms = v;
         }
 
-        bool fast_mode = false;
+        bool fast_mode = (G_.m() >= kPhase2AutoFastM);
         if (const char* env = std::getenv("GCSA_PHASE2_FAST")) {
             fast_mode = (std::atoi(env) != 0);
         }
 
+        // Always time-budget against Phase I when its duration is known; FAST
+        // alone still applies the min_ms floor. Caps Phase II ≈ Phase I wall.
         const bool time_budgeted = (fast_mode || phase1_ms > 0.0);
         const double time_limit_ms = time_budgeted
             ? std::max(min_ms, (phase1_ms > 0.0 ? phase1_ms : min_ms) * time_ratio)
             : 0.0;
 
         gcsa_log("[%s] Phase II: unpin/retarget...\n", label);
-        if (timing && precomputed) {
-            gcsa_log("[timing] %s Phase II precomputed cache size=%zu\n",
-                     label, precomputed->size());
+        if (timing) {
+            if (precomputed) {
+                gcsa_log("[timing] %s Phase II precomputed cache size=%zu\n",
+                         label, precomputed->size());
+            }
+            if (time_budgeted) {
+                gcsa_log("[timing] %s Phase II time_budget=%.1fms "
+                         "(phase1=%.1fms ratio=%.2f fast=%d)\n",
+                         label, time_limit_ms, phase1_ms, time_ratio,
+                         (int)fast_mode);
+            }
         }
         auto t0 = Clock::now();
 
         // Size-order once; static candidate lists (avail ignored) cached once.
+        // |I|<=2 can never meet kMinCoverage, so omit them from the dirty seed.
         std::vector<const Interval*> order;
-        for (const auto& iv : intervals) if (iv.hi - iv.lo > 1) order.push_back(&iv);
+        for (const auto& iv : intervals) if (iv.hi - iv.lo > 2) order.push_back(&iv);
         std::sort(order.begin(), order.end(),
                   [](const Interval* a, const Interval* b){
                       return (a->hi-a->lo) > (b->hi-b->lo);
@@ -1339,6 +1372,7 @@ private:
                 if (a.coverage() != b.coverage()) return a.coverage() > b.coverage();
                 return a.add > b.add;
             });
+            trim_cand_cache_(cands);
             auto& slot = cand_cache[iv.name];
             slot = std::move(cands);
             return slot;
@@ -1642,6 +1676,11 @@ private:
                     last_gen_kept_drop, min_gain, stall, stall_limit);
             } else if (std::strcmp(stop_reason, "max-iters") == 0) {
                 gcsa_log("  (generation budget exhausted)");
+            } else if (std::strcmp(stop_reason, "phase1-time-budget") == 0) {
+                gcsa_log("  (hit Phase I time budget %.1fms)", time_limit_ms);
+            }
+            if (phase1_ms > 0.0) {
+                gcsa_log("  phase2/phase1=%.2f", ms / phase1_ms);
             }
             gcsa_log("\n");
         }
@@ -1919,42 +1958,35 @@ private:
         for (const auto& iv : intervals)
             if (iv.hi - iv.lo > 1) big_ivs.push_back(&iv);
 
-        struct PrefWork {
-            std::vector<Candidate> cands;
-            bool has_pref = false;
-            Candidate best;
-            uint64_t src_name = 0;
-        };
-        std::vector<PrefWork> work(big_ivs.size());
+        // Stream into prefs/cand_cache under a mutex instead of retaining a
+        // PrefWork[] the size of |{I : |I|>1}| — that doubled peak RAM on large
+        // skmer concatenations (hundreds of thousands of intervals) and OOM'd.
+        prefs.reserve(big_ivs.size());
+        cand_cache.reserve(big_ivs.size() * 2);
+        std::mutex pref_mu;
         gcsa_parallel_for(big_ivs.size(), [&](size_t i) {
             const Interval& iv = *big_ivs[i];
             auto cands = enumerate_candidates_(iv.name, iv.lo, iv.hi, /*avail=*/false);
-            PrefWork w;
+            bool has_pref = false;
+            Candidate best;
+            uint64_t src_name = 0;
             if (iv.hi - iv.lo > 2) {
-                Candidate best = pick_best_(cands);
+                best = pick_best_(cands);
                 if (best.coverage() >= kMinCoverage) {
-                    w.has_pref = true;
-                    w.src_name = name_of_rank_(best.src_lo);
-                    w.best = std::move(best);
+                    has_pref = true;
+                    src_name = name_of_rank_(best.src_lo);
                 }
             }
             std::sort(cands.begin(), cands.end(), [](const Candidate& a, const Candidate& b){
                 if (a.coverage() != b.coverage()) return a.coverage() > b.coverage();
                 return a.add > b.add;
             });
-            w.cands = std::move(cands);
-            work[i] = std::move(w);
+            trim_cand_cache_(cands);
+            std::lock_guard<std::mutex> lock(pref_mu);
+            if (has_pref)
+                prefs.emplace(iv.name, Pref{&iv, std::move(best), src_name});
+            cand_cache.emplace(iv.name, std::move(cands));
         });
-        prefs.reserve(work.size());
-        cand_cache.reserve(work.size() * 2);
-        for (size_t i = 0; i < work.size(); ++i) {
-            const Interval* iv = big_ivs[i];
-            if (work[i].has_pref)
-                prefs.emplace(iv->name, Pref{iv, std::move(work[i].best), work[i].src_name});
-            cand_cache.emplace(iv->name, std::move(work[i].cands));
-        }
-        work.clear();
-        work.shrink_to_fit();
         auto t_pref1 = Clock::now();
 
         // Forest edges: only cov>=kMinCoverage (same threshold as DepOrder DAG edges).
@@ -2250,15 +2282,19 @@ private:
             auto ms = [](Clock::time_point a, Clock::time_point b) {
                 return std::chrono::duration<double, std::milli>(b - a).count();
             };
+            const double phase1_total = ms(t_pref0, t_left1);
+            const double phase2_total = ms(t_p2_0, t_p2_1);
             gcsa_log(
                 "[timing] %s pref=%.1fms forest=%.1fms dp=%.1fms accept=%.1fms "
-                "leftover=%.1fms phase2=%.1fms total=%.1fms\n"
+                "leftover=%.1fms phase2=%.1fms total=%.1fms "
+                "phase2/phase1=%.2f\n"
                 "         roots=%zu forest_nodes=%zu prefs=%zu #I>1=%zu "
                 "accepted=%zu kept=%zu threads=%d "
                 "cycles=%zu repaired=%zu edge_gain=%zu\n",
                 label, ms(t_pref0, t_pref1), ms(t_forest0, t_forest1),
                 ms(t_dp0, t_dp1), ms(t_acc0, t_acc1), ms(t_left0, t_left1),
-                ms(t_p2_0, t_p2_1), ms(t_all, Clock::now()),
+                phase2_total, ms(t_all, Clock::now()),
+                phase2_total / std::max(1.0, phase1_total),
                 roots.size(), nodes.size(), prefs.size(), cand_cache.size(),
                 accepted.size(), kept_count_, nthreads,
                 cycles_seen, cycles_repaired, cycle_gain);

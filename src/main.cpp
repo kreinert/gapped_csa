@@ -12,6 +12,7 @@
 #include "serialize.hpp"
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -246,32 +247,55 @@ int main(int argc, char** argv) {
               << 100.0 * idx.stored_positions() / std::max<size_t>(1, idx.total_positions())
               << "% of full SA)\n";
 
-    bool ok = self_test(idx, sh, text, is_example);
-    std::cout << "self-test (vs brute force): " << (ok ? "PASS" : "FAIL") << "\n";
+    // Brute-force self-test + round-trip walk every text position. On large N
+    // that dominates wall time / RAM; GCSA_SKIP_SELFTEST=1 keeps compress+timing.
+    const bool skip_selftest = [] {
+        const char* e = std::getenv("GCSA_SKIP_SELFTEST");
+        return e && std::atoi(e) != 0;
+    }();
 
-    // Byte-level serialization + round-trip check + size accounting.
-    SerializedIndex S = serialize_index(idx);
-    bool rt_ok = true;
-    {
-        auto truth = brute_positions(sh, text);
-        for (auto& kv : truth) {
-            auto got = S.positions_of(kv.first);
-            std::sort(got.begin(), got.end());
-            auto exp = kv.second; std::sort(exp.begin(), exp.end());
-            if (got != exp) { rt_ok = false; break; }
+    if (skip_selftest) {
+        std::cout << "self-test (vs brute force): SKIPPED (GCSA_SKIP_SELFTEST)\n";
+        std::cout << "serialized round-trip     : SKIPPED (GCSA_SKIP_SELFTEST)\n";
+        SerializedIndex S = serialize_index(idx);
+        double full_sa = (double)idx.total_positions() * S.pb;
+        std::cout << "pb(bytes/pos)=" << S.pb
+                  << "  |C|*pb=" << S.bytes_C()
+                  << "  H=" << S.bytes_H()
+                  << "  S_H=" << S.bytes_SH()
+                  << "  names=" << S.bytes_names()
+                  << "  total=" << S.total_bytes()
+                  << "  (full SA would be " << (size_t)full_sa << " bytes; "
+                  << std::fixed << std::setprecision(1)
+                  << 100.0 * S.total_bytes() / std::max(1.0, full_sa) << "%)\n";
+    } else {
+        bool ok = self_test(idx, sh, text, is_example);
+        std::cout << "self-test (vs brute force): " << (ok ? "PASS" : "FAIL") << "\n";
+
+        // Byte-level serialization + round-trip check + size accounting.
+        SerializedIndex S = serialize_index(idx);
+        bool rt_ok = true;
+        {
+            auto truth = brute_positions(sh, text);
+            for (auto& kv : truth) {
+                auto got = S.positions_of(kv.first);
+                std::sort(got.begin(), got.end());
+                auto exp = kv.second; std::sort(exp.begin(), exp.end());
+                if (got != exp) { rt_ok = false; break; }
+            }
         }
+        std::cout << "serialized round-trip     : " << (rt_ok ? "PASS" : "FAIL") << "\n";
+        double full_sa = (double)idx.total_positions() * S.pb;   // uncompressed SA bytes
+        std::cout << "pb(bytes/pos)=" << S.pb
+                  << "  |C|*pb=" << S.bytes_C()
+                  << "  H=" << S.bytes_H()
+                  << "  S_H=" << S.bytes_SH()
+                  << "  names=" << S.bytes_names()
+                  << "  total=" << S.total_bytes()
+                  << "  (full SA would be " << (size_t)full_sa << " bytes; "
+                  << std::fixed << std::setprecision(1)
+                  << 100.0 * S.total_bytes() / std::max(1.0, full_sa) << "%)\n";
     }
-    std::cout << "serialized round-trip     : " << (rt_ok ? "PASS" : "FAIL") << "\n";
-    double full_sa = (double)idx.total_positions() * S.pb;   // uncompressed SA bytes
-    std::cout << "pb(bytes/pos)=" << S.pb
-              << "  |C|*pb=" << S.bytes_C()
-              << "  H=" << S.bytes_H()
-              << "  S_H=" << S.bytes_SH()
-              << "  names=" << S.bytes_names()
-              << "  total=" << S.total_bytes()
-              << "  (full SA would be " << (size_t)full_sa << " bytes; "
-              << std::fixed << std::setprecision(1)
-              << 100.0 * S.total_bytes() / std::max(1.0, full_sa) << "%)\n";
 
     if (want_sa) print_sa_tables(idx);
     if (want_table) print_hash_table(idx);
