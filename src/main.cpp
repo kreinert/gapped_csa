@@ -153,7 +153,8 @@ static void print_usage(const char* argv0) {
         << "  -s <shape>          gapped shape, e.g. \"#.#\" (default: #.#)\n"
         << "  -q <query>          query string to locate\n"
         << "  -r <reads.fasta>    locate every read in a FASTA\n"
-        << "  --algo <name>       greedy|dep-order|tree-dp|tree-dp2 (default: greedy)\n"
+        << "  --algo <name>       greedy|dep-order|tree-dp|tree-dp2|tree-dp3"
+        << " (default: greedy)\n"
         << "  --max-add N         max differential offset (default: 8)\n"
         << "  --phase2-iters N    Phase II dirty-generation budget (default: "
         << kPhase2DefaultIters << ").\n"
@@ -196,8 +197,9 @@ int main(int argc, char** argv) {
             else if (a == "dep-order" || a == "dep") algo = CompressAlgo::DepOrder;
             else if (a == "tree-dp" || a == "dp") algo = CompressAlgo::TreeDp;
             else if (a == "tree-dp2" || a == "dp2") algo = CompressAlgo::TreeDp2;
+            else if (a == "tree-dp3" || a == "dp3") algo = CompressAlgo::TreeDp3;
             else {
-                std::cerr << "--algo must be greedy|dep-order|tree-dp|tree-dp2\n";
+                std::cerr << "--algo must be greedy|dep-order|tree-dp|tree-dp2|tree-dp3\n";
                 return 1;
             }
         }

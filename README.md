@@ -60,6 +60,7 @@ make
 ./gcsa --algo dep-order
 ./gcsa --algo tree-dp             # preference-forest DP + Phase II
 ./gcsa --algo tree-dp2            # same as tree-dp without Phase II
+./gcsa --algo tree-dp3            # tree-dp + exact cluster LNS on top of Phase II
 GCSA_TRACE_DP=1  ./gcsa -g /tmp/ex.fa -s "#.#" --algo tree-dp
 GCSA_TIMING=1    ./gcsa -g genome.fasta -s "#####" --algo tree-dp   # stage timings
 GCSA_THREADS=8   ./gcsa -g genome.fasta -s "#####" --algo tree-dp   # parallel pref/DP (default=hw)
@@ -158,9 +159,10 @@ compression on a 180 kb repetitive input: `####.####` → **40% of the full SA**
 
 ## Limitations & research extensions
 
-- **Source selection**: four heuristics — `greedy`, `dep-order`, `tree-dp`
-  (preference-forest DP KEEP vs COMPRESS, then Phase II unpin/retarget), and
-  `tree-dp2` (same forest DP without Phase II). Use
+- **Source selection**: five heuristics — `greedy`, `dep-order`, `tree-dp`
+  (preference-forest DP KEEP vs COMPRESS, then Phase II unpin/retarget),
+  `tree-dp2` (same forest DP without Phase II), and `tree-dp3` (same forest DP,
+  Phase II unpin/retarget followed by the exact cluster LNS below). Use
   `./gcsa --algo <name>` or `./compare_algos`.
   Tree-dp preference enumeration and per-root forest DP are parallelized via
   `std::thread` (`GCSA_THREADS=N`, default=`hardware_concurrency`). Set
@@ -175,6 +177,25 @@ compression on a 180 kb repetitive input: `####.####` → **40% of the full SA**
   adaptive early-stop
   (`GCSA_PHASE2_MIN_GAIN`, `GCSA_PHASE2_STALL`) ends generations when kept-drop
   plateaus, but is disabled by default (`GCSA_PHASE2_STALL=0`).
+- **Phase II cluster LNS (`tree-dp3`)**: since `|C| = m -` total coverage and
+  the only constraints are one link per name plus "a chosen link's sources are
+  not covered by another chosen link" (both *pairwise* — there is no acyclicity
+  requirement), a small set of names can be re-optimized *exactly* with the rest
+  of the assignment frozen. Names are dependent when one's candidate sources
+  from the other's interval; clusters are bounded BFS components of that graph,
+  solved by branch-and-bound over each member's candidates plus "no link".
+  Sharing a source is deliberately *not* a dependency — sources are read-only,
+  so two links may share them. This recovers the ILP optimum on the two known
+  forest-restriction counterexamples (`ACACACACACAC`, `ACGTACGTACGTACGTACGT`).
+  It runs after the retarget loop rather than instead of it: retargeting reaches
+  composite-`add` links the static candidate cache does not hold. Knobs:
+  `GCSA_LNS_CLUSTER` (max names per cluster, default 8), `GCSA_LNS_OPTS`
+  (candidates considered per name, 12), `GCSA_LNS_DEGREE` (dependency-graph
+  degree cap, 16), `GCSA_LNS_NODES` (enumeration budget per cluster, 20000;
+  clusters that exceed it retry at size 4), `GCSA_LNS_ONLY=1` (skip the retarget
+  loop and run the LNS alone), `GCSA_TRACE_LNS=1`. The payoff grows with
+  `--max-add`: on `./compare_algos --max-add 16` it beats `tree-dp` on 122 of
+  139 configs and none worse (213078 vs 252329 total `|C|`).
 - **Link universe (what a differential link may look like)**: an `H_offset`
   entry `(pos, add, num)` decodes to `{C[pos+t] + add*span}`, i.e. it reads
   `num` consecutive *kept* entries of `C` and shifts them. A link is therefore

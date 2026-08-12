@@ -117,6 +117,10 @@ constexpr int kMinCoverage = 3;
 // i.e. --phase2-iters), or process-wide with GCSA_PHASE2_MAX_ITERS.
 constexpr int kPhase2DefaultIters = 100;
 
+// Cluster size the LNS Phase II falls back to when a cluster's exact solve
+// blows the enumeration budget (see run_phase2_local_).
+constexpr int kLnsFallbackCluster = 4;
+
 // Let the heuristics' enumerate_candidates_ see intra-interval links (source
 // run overlapping I_c but never the ranks it covers) — see "Link universe".
 // GCSA_INTRA_LINKS=0 restores the old "source entirely outside I_c" rule.
@@ -170,6 +174,7 @@ enum class CompressAlgo {
     DepOrder,      // dependency-order + un-pin / retarget
     TreeDp,        // preference-forest DP (KEEP vs COMPRESS per hub) + Phase II
     TreeDp2,       // same as TreeDp without Phase II
+    TreeDp3,       // same as TreeDp with the cluster-LNS Phase II
 };
 
 inline const char* algo_name(CompressAlgo a) {
@@ -178,8 +183,25 @@ inline const char* algo_name(CompressAlgo a) {
         case CompressAlgo::DepOrder:      return "dep-order";
         case CompressAlgo::TreeDp:        return "tree-dp";
         case CompressAlgo::TreeDp2:       return "tree-dp2";
+        case CompressAlgo::TreeDp3:       return "tree-dp3";
     }
     return "?";
+}
+
+// What compress_tree_dp_ runs after the forest DP + leftover greedy.
+enum class Phase2Mode {
+    None,    // tree-dp2
+    Greedy,  // tree-dp: dirty-set unpin/retarget
+    Local,   // tree-dp3: exact cluster large-neighborhood search
+};
+
+// Positive-integer env override, `def` when unset/invalid.
+inline int gcsa_env_int(const char* name, int def) {
+    if (const char* e = std::getenv(name)) {
+        int v = std::atoi(e);
+        if (v > 0) return v;
+    }
+    return def;
 }
 
 struct HashEntry {
@@ -781,6 +803,357 @@ private:
         return true;
     }
 
+    // Phase II iteration budget, in precedence order: --phase2-iters (the
+    // caller's phase2_iters) if > 0, else GCSA_PHASE2_MAX_ITERS, else
+    // kPhase2DefaultIters. Shared by both Phase II implementations.
+    int phase2_budget_(const char*& src) const {
+        int iters = kPhase2DefaultIters;
+        src = "default";
+        if (const char* env = std::getenv("GCSA_PHASE2_MAX_ITERS")) {
+            int v = std::atoi(env);
+            if (v > 0) { iters = v; src = "GCSA_PHASE2_MAX_ITERS"; }
+        }
+        if (phase2_iters_ > 0) {
+            iters = phase2_iters_;
+            src = "--phase2-iters";
+        }
+        return iters;
+    }
+
+    // ---- Phase II (local): exact cluster large-neighborhood search ---------
+    //
+    // Model. |C| = m - sum of the coverages of the accepted links, so we are
+    // maximizing total coverage subject to exactly two constraints:
+    //   (F1) at most one link per name (one H_offset per hash entry), and
+    //   (F2) a chosen link's source ranks are all kept, i.e. no *other* chosen
+    //        link covers them.
+    // There is no acyclicity requirement (C holds literal positions, H_offset
+    // never recurses), so this is a maximum-weight set packing, and crucially
+    // (F2) is a *pairwise* condition between links.
+    //
+    // Neighborhood. Freeze the links of all names outside a small cluster S and
+    // re-solve S exactly. Two names are dependent iff a candidate of one draws
+    // its source from the other's interval — that is the only way (F2) can bind
+    // them. Note that *sharing* a source is deliberately not a dependency:
+    // sources are shared freely (pin_count_ is a count, not a lock), so two
+    // links reading the same ranks never conflict.
+    //
+    // Composition. Covered ranks of a link always lie in its own interval, so a
+    // frozen link can never drop a rank inside S — the cluster fully owns the
+    // keep/drop decisions for its own ranks. The interface to the frozen part is
+    // therefore just: (i) don't drop a rank some frozen link uses as a source,
+    // and (ii) don't source from a rank some frozen link drops. After revoking
+    // the cluster's own links, removed_ / pin_count_ describe exactly the frozen
+    // part, so (i)+(ii) is precisely the existing cand_available_ predicate.
+    // Internal conflicts are then the pairwise (F2) checks during enumeration.
+    //
+    // Since the incumbent assignment is itself feasible and is seeded as the
+    // initial best, an accepted cluster solve can never increase |C|.
+    void run_phase2_local_(const std::vector<Interval>& intervals,
+                           std::unordered_map<uint64_t, Candidate>& accepted,
+                           const char* label, bool timing,
+                           std::unordered_map<uint64_t, std::vector<Candidate>>* precomputed) {
+        using Clock = std::chrono::steady_clock;
+        const bool trace = (std::getenv("GCSA_TRACE_LNS") != nullptr);
+        const char* iters_src = "default";
+        const int max_iters = phase2_budget_(iters_src);
+        const int cluster_cap = gcsa_env_int("GCSA_LNS_CLUSTER", 8);
+        const int opt_cap = gcsa_env_int("GCSA_LNS_OPTS", 12);
+        const int deg_cap = gcsa_env_int("GCSA_LNS_DEGREE", 16);
+        const long node_cap = gcsa_env_int("GCSA_LNS_NODES", 20000);
+        auto t0 = Clock::now();
+        gcsa_log("[%s] Phase II: cluster LNS...\n", label);
+
+        std::unordered_map<uint64_t, std::vector<Candidate>> local_cache;
+        auto& cand_cache = precomputed ? *precomputed : local_cache;
+
+        // Seeds in size order, matching the greedy Phase II's bias to big wins.
+        std::vector<const Interval*> order;
+        for (const auto& iv : intervals) if (iv.hi - iv.lo > 1) order.push_back(&iv);
+        std::sort(order.begin(), order.end(),
+                  [](const Interval* a, const Interval* b){
+                      return (a->hi - a->lo) > (b->hi - b->lo);
+                  });
+        for (const Interval* ivp : order) {
+            if (cand_cache.count(ivp->name)) continue;
+            auto cands = enumerate_candidates_(ivp->name, ivp->lo, ivp->hi, /*avail=*/false);
+            std::sort(cands.begin(), cands.end(),
+                      [](const Candidate& a, const Candidate& b){
+                          if (a.coverage() != b.coverage()) return a.coverage() > b.coverage();
+                          return a.add > b.add;
+                      });
+            cand_cache.emplace(ivp->name, std::move(cands));
+        }
+
+        // Dependency graph over names: an edge for every "c can source from d".
+        std::unordered_map<uint64_t, std::vector<uint64_t>> adj;
+        adj.reserve(order.size() * 2);
+        auto add_edge = [&](uint64_t a, uint64_t b) {
+            if (a == b) return;
+            auto& va = adj[a];
+            if (std::find(va.begin(), va.end(), b) == va.end()) va.push_back(b);
+            auto& vb = adj[b];
+            if (std::find(vb.begin(), vb.end(), a) == vb.end()) vb.push_back(a);
+        };
+        for (const Interval* ivp : order) {
+            const auto& cands = cand_cache[ivp->name];
+            for (const Candidate& c : cands) {
+                uint64_t last = 0;
+                bool have_last = false;
+                for (int32_t r = c.src_lo; r < c.src_hi; ++r) {
+                    uint64_t s = name_of_rank_(r);
+                    if (have_last && s == last) continue;
+                    last = s; have_last = true;
+                    add_edge(ivp->name, s);
+                }
+            }
+        }
+        for (auto& kv : adj)
+            if ((int)kv.second.size() > deg_cap) kv.second.resize((size_t)deg_cap);
+
+        // Best coverage any single link could ever give a name (cand_cache is
+        // coverage-desc). Summed over a cluster this upper-bounds every feasible
+        // assignment, so it cheaply rules out clusters that cannot improve
+        // before we pay for revoking them and filtering their options.
+        std::unordered_map<uint64_t, int> static_cap;
+        static_cap.reserve(cand_cache.size() * 2);
+        for (const auto& kv : cand_cache)
+            static_cap[kv.first] = kv.second.empty() ? 0 : kv.second.front().coverage();
+        auto t_adj = Clock::now();
+
+        // Internal (F2) check between two links of a cluster. A link's source is
+        // a contiguous rank range and everything it covers lies in its own
+        // interval, so the ranges almost never meet and the test is O(1); only
+        // on overlap do we look at individual covered ranks.
+        auto conflicts = [](const Candidate& a, const Candidate& b) {
+            if (a.src_lo < b.target_hi && b.target_lo < a.src_hi)
+                for (int32_t r : b.covered)
+                    if (r >= a.src_lo && r < a.src_hi) return true;
+            if (b.src_lo < a.target_hi && a.target_lo < b.src_hi)
+                for (int32_t r : a.covered)
+                    if (r >= b.src_lo && r < b.src_hi) return true;
+            return false;
+        };
+
+        std::vector<uint64_t> dirty;
+        dirty.reserve(order.size());
+        for (const Interval* ivp : order) dirty.push_back(ivp->name);
+        std::unordered_map<uint64_t, const Interval*> by_name;
+        by_name.reserve(intervals.size() * 2);
+        for (const auto& iv : intervals) by_name[iv.name] = &iv;
+
+        size_t clusters = 0, improved = 0, aborted = 0, skipped = 0, gain_total = 0;
+        int iter = 0;
+        const char* stop = "fixed-point";
+        for (; iter < max_iters && !dirty.empty(); ++iter) {
+            std::vector<uint64_t> next;
+            std::unordered_set<uint64_t> next_seen;
+            std::unordered_set<uint64_t> done;
+            for (uint64_t seed : dirty) {
+                if (!done.insert(seed).second) continue;
+
+                // --- grow the cluster: BFS over the dependency graph ---------
+                std::vector<uint64_t> cluster{seed};
+                for (size_t qi = 0;
+                     qi < cluster.size() && (int)cluster.size() < cluster_cap; ++qi) {
+                    auto ait = adj.find(cluster[qi]);
+                    if (ait == adj.end()) continue;
+                    for (uint64_t nb : ait->second) {
+                        if ((int)cluster.size() >= cluster_cap) break;
+                        if (!by_name.count(nb) || !cand_cache.count(nb)) continue;
+                        if (std::find(cluster.begin(), cluster.end(), nb) != cluster.end())
+                            continue;
+                        cluster.push_back(nb);
+                    }
+                }
+                int ub = 0, incumbent = 0;
+                for (uint64_t nm : cluster) {
+                    auto sc = static_cap.find(nm);
+                    if (sc != static_cap.end()) ub += sc->second;
+                    auto ac = accepted.find(nm);
+                    if (ac != accepted.end()) incumbent += ac->second.coverage();
+                }
+                if (ub <= incumbent) { ++skipped; continue; }
+
+                // Solve S exactly; returns the coverage gain, or -1 if the node
+                // cap was hit (state restored, cluster left untouched).
+                auto solve_cluster = [&](const std::vector<uint64_t>& S) -> int {
+                ++clusters;
+
+                // --- the cluster's current links -----------------------------
+                std::vector<Candidate> cur(S.size());
+                std::vector<uint8_t> had(S.size(), 0);
+                int cur_total = 0;
+                for (size_t i = 0; i < S.size(); ++i) {
+                    auto it = accepted.find(S[i]);
+                    if (it == accepted.end()) continue;
+                    had[i] = 1;
+                    cur[i] = it->second;
+                    cur_total += cur[i].coverage();
+                }
+
+                // Availability against the frozen part, evaluated *without*
+                // revoking anything: the solve usually finds no improvement, and
+                // revoke_/accept_ round trips are the dominant cost on large
+                // inputs. Revoking would restore the ranks the cluster's own
+                // links cover and release the pins they hold, so subtract both
+                // from removed_ / pin_count_ on the fly.
+                std::vector<int32_t> cl_cov;
+                for (size_t i = 0; i < S.size(); ++i)
+                    if (had[i])
+                        cl_cov.insert(cl_cov.end(), cur[i].covered.begin(),
+                                      cur[i].covered.end());
+                std::sort(cl_cov.begin(), cl_cov.end());
+                auto kept_after_revoke = [&](int32_t r) {
+                    return !removed_[r]
+                        || std::binary_search(cl_cov.begin(), cl_cov.end(), r);
+                };
+                auto external_pins = [&](int32_t r) {
+                    int n = pin_count_[r];
+                    for (size_t i = 0; i < S.size(); ++i)
+                        if (had[i] && r >= cur[i].src_lo && r < cur[i].src_hi) --n;
+                    return n;
+                };
+                auto avail = [&](const Candidate& c) {
+                    for (int32_t r = c.src_lo; r < c.src_hi; ++r)
+                        if (!kept_after_revoke(r)) return false;
+                    for (int32_t r : c.covered)
+                        if (!kept_after_revoke(r) || external_pins(r) > 0) return false;
+                    return true;
+                };
+
+                // --- options per member, filtered against the frozen part ----
+                std::vector<std::vector<const Candidate*>> opts(S.size());
+                for (size_t i = 0; i < S.size(); ++i) {
+                    const auto& cands = cand_cache[S[i]];
+                    for (const Candidate& c : cands) {
+                        if ((int)opts[i].size() >= opt_cap) break;
+                        if (c.coverage() < kMinCoverage) continue;
+                        if (!avail(c)) continue;
+                        opts[i].push_back(&c);
+                    }
+                    // The incumbent must stay expressible even if the cap or the
+                    // cache would hide it, else "never worse" is not guaranteed.
+                    if (had[i]) {
+                        bool found = false;
+                        for (const Candidate* c : opts[i])
+                            if (c->add == cur[i].add && c->src_lo == cur[i].src_lo
+                                && c->src_hi == cur[i].src_hi) { found = true; break; }
+                        if (!found) opts[i].push_back(&cur[i]);
+                    }
+                }
+
+                // Members ordered by best-option coverage: fail fast, bound hard.
+                std::vector<int> ord(S.size());
+                for (size_t i = 0; i < S.size(); ++i) ord[i] = (int)i;
+                std::vector<int> cap_cov(S.size(), 0);
+                for (size_t i = 0; i < S.size(); ++i)
+                    for (const Candidate* c : opts[i])
+                        cap_cov[i] = std::max(cap_cov[i], c->coverage());
+                std::sort(ord.begin(), ord.end(), [&](int a, int b){
+                    return cap_cov[(size_t)a] > cap_cov[(size_t)b];
+                });
+                std::vector<int> suffix(S.size() + 1, 0);
+                for (size_t k = S.size(); k-- > 0; )
+                    suffix[k] = suffix[k + 1] + cap_cov[(size_t)ord[k]];
+
+                // --- exact solve: DFS over one option (or none) per member ---
+                std::vector<const Candidate*> pick(S.size(), nullptr);
+                std::vector<const Candidate*> best(S.size(), nullptr);
+                for (size_t i = 0; i < S.size(); ++i)
+                    if (had[i]) best[i] = &cur[i];
+                int best_total = cur_total;
+                long nodes = 0;
+                bool over_budget = false;
+
+                std::vector<const Candidate*> live;
+                live.reserve(S.size());
+                std::function<void(size_t, int)> dfs = [&](size_t k, int total) {
+                    if (over_budget) return;
+                    if (++nodes > node_cap) { over_budget = true; return; }
+                    if (total + suffix[k] <= best_total) return;
+                    if (k == S.size()) {
+                        best_total = total;
+                        best = pick;
+                        return;
+                    }
+                    const size_t i = (size_t)ord[k];
+                    for (const Candidate* c : opts[i]) {
+                        bool clash = false;
+                        for (const Candidate* x : live)
+                            if (conflicts(*c, *x)) { clash = true; break; }
+                        if (clash) continue;
+                        live.push_back(c);
+                        pick[i] = c;
+                        dfs(k + 1, total + c->coverage());
+                        pick[i] = nullptr;
+                        live.pop_back();
+                        if (over_budget) return;
+                    }
+                    dfs(k + 1, total);  // leave this name uncompressed
+                };
+                dfs(0, 0);
+
+                if (over_budget) return -1;
+                if (best_total == cur_total) return 0;  // incumbent stands
+
+                // --- apply: only now do we touch the global state ------------
+                for (size_t i = 0; i < S.size(); ++i)
+                    if (had[i]) revoke_(S[i], accepted);
+                for (size_t i = 0; i < S.size(); ++i) {
+                    if (!best[i]) continue;
+                    Candidate c = *best[i];
+                    accept_(c, accepted);
+                }
+                if (trace) {
+                    gcsa_log("  LNS cluster seed=%s size=%zu cov %d -> %d\n",
+                             name_to_string(G_.shape, seed).c_str(), S.size(),
+                             cur_total, best_total);
+                }
+                return best_total - cur_total;
+                };
+
+                // A cluster too tangled to enumerate degrades to a smaller one
+                // rather than being skipped: aborting outright loses the
+                // improvements the sub-cluster would still have found.
+                int gain = solve_cluster(cluster);
+                if (gain < 0 && (int)cluster.size() > kLnsFallbackCluster) {
+                    ++aborted;
+                    cluster.resize((size_t)kLnsFallbackCluster);
+                    gain = solve_cluster(cluster);
+                }
+                if (gain < 0) { ++aborted; continue; }
+
+                if (gain > 0) {
+                    ++improved;
+                    gain_total += (size_t)gain;
+                    for (uint64_t nm : cluster) {
+                        if (next_seen.insert(nm).second) next.push_back(nm);
+                        auto ait = adj.find(nm);
+                        if (ait == adj.end()) continue;
+                        for (uint64_t nb : ait->second)
+                            if (cand_cache.count(nb) && next_seen.insert(nb).second)
+                                next.push_back(nb);
+                    }
+                }
+            }
+            dirty.swap(next);
+        }
+        if (iter >= max_iters && !dirty.empty()) stop = "max-iters";
+
+        if (timing) {
+            auto ms = [](Clock::time_point a, Clock::time_point b) {
+                return std::chrono::duration<double, std::milli>(b - a).count();
+            };
+            gcsa_log("[timing] %s Phase II(LNS) graph=%.1fms total=%.1fms\n"
+                     "         iters=%d/%d (%s, stop=%s) solved=%zu skipped=%zu "
+                     "improved=%zu aborted=%zu coverage_gain=%zu cap=%d kept=%zu\n",
+                     label, ms(t0, t_adj), ms(t0, Clock::now()),
+                     iter, max_iters, iters_src, stop, clusters, skipped,
+                     improved, aborted, gain_total, cluster_cap, kept_count_);
+        }
+    }
+
     // Dirty-set unpin / retarget: try higher-coverage candidates (including
     // former sources), retargeting dependents with transitive add when needed.
     // Shared by DepOrder Phase II and TreeDp Phase II.
@@ -816,16 +1189,8 @@ private:
                      bool timing,
                      std::unordered_map<uint64_t, std::vector<Candidate>>* precomputed = nullptr) {
         using Clock = std::chrono::steady_clock;
-        int max_iters = kPhase2DefaultIters;
         const char* iters_src = "default";
-        if (const char* env = std::getenv("GCSA_PHASE2_MAX_ITERS")) {
-            int v = std::atoi(env);
-            if (v > 0) { max_iters = v; iters_src = "GCSA_PHASE2_MAX_ITERS"; }
-        }
-        if (phase2_iters_ > 0) {
-            max_iters = phase2_iters_;
-            iters_src = "--phase2-iters";
-        }
+        const int max_iters = phase2_budget_(iters_src);
         int min_gain = 1;
         if (const char* env = std::getenv("GCSA_PHASE2_MIN_GAIN")) {
             int v = std::atoi(env);
@@ -1264,7 +1629,8 @@ private:
     // KEEP (all ranks stored, children may compress against us) vs COMPRESS
     // (drop cov ranks via the preferred candidate; children lose that source).
     // Exact for |C| on this forest model; leftover names get an avail. greedy.
-    // skip_phase2: TreeDp2 — forest DP + accept + leftover only (no unpin/retarget).
+    // phase2: which Phase II follows — none (TreeDp2), the dirty-set
+    // unpin/retarget (TreeDp), or the exact cluster LNS (TreeDp3).
     //
     // Hot-path notes (large N):
     //   - Preference enum is independent per interval → GCSA_THREADS parallel.
@@ -1272,7 +1638,7 @@ private:
     //   - Forest DP uses dense node ids + vector memo; roots are independent.
     void compress_tree_dp_(const std::vector<Interval>& intervals,
                            std::unordered_map<uint64_t, Candidate>& accepted,
-                           bool skip_phase2 = false) {
+                           Phase2Mode phase2 = Phase2Mode::Greedy) {
         using Clock = std::chrono::steady_clock;
         const bool timing = (std::getenv("GCSA_TIMING") != nullptr);
         const bool trace = (std::getenv("GCSA_TRACE_DP") != nullptr);
@@ -1578,10 +1944,20 @@ private:
         auto t_left1 = Clock::now();
         gcsa_log("[%s] leftover done\n", label);
 
-        // Phase II: same unpin/retarget fixed point as DepOrder (reuse cand_cache).
+        // Phase II (reuses cand_cache either way).
         auto t_p2_0 = Clock::now();
-        if (!skip_phase2)
+        if (phase2 == Phase2Mode::Greedy) {
             run_phase2_(intervals, accepted, label, trace, timing, &cand_cache);
+        } else if (phase2 == Phase2Mode::Local) {
+            // The cluster solve only ever lowers |C|, so it composes with the
+            // retarget loop instead of replacing it: retargeting reaches links
+            // (composite adds) the static candidate cache does not contain,
+            // which is exactly where the LNS alone gives ground on long
+            // repeats. GCSA_LNS_ONLY=1 measures the LNS on its own.
+            if (gcsa_env_int("GCSA_LNS_ONLY", 0) == 0)
+                run_phase2_(intervals, accepted, label, trace, timing, &cand_cache);
+            run_phase2_local_(intervals, accepted, label, timing, &cand_cache);
+        }
         auto t_p2_1 = Clock::now();
 
         if (timing) {
@@ -1627,9 +2003,11 @@ private:
         if (algo_ == CompressAlgo::DepOrder)
             compress_dep_order_(intervals, accepted);
         else if (algo_ == CompressAlgo::TreeDp)
-            compress_tree_dp_(intervals, accepted, /*skip_phase2=*/false);
+            compress_tree_dp_(intervals, accepted, Phase2Mode::Greedy);
         else if (algo_ == CompressAlgo::TreeDp2)
-            compress_tree_dp_(intervals, accepted, /*skip_phase2=*/true);
+            compress_tree_dp_(intervals, accepted, Phase2Mode::None);
+        else if (algo_ == CompressAlgo::TreeDp3)
+            compress_tree_dp_(intervals, accepted, Phase2Mode::Local);
         else
             compress_greedy_(intervals, accepted);
 

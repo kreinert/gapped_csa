@@ -122,25 +122,29 @@ static void print_header() {
               << std::setw(6)  << "t%"
               << std::setw(7)  << "t2|C|"
               << std::setw(6)  << "t2%"
+              << std::setw(7)  << "t3|C|"
+              << std::setw(6)  << "t3%"
               << std::setw(14) << "best"
               << std::setw(4)  << "g"
               << std::setw(4)  << "d"
               << std::setw(4)  << "t"
               << std::setw(4)  << "t2"
+              << std::setw(4)  << "t3"
               << "\n";
 }
 
-// g=greedy, d=dep-order, t=tree-dp, t2=tree-dp2
+// g=greedy, d=dep-order, t=tree-dp, t2=tree-dp2, t3=tree-dp3
 static void print_row(const std::string& tag,
                       const Result& g, const Result& d,
-                      const Result& t, const Result& t2) {
-    size_t bC = std::min({g.C, d.C, t.C, t2.C});
+                      const Result& t, const Result& t2, const Result& t3) {
+    size_t bC = std::min({g.C, d.C, t.C, t2.C, t3.C});
     std::string best;
     if (g.C == bC) best += (best.empty() ? "" : "/") + std::string("g");
     if (d.C == bC) best += (best.empty() ? "" : "/") + std::string("d");
     if (t.C == bC) best += (best.empty() ? "" : "/") + std::string("t");
     if (t2.C == bC) best += (best.empty() ? "" : "/") + std::string("t2");
-    if (best == "g/d/t/t2") best = "tie";
+    if (t3.C == bC) best += (best.empty() ? "" : "/") + std::string("t3");
+    if (best == "g/d/t/t2/t3") best = "tie";
 
     auto ok = [](const Result& r) { return (r.ok && r.rt) ? "ok" : "FAIL"; };
     std::cout << std::left << std::setw(28) << tag
@@ -152,35 +156,41 @@ static void print_row(const std::string& tag,
               << std::setw(6) << t.keep_pct
               << std::setw(7) << t2.C
               << std::setw(6) << t2.keep_pct
+              << std::setw(7) << t3.C
+              << std::setw(6) << t3.keep_pct
               << std::setw(14) << best
               << std::setw(4) << ok(g)
               << std::setw(4) << ok(d)
               << std::setw(4) << ok(t)
               << std::setw(4) << ok(t2)
+              << std::setw(4) << ok(t3)
               << "\n";
 }
 
 struct Totals {
-    long long sum_g = 0, sum_d = 0, sum_t = 0, sum_t2 = 0;
-    int win_g = 0, win_d = 0, win_t = 0, win_t2 = 0, tie = 0;
+    long long sum_g = 0, sum_d = 0, sum_t = 0, sum_t2 = 0, sum_t3 = 0;
+    int win_g = 0, win_d = 0, win_t = 0, win_t2 = 0, win_t3 = 0, tie = 0;
     int fails = 0, n = 0;
 
     void add(const Result& g, const Result& d,
-             const Result& t, const Result& t2) {
+             const Result& t, const Result& t2, const Result& t3) {
         ++n;
         sum_g += (long long)g.C;
         sum_d += (long long)d.C;
         sum_t += (long long)t.C;
         sum_t2 += (long long)t2.C;
+        sum_t3 += (long long)t3.C;
         if (!g.ok || !g.rt || !d.ok || !d.rt ||
-            !t.ok || !t.rt || !t2.ok || !t2.rt) ++fails;
-        size_t b = std::min({g.C, d.C, t.C, t2.C});
-        int winners = (g.C == b) + (d.C == b) + (t.C == b) + (t2.C == b);
+            !t.ok || !t.rt || !t2.ok || !t2.rt || !t3.ok || !t3.rt) ++fails;
+        size_t b = std::min({g.C, d.C, t.C, t2.C, t3.C});
+        int winners = (g.C == b) + (d.C == b) + (t.C == b) + (t2.C == b)
+                    + (t3.C == b);
         if (winners > 1) ++tie;
         else if (g.C == b) ++win_g;
         else if (d.C == b) ++win_d;
         else if (t.C == b) ++win_t;
-        else ++win_t2;
+        else if (t2.C == b) ++win_t2;
+        else ++win_t3;
     }
 };
 
@@ -222,9 +232,10 @@ int main(int argc, char** argv) {
 
     gcsa_set_quiet(!verbose);
 
-    std::cout << "Comparing greedy | dep-order | tree-dp | tree-dp2"
+    std::cout << "Comparing greedy | dep-order | tree-dp | tree-dp2 | tree-dp3"
               << "  (max_add=" << max_add << ")\n"
-              << "columns: g=greedy  d=dep-order  t=tree-dp  t2=tree-dp2\n\n";
+              << "columns: g=greedy  d=dep-order  t=tree-dp  t2=tree-dp2"
+              << "  t3=tree-dp3\n\n";
     print_header();
 
     Totals tot;
@@ -234,9 +245,10 @@ int main(int argc, char** argv) {
         Result d = run_algo(sh, text, max_add, CompressAlgo::DepOrder, phase2_iters);
         Result t = run_algo(sh, text, max_add, CompressAlgo::TreeDp, phase2_iters);
         Result t2 = run_algo(sh, text, max_add, CompressAlgo::TreeDp2, phase2_iters);
-        print_row(tag, g, d, t, t2);
+        Result t3 = run_algo(sh, text, max_add, CompressAlgo::TreeDp3, phase2_iters);
+        print_row(tag, g, d, t, t2, t3);
         std::cout.flush();
-        tot.add(g, d, t, t2);
+        tot.add(g, d, t, t2, t3);
     };
 
     // --- Hand examples -----------------------------------------------------
@@ -291,11 +303,13 @@ int main(int argc, char** argv) {
               << "  dep-order=" << tot.win_d
               << "  tree-dp=" << tot.win_t
               << "  tree-dp2=" << tot.win_t2
+              << "  tree-dp3=" << tot.win_t3
               << "  ties/shared=" << tot.tie << "\n"
               << "total |C|:  greedy=" << tot.sum_g
               << "  dep-order=" << tot.sum_d
               << "  tree-dp=" << tot.sum_t
-              << "  tree-dp2=" << tot.sum_t2 << "\n"
+              << "  tree-dp2=" << tot.sum_t2
+              << "  tree-dp3=" << tot.sum_t3 << "\n"
               << "vs greedy:" << std::fixed << std::setprecision(2);
     // Stored positions relative to greedy: "fewer" is better, "more" is worse.
     auto vs_greedy = [&](const char* name, long long a) {
@@ -308,6 +322,7 @@ int main(int argc, char** argv) {
     vs_greedy("dep-order", tot.sum_d);
     vs_greedy("tree-dp", tot.sum_t);
     vs_greedy("tree-dp2", tot.sum_t2);
+    vs_greedy("tree-dp3", tot.sum_t3);
     std::cout << "\ncorrectness failures: " << tot.fails << "\n";
     return tot.fails ? 1 : 0;
 }
