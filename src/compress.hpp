@@ -84,6 +84,7 @@
 #include <thread>
 #include <atomic>
 #include <cstring>
+#include <cmath>
 
 namespace gcsa {
 
@@ -175,6 +176,7 @@ enum class CompressAlgo {
     TreeDp,        // preference-forest DP (KEEP vs COMPRESS per hub) + Phase II
     TreeDp2,       // same as TreeDp without Phase II
     TreeDp3,       // same as TreeDp with the cluster-LNS Phase II
+    TreeDp4,       // same as TreeDp with value-based cycle repair in Phase I
 };
 
 inline const char* algo_name(CompressAlgo a) {
@@ -184,6 +186,7 @@ inline const char* algo_name(CompressAlgo a) {
         case CompressAlgo::TreeDp:        return "tree-dp";
         case CompressAlgo::TreeDp2:       return "tree-dp2";
         case CompressAlgo::TreeDp3:       return "tree-dp3";
+        case CompressAlgo::TreeDp4:       return "tree-dp4";
     }
     return "?";
 }
@@ -857,10 +860,11 @@ private:
         const bool trace = (std::getenv("GCSA_TRACE_LNS") != nullptr);
         const char* iters_src = "default";
         const int max_iters = phase2_budget_(iters_src);
-        const int cluster_cap = gcsa_env_int("GCSA_LNS_CLUSTER", 8);
+        // 0 = pick from the measured dependency-graph density once it is built.
+        int cluster_cap = gcsa_env_int("GCSA_LNS_CLUSTER", 0);
         const int opt_cap = gcsa_env_int("GCSA_LNS_OPTS", 12);
         const int deg_cap = gcsa_env_int("GCSA_LNS_DEGREE", 16);
-        const long node_cap = gcsa_env_int("GCSA_LNS_NODES", 20000);
+        long node_cap = gcsa_env_int("GCSA_LNS_NODES", 0);
         auto t0 = Clock::now();
         gcsa_log("[%s] Phase II: cluster LNS...\n", label);
 
@@ -915,6 +919,27 @@ private:
         // coverage-desc). Summed over a cluster this upper-bounds every feasible
         // assignment, so it cheaply rules out clusters that cannot improve
         // before we pay for revoking them and filtering their options.
+        // A bigger --max-add densifies this graph, so a fixed-size BFS ball
+        // covers a progressively smaller share of each name's real neighborhood.
+        // Size the cluster from the measured mean degree instead of a constant,
+        // and grow the enumeration budget with it: a cluster that overruns the
+        // budget falls back to 4 names, which costs more than the larger cluster
+        // ever gained. Both remain overridable.
+        // Both are quality/cost dials rather than a free win: raising them
+        // together helps at every --max-add, but costs 30-80x runtime, so the
+        // defaults stay put and GCSA_LNS_AUTO=1 opts in.
+        size_t deg_sum = 0;
+        for (const auto& kv : adj) deg_sum += kv.second.size();
+        const double mean_deg =
+            adj.empty() ? 0.0 : (double)deg_sum / (double)adj.size();
+        const bool auto_size = (gcsa_env_int("GCSA_LNS_AUTO", 0) != 0);
+        if (cluster_cap <= 0)
+            cluster_cap = auto_size
+                ? std::min(16, std::max(8, (int)std::lround(2.0 * mean_deg)))
+                : 8;
+        if (node_cap <= 0)
+            node_cap = 20000L * (1 + 3 * (cluster_cap - 8));
+
         std::unordered_map<uint64_t, int> static_cap;
         static_cap.reserve(cand_cache.size() * 2);
         for (const auto& kv : cand_cache)
@@ -1147,10 +1172,12 @@ private:
             };
             gcsa_log("[timing] %s Phase II(LNS) graph=%.1fms total=%.1fms\n"
                      "         iters=%d/%d (%s, stop=%s) solved=%zu skipped=%zu "
-                     "improved=%zu aborted=%zu coverage_gain=%zu cap=%d kept=%zu\n",
+                     "improved=%zu aborted=%zu coverage_gain=%zu kept=%zu\n"
+                     "         mean_degree=%.2f cluster_cap=%d node_cap=%ld\n",
                      label, ms(t0, t_adj), ms(t0, Clock::now()),
                      iter, max_iters, iters_src, stop, clusters, skipped,
-                     improved, aborted, gain_total, cluster_cap, kept_count_);
+                     improved, aborted, gain_total, kept_count_,
+                     mean_deg, cluster_cap, node_cap);
         }
     }
 
@@ -1638,7 +1665,8 @@ private:
     //   - Forest DP uses dense node ids + vector memo; roots are independent.
     void compress_tree_dp_(const std::vector<Interval>& intervals,
                            std::unordered_map<uint64_t, Candidate>& accepted,
-                           Phase2Mode phase2 = Phase2Mode::Greedy) {
+                           Phase2Mode phase2 = Phase2Mode::Greedy,
+                           bool cycle_repair = false) {
         using Clock = std::chrono::steady_clock;
         const bool timing = (std::getenv("GCSA_TIMING") != nullptr);
         const bool trace = (std::getenv("GCSA_TRACE_DP") != nullptr);
@@ -1726,15 +1754,48 @@ private:
         pref_names.reserve(prefs.size());
         for (auto& kv : prefs) pref_names.push_back(kv.first);
         std::sort(pref_names.begin(), pref_names.end());
+        size_t cycles_seen = 0, cycles_repaired = 0, cycle_gain = 0;
+        const int cycle_min_gain = gcsa_env_int("GCSA_CYCLE_MIN_GAIN", 1);
         for (uint64_t t : pref_names) {
             auto& p = prefs[t];
             uint64_t s = p.src_name;
             if (p.cand.coverage() < kMinCoverage) continue;
             if (s == t) continue;
             if (!by_name.count(s)) continue;
-            if (has_ancestor(s, t)) continue;
+            if (!has_ancestor(s, t)) {
+                parent[t] = s;
+                children[s].push_back(t);
+                continue;
+            }
+            // t -> s would close a cycle. Which edge of that cycle dies is
+            // otherwise decided by name order, not by value: drop the
+            // least-valuable one instead. The node whose edge is dropped is the
+            // one that cannot compress via its preference, so the loss is that
+            // edge's coverage. Adding t -> s creates exactly this one cycle, so
+            // removing any single edge of it leaves the forest acyclic.
+            ++cycles_seen;
+            if (!cycle_repair) continue;
+            uint64_t victim = t;
+            int victim_cov = p.cand.coverage();
+            for (uint64_t u = s; u != t; u = parent[u]) {
+                auto pit = prefs.find(u);
+                if (pit == prefs.end()) { victim = t; break; }
+                int cov = pit->second.cand.coverage();
+                if (cov < victim_cov) { victim_cov = cov; victim = u; }
+            }
+            // Rewiring mid-chain is more disruptive than dropping t's edge (t is
+            // still a leaf here), so only do it when the edge we save is
+            // meaningfully better than the one we sacrifice.
+            if (victim == t) continue;  // name order already picked the cheapest
+            if (p.cand.coverage() - victim_cov < cycle_min_gain) continue;
+            uint64_t vp = parent[victim];
+            auto& sib = children[vp];
+            sib.erase(std::remove(sib.begin(), sib.end(), victim), sib.end());
+            parent.erase(victim);
             parent[t] = s;
             children[s].push_back(t);
+            ++cycles_repaired;
+            cycle_gain += (size_t)(p.cand.coverage() - victim_cov);
         }
 
         std::unordered_set<uint64_t> nodes;
@@ -1968,12 +2029,14 @@ private:
                 "[timing] %s pref=%.1fms forest=%.1fms dp=%.1fms accept=%.1fms "
                 "leftover=%.1fms phase2=%.1fms total=%.1fms\n"
                 "         roots=%zu forest_nodes=%zu prefs=%zu #I>1=%zu "
-                "accepted=%zu kept=%zu threads=%d\n",
+                "accepted=%zu kept=%zu threads=%d "
+                "cycles=%zu repaired=%zu edge_gain=%zu\n",
                 label, ms(t_pref0, t_pref1), ms(t_forest0, t_forest1),
                 ms(t_dp0, t_dp1), ms(t_acc0, t_acc1), ms(t_left0, t_left1),
                 ms(t_p2_0, t_p2_1), ms(t_all, Clock::now()),
                 roots.size(), nodes.size(), prefs.size(), cand_cache.size(),
-                accepted.size(), kept_count_, nthreads);
+                accepted.size(), kept_count_, nthreads,
+                cycles_seen, cycles_repaired, cycle_gain);
         }
     }
 
@@ -2008,6 +2071,9 @@ private:
             compress_tree_dp_(intervals, accepted, Phase2Mode::None);
         else if (algo_ == CompressAlgo::TreeDp3)
             compress_tree_dp_(intervals, accepted, Phase2Mode::Local);
+        else if (algo_ == CompressAlgo::TreeDp4)
+            compress_tree_dp_(intervals, accepted, Phase2Mode::Greedy,
+                              /*cycle_repair=*/true);
         else
             compress_greedy_(intervals, accepted);
 

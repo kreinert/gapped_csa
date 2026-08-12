@@ -575,6 +575,7 @@ int main(int argc, char** argv) {
     size_t Ct = heuristic_C(sh, text, max_add, CompressAlgo::TreeDp);
     size_t Ct2 = heuristic_C(sh, text, max_add, CompressAlgo::TreeDp2);
     size_t Ct3 = heuristic_C(sh, text, max_add, CompressAlgo::TreeDp3);
+    size_t Ct4 = heuristic_C(sh, text, max_add, CompressAlgo::TreeDp4);
 
     IlpSolution sol = solve_with_external(lp_out, P, n_vars, n_cons);
 
@@ -585,7 +586,8 @@ int main(int argc, char** argv) {
                   << " dep-order=" << Cd
                   << " tree-dp=" << Ct
                   << " tree-dp2=" << Ct2
-                  << " tree-dp3=" << Ct3 << "\n"
+                  << " tree-dp3=" << Ct3
+                  << " tree-dp4=" << Ct4 << "\n"
                   << "Open " << lp_out << " with cbc/glpsol/gurobi to get optimal |C|.\n";
         return 2;
     }
@@ -598,7 +600,7 @@ int main(int argc, char** argv) {
     size_t n_sel = 0;
     for (auto v : sol.y) n_sel += v;
 
-    size_t best_h = std::min({Cg, Cd, Ct, Ct2, Ct3});
+    size_t best_h = std::min({Cg, Cd, Ct, Ct2, Ct3, Ct4});
     bool bounds = (sol.opt_C >= 0 && (size_t)sol.opt_C <= best_h);
 
     auto gap = [&](size_t h) -> double {
@@ -616,12 +618,14 @@ int main(int argc, char** argv) {
               << " dep-order=" << Cd
               << " tree-dp=" << Ct
               << " tree-dp2=" << Ct2
-              << " tree-dp3=" << Ct3 << "\n"
+              << " tree-dp3=" << Ct3
+              << " tree-dp4=" << Ct4 << "\n"
               << "gap vs opt (%): greedy=" << gap(Cg)
               << " dep-order=" << gap(Cd)
               << " tree-dp=" << gap(Ct)
               << " tree-dp2=" << gap(Ct2)
-              << " tree-dp3=" << gap(Ct3) << "\n"
+              << " tree-dp3=" << gap(Ct3)
+              << " tree-dp4=" << gap(Ct4) << "\n"
               << "self-check: " << (ok ? "OK" : ("FAIL (" + err + ")")) << "\n"
               << "decode-check: " << (dec_ok ? "OK" : ("FAIL (" + derr + ")"))
               << "  (|C|=" << decoded_C << ")\n"

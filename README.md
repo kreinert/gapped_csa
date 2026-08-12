@@ -61,6 +61,7 @@ make
 ./gcsa --algo tree-dp             # preference-forest DP + Phase II
 ./gcsa --algo tree-dp2            # same as tree-dp without Phase II
 ./gcsa --algo tree-dp3            # tree-dp + exact cluster LNS on top of Phase II
+./gcsa --algo tree-dp4            # tree-dp + value-based cycle-edge repair (free)
 GCSA_TRACE_DP=1  ./gcsa -g /tmp/ex.fa -s "#.#" --algo tree-dp
 GCSA_TIMING=1    ./gcsa -g genome.fasta -s "#####" --algo tree-dp   # stage timings
 GCSA_THREADS=8   ./gcsa -g genome.fasta -s "#####" --algo tree-dp   # parallel pref/DP (default=hw)
@@ -159,10 +160,11 @@ compression on a 180 kb repetitive input: `####.####` → **40% of the full SA**
 
 ## Limitations & research extensions
 
-- **Source selection**: five heuristics — `greedy`, `dep-order`, `tree-dp`
+- **Source selection**: six heuristics — `greedy`, `dep-order`, `tree-dp`
   (preference-forest DP KEEP vs COMPRESS, then Phase II unpin/retarget),
-  `tree-dp2` (same forest DP without Phase II), and `tree-dp3` (same forest DP,
-  Phase II unpin/retarget followed by the exact cluster LNS below). Use
+  `tree-dp2` (same forest DP without Phase II), `tree-dp3` (same forest DP,
+  Phase II unpin/retarget followed by the exact cluster LNS below), and
+  `tree-dp4` (`tree-dp` plus cycle-edge repair below). Use
   `./gcsa --algo <name>` or `./compare_algos`.
   Tree-dp preference enumeration and per-root forest DP are parallelized via
   `std::thread` (`GCSA_THREADS=N`, default=`hardware_concurrency`). Set
@@ -196,6 +198,25 @@ compression on a 180 kb repetitive input: `####.####` → **40% of the full SA**
   loop and run the LNS alone), `GCSA_TRACE_LNS=1`. The payoff grows with
   `--max-add`: on `./compare_algos --max-add 16` it beats `tree-dp` on 122 of
   139 configs and none worse (213078 vs 252329 total `|C|`).
+  `GCSA_LNS_CLUSTER` and `GCSA_LNS_NODES` bind *jointly*, and raising them
+  together is the single largest quality lever: a bigger `--max-add` densifies
+  the dependency graph, so a fixed 8-name ball covers less of each name's real
+  neighborhood, but a larger ball also overruns the enumeration budget and falls
+  back to 4 names, which costs more than it gained. At cap 8 the node budget is
+  irrelevant (0-1 aborts, 20x makes no difference); at cap 16 it is decisive
+  (`--max-add 16`: 233826 at 20000 nodes vs 169388 at 400000). `GCSA_LNS_AUTO=1`
+  sizes both from the measured mean degree. It is off by default because it
+  costs 30-80x runtime — a dial, not a free win.
+- **Phase I cycle-edge repair (`tree-dp4`)**: the preference forest gives each
+  name one edge to its preferred source and drops any edge that would close a
+  cycle — but *which* edge dies is decided by name order, not by value. On
+  `ACACACACACAC` that keeps a coverage-3 edge and discards the coverage-4 one.
+  This pass instead drops the cycle's least-valuable edge; adding the closing
+  edge creates exactly one cycle, so removing any single edge of it keeps the
+  forest acyclic. It runs inside forest construction (`forest=10.3ms` →
+  `10.1ms` on a 22.7 s input, i.e. free) and reaches the optimum on
+  `ACACACACACAC`. `GCSA_CYCLE_MIN_GAIN` (default 1) is the coverage improvement
+  required before rewiring mid-chain.
 - **Link universe (what a differential link may look like)**: an `H_offset`
   entry `(pos, add, num)` decodes to `{C[pos+t] + add*span}`, i.e. it reads
   `num` consecutive *kept* entries of `C` and shifts them. A link is therefore
