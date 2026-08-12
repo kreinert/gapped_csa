@@ -1171,7 +1171,7 @@ private:
                 return std::chrono::duration<double, std::milli>(b - a).count();
             };
             gcsa_log("[timing] %s Phase II(LNS) graph=%.1fms total=%.1fms\n"
-                     "         iters=%d/%d (%s, stop=%s) solved=%zu skipped=%zu "
+                     "         gen %d/%d (%s, stop=%s) solved=%zu skipped=%zu "
                      "improved=%zu aborted=%zu coverage_gain=%zu kept=%zu\n"
                      "         mean_degree=%.2f cluster_cap=%d node_cap=%ld\n",
                      label, ms(t0, t_adj), ms(t0, Clock::now()),
@@ -1418,13 +1418,14 @@ private:
         if (timing) {
             double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
             gcsa_log(
-                "[timing] %s Phase II: %.1fms  iters=%d stop=%s "
+                "[timing] %s Phase II: %.1fms  gen %d/%d (%s, stop=%s) "
                 "enums=%zu cache_hits=%zu "
                 "skip_sat=%zu skip_best=%zu tries=%zu "
                 "fail=%zu improve=%zu dirty_marks=%zu "
                 "pin(none/fast/multi)=%zu/%zu/%zu "
                 "enum=%.1fms try=%.1fms",
-                label, ms, guard, stop_reason, phase2_enum, phase2_cache_hits,
+                label, ms, guard, max_iters, iters_src, stop_reason,
+                phase2_enum, phase2_cache_hits,
                 phase2_skip_sat, phase2_skip_best, phase2_tries,
                 phase2_fail, phase2_improve, phase2_dirty_marks,
                 phase2_no_pin, phase2_fast_pin, phase2_multi_pin,
@@ -1434,8 +1435,7 @@ private:
                     "  (kept_drop=%d < min_gain=%d for stall=%d/%d)",
                     last_gen_kept_drop, min_gain, stall, stall_limit);
             } else if (std::strcmp(stop_reason, "max-iters") == 0) {
-                gcsa_log("  (spent the %d-iteration budget from %s)",
-                         max_iters, iters_src);
+                gcsa_log("  (generation budget exhausted)");
             }
             gcsa_log("\n");
         }

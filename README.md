@@ -169,7 +169,9 @@ compression on a 180 kb repetitive input: `####.####` → **40% of the full SA**
   Tree-dp preference enumeration and per-root forest DP are parallelized via
   `std::thread` (`GCSA_THREADS=N`, default=`hardware_concurrency`). Set
   `GCSA_TIMING=1` for per-phase ms (pref / forest / dp / accept / leftover /
-  Phase II; Phase II also prints `stop=fixed-point|max-iters|adaptive-stall`).
+  Phase II; Phase II also prints the generation it reached out of the budget
+  and why it stopped, as `gen X/Y (<budget source>, stop=<reason>)` with
+  `reason` one of `fixed-point|max-iters|adaptive-stall`).
   Leftover greedy reuses the static candidate cache (no re-enum).
   Forest cycle checks walk the parent chain; DP uses dense node ids.
   Phase II runs a fixed budget of 100 dirty generations

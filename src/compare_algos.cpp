@@ -279,6 +279,47 @@ int main(int argc, char** argv) {
              Shape::parse("#.#"),
              "ACGTACGTACGTACGTACGT");
 
+    // --- Cyclic preference structures --------------------------------------
+    // Each name points at one preferred source, so the preference graph has
+    // out-degree 1 and its cycles are what the forest build must break. It
+    // breaks them at the member processed last -- the largest packed k-mer name
+    // -- which is an artifact of iteration order, not of value; tree-dp4 drops
+    // the cycle's cheapest edge instead. These are the families where that
+    // choice is load-bearing. They are periodic by construction: a period-p
+    // repeat makes the p gapped k-mers derive from each other cyclically.
+    //
+    // The rows below deliberately cover both signs. Repair maximizes the forest
+    // DP's own objective, but the DP only feeds Phase II, and re-rooting the
+    // chain can leave the retarget loop with less to work with -- so the same
+    // move that wins 97 on tgac-style motifs loses 97 on gtac ones.
+    auto rep = [](const std::string& motif, size_t n) {
+        std::string s;
+        s.reserve(n + motif.size());
+        while (s.size() < n) s += motif;
+        s.resize(n);
+        return s;
+    };
+    const Shape sh_gap = Shape::parse("#.#");
+    const Shape sh_adj = Shape::parse("##");
+    // Period 2: the ac12 counterexample at scale. One 2-cycle, coverages 3 vs
+    // 4; the gain stays 1 however long the text gets.
+    run_case("cyc ac48 #.#", sh_gap, rep("AC", 48));
+    // Period 4 with motif[1]==motif[3]: the odd positions collapse to a single
+    // name, leaving one cycle whose repair unlocks the whole chain. Nominal
+    // edge gain is 1, but end to end it halves |C| and hits the ILP optimum.
+    run_case("cyc taaa48 #.#", sh_gap, rep("TAAA", 48));
+    run_case("cyc gaca120 #.#", sh_gap, rep("GACA", 120));
+    run_case("cyc taaa400 #.#", sh_gap, rep("TAAA", 400));
+    // Two interacting cycles, both repaired.
+    run_case("cyc tgttct120 ##", sh_adj, rep("TGTTCT", 120));
+    // Boundary: a period-4 forest *path*, no cycle to repair (dep-order and
+    // tree-dp3 reach the optimum here; cycle repair cannot).
+    run_case("cyc acgt48 #.#", sh_gap, rep("ACGT", 48));
+    // Counter-family: a rotation of the same cyclic sequence, where plain
+    // tree-dp is already optimal and repairing the cycle breaks it.
+    run_case("cyc gtac48 #.#", sh_gap, rep("GTAC", 48));
+    run_case("cyc gtac400 #.#", sh_gap, rep("GTAC", 400));
+
     // --- Short repetitive DNA ----------------------------------------------
     {
         std::mt19937_64 rng(seed);
