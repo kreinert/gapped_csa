@@ -321,6 +321,7 @@ public:
         // enumerate_candidates_ may consult removed_/pin_count_ only when
         // require_avail=true; still initialize so the object is consistent.
         removed_.assign(m, 0);
+        removed_words_.assign((m + 63) / 64, 0);
         pin_count_.assign(m, 0);
         pin_owner_.assign(m, 0);
         multi_pin_owners_.clear();
@@ -357,6 +358,7 @@ public:
                      const std::vector<Candidate>& links) {
         const size_t m = G_.m();
         removed_.assign(m, 0);
+        removed_words_.assign((m + 63) / 64, 0);
         pin_count_.assign(m, 0);
         pin_owner_.assign(m, 0);
         multi_pin_owners_.clear();
@@ -390,6 +392,7 @@ private:
 
     std::vector<int32_t> rank_of_;
     std::vector<uint8_t> removed_;
+    std::vector<uint64_t> removed_words_;
     std::vector<int32_t> pin_count_;   // #accepted candidates using this rank as source
     std::vector<uint64_t> pin_owner_;  // one owner name when pin_count==1 (undef if 0)
     std::unordered_map<int32_t, std::vector<uint64_t>> multi_pin_owners_; // owners when pin_count>1
@@ -424,7 +427,23 @@ private:
     }
 
     bool run_kept_(int32_t a, int32_t b) const {
-        for (int32_t r = a; r < b; ++r) if (removed_[r]) return false;
+        if (a >= b) return true;
+        if (removed_words_.empty() || (size_t)b > removed_words_.size() * 64) {
+            for (int32_t r = a; r < b; ++r) if (removed_[r]) return false;
+            return true;
+        }
+        size_t w_start = (size_t)a >> 6;
+        size_t w_end   = (size_t)(b - 1) >> 6;
+        uint64_t mask_start = ~0ULL << (a & 63);
+        uint64_t mask_end   = ~0ULL >> (63 - ((b - 1) & 63));
+        if (w_start == w_end) {
+            return (removed_words_[w_start] & (mask_start & mask_end)) == 0;
+        }
+        if (removed_words_[w_start] & mask_start) return false;
+        for (size_t w = w_start + 1; w < w_end; ++w) {
+            if (removed_words_[w]) return false;
+        }
+        if (removed_words_[w_end] & mask_end) return false;
         return true;
     }
 
@@ -643,9 +662,11 @@ private:
         for (int32_t r : c.covered) {
             if (!removed_[r]) {
                 removed_[r] = 1;
+                if (!removed_words_.empty()) removed_words_[r >> 6] |= (1ULL << (r & 63));
                 --kept_count_;
             } else {
                 removed_[r] = 1;
+                if (!removed_words_.empty()) removed_words_[r >> 6] |= (1ULL << (r & 63));
             }
         }
         accepted[c.name] = std::move(c);
@@ -677,6 +698,7 @@ private:
         for (int32_t r : c.covered) {
             if (removed_[r]) {
                 removed_[r] = 0;
+                if (!removed_words_.empty()) removed_words_[r >> 6] &= ~(1ULL << (r & 63));
                 ++kept_count_;
             }
         }
@@ -1327,9 +1349,36 @@ private:
             return it == accepted.end() ? 0 : it->second.coverage();
         };
 
-        // Seed: all |I|>1 (saturated / skip_best exit cheaply on first touch).
-        std::vector<int> dirty(n_ord);
-        for (int i = 0; i < n_ord; ++i) dirty[i] = i;
+        if (cand_cache.size() < (size_t)n_ord) {
+            std::vector<std::vector<Candidate>> temp_cands((size_t)n_ord);
+            gcsa_parallel_for((size_t)n_ord, [&](size_t i) {
+                const Interval* ivp = order[i];
+                if (cand_cache.find(ivp->name) != cand_cache.end()) return;
+                auto cands = enumerate_candidates_(ivp->name, ivp->lo, ivp->hi, /*require_avail=*/false);
+                std::sort(cands.begin(), cands.end(), [](const Candidate& a, const Candidate& b){
+                    if (a.coverage() != b.coverage()) return a.coverage() > b.coverage();
+                    return a.add > b.add;
+                });
+                temp_cands[i] = std::move(cands);
+            });
+            for (size_t i = 0; i < (size_t)n_ord; ++i) {
+                if (!temp_cands[i].empty() || cand_cache.find(order[i]->name) == cand_cache.end()) {
+                    cand_cache.emplace(order[i]->name, std::move(temp_cands[i]));
+                }
+            }
+        }
+
+        // Seed: dirty queue with candidates having potential coverage gain.
+        std::vector<int> dirty;
+        dirty.reserve(n_ord);
+        for (int i = 0; i < n_ord; ++i) {
+            const Interval* ivp = order[i];
+            int cur_cov = cov_of(ivp->name);
+            if (cur_cov >= ivp->hi - ivp->lo) continue;
+            const auto& cands = get_cands(*ivp);
+            if (cands.empty() || cands.front().coverage() <= cur_cov) continue;
+            dirty.push_back(i);
+        }
         std::vector<char> in_next(n_ord, 0);
         std::vector<int> next_dirty;
         next_dirty.reserve((size_t)n_ord);
@@ -1342,6 +1391,8 @@ private:
             const Interval* iv = order[oi];
             int cv = cov_of(iv->name);
             if (cv >= iv->hi - iv->lo) return;
+            const auto& cands = get_cands(*iv);
+            if (cands.empty() || cands.front().coverage() <= cv) return;
             in_next[oi] = 1;
             next_dirty.push_back(oi);
             ++phase2_dirty_marks;
@@ -1370,7 +1421,82 @@ private:
             std::sort(dirty.begin(), dirty.end());
 
             bool hit_time_limit = false;
-            for (int oi : dirty) {
+
+            struct Proposed {
+                int oi = -1;
+                const Candidate* cand = nullptr;
+            };
+            std::vector<Proposed> proposed(dirty.size());
+            std::atomic<size_t> eval_counter{0};
+
+            gcsa_parallel_for(dirty.size(), [&](size_t idx) {
+                size_t cnt = eval_counter.fetch_add(1, std::memory_order_relaxed);
+                if (time_budgeted && (cnt & 1023) == 0) {
+                    double elapsed = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                    if (elapsed >= time_limit_ms) {
+                        hit_time_limit = true;
+                        return;
+                    }
+                }
+                if (hit_time_limit) return;
+
+                int oi = dirty[idx];
+                const Interval* ivp = order[oi];
+                const int isize = ivp->hi - ivp->lo;
+                int cur_cov = cov_of(ivp->name);
+                if (cur_cov >= isize) return;
+
+                const auto& cands = get_cands(*ivp);
+                if (cands.empty() || cands.front().coverage() <= cur_cov) return;
+
+                for (const auto& c : cands) {
+                    if (c.coverage() < kMinCoverage) continue;
+                    if (c.coverage() <= cur_cov) break;
+                    if (!run_kept_(c.src_lo, c.src_hi)) continue;
+                    bool ok = true;
+                    for (int32_t r : c.covered) {
+                        if (removed_[r]) { ok = false; break; }
+                    }
+                    if (!ok) continue;
+
+                    // Quick retarget check for pinned covered ranks
+                    bool pin_ok = true;
+                    for (int32_t r : c.covered) {
+                        if (pin_count_[r] > 0) {
+                            if (pin_count_[r] == 1) {
+                                uint64_t owner = pin_owner_[r];
+                                auto it = accepted.find(owner);
+                                if (it == accepted.end()) { pin_ok = false; break; }
+                                int32_t nlo, nhi;
+                                if (!can_retarget_(it->second, c, nlo, nhi)) { pin_ok = false; break; }
+                            } else {
+                                auto mit = multi_pin_owners_.find(r);
+                                if (mit != multi_pin_owners_.end()) {
+                                    for (uint64_t owner : mit->second) {
+                                        auto it = accepted.find(owner);
+                                        if (it == accepted.end()) { pin_ok = false; break; }
+                                        int32_t nlo, nhi;
+                                        if (!can_retarget_(it->second, c, nlo, nhi)) { pin_ok = false; break; }
+                                    }
+                                } else {
+                                    pin_ok = false; break;
+                                }
+                            }
+                        }
+                    }
+                    if (!pin_ok) continue;
+
+                    proposed[idx] = {oi, &c};
+                    break;
+                }
+            });
+
+            if (hit_time_limit) {
+                stop_reason = "phase1-time-budget";
+                break;
+            }
+
+            for (size_t idx = 0; idx < dirty.size(); ++idx) {
                 if (time_budgeted && (phase2_tries & 63) == 0 && phase2_tries > 0) {
                     double elapsed = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
                     if (elapsed >= time_limit_ms) {
@@ -1379,6 +1505,7 @@ private:
                         break;
                     }
                 }
+                int oi = dirty[idx];
                 const Interval* ivp = order[oi];
                 const int isize = ivp->hi - ivp->lo;
                 int cur_cov = cov_of(ivp->name);
@@ -1392,13 +1519,13 @@ private:
                 const int best_cov = cands.front().coverage();
 
                 int got_cov = cur_cov;
-                for (const auto& c : cands) {
-                    if (c.coverage() < kMinCoverage) continue;
-                    if (c.coverage() <= cur_cov) break;
-                    if (!run_kept_(c.src_lo, c.src_hi)) continue;
-                    bool ok = true;
-                    for (int32_t r : c.covered) if (removed_[r]) { ok = false; break; }
-                    if (!ok) continue;
+                const Candidate* prop_cand = proposed[idx].cand;
+
+                auto try_cand = [&](const Candidate& c) -> bool {
+                    if (c.coverage() < kMinCoverage) return false;
+                    if (c.coverage() <= cur_cov) return false;
+                    if (!run_kept_(c.src_lo, c.src_hi)) return false;
+                    for (int32_t r : c.covered) if (removed_[r]) return false;
 
                     size_t before = kept_count_;
                     ++phase2_tries;
@@ -1415,7 +1542,7 @@ private:
                             in_pin_blocked[oi] = 1;
                             pin_blocked.push_back(oi);
                         }
-                        continue;
+                        return false;
                     }
                     size_t after = kept_count_;
                     if (after < before) gen_kept_drop += (int)(before - after);
@@ -1435,8 +1562,21 @@ private:
                     improved_gen = true;
                     ++phase2_improve;
                     got_cov = c.coverage();
-                    break;
+                    return true;
+                };
+
+                bool applied = false;
+                if (prop_cand) {
+                    applied = try_cand(*prop_cand);
                 }
+                if (!applied) {
+                    for (const auto& c : cands) {
+                        if (&c == prop_cand) continue;
+                        if (c.coverage() <= cur_cov) break;
+                        if (try_cand(c)) { applied = true; break; }
+                    }
+                }
+
                 // Still room vs cached best (pin-blocked / source not kept yet /
                 // accepted a suboptimal cand) — retry next generation if anyone
                 // improved (pins / kept sets may have moved).
@@ -1581,23 +1721,40 @@ private:
         std::unordered_map<uint64_t, std::vector<Candidate>> cand_cache;
         gcsa_log("[dep-order] preference / DAG build...\n");
         auto t0 = Clock::now();
-        for (const auto& iv : intervals) {
-            if (iv.hi - iv.lo <= 1) continue;
+        std::vector<std::vector<Candidate>> temp_cands(intervals.size());
+        std::vector<Pref> temp_prefs(intervals.size());
+        std::vector<char> has_pref(intervals.size(), 0);
+
+        gcsa_parallel_for(intervals.size(), [&](size_t i) {
+            const auto& iv = intervals[i];
+            if (iv.hi - iv.lo <= 1) return;
             auto cands = enumerate_candidates_(iv.name, iv.lo, iv.hi, /*avail=*/false);
             if (iv.hi - iv.lo > 2) {
                 Candidate c = pick_best_(cands);
                 if (c.coverage() >= kMinCoverage) {
                     uint64_t src_name = name_of_rank_(c.src_lo);
-                    prefs.push_back({&iv, std::move(c), src_name});
+                    temp_prefs[i] = Pref{&iv, std::move(c), src_name};
+                    has_pref[i] = 1;
                 }
             }
             std::sort(cands.begin(), cands.end(), [](const Candidate& a, const Candidate& b){
                 if (a.coverage() != b.coverage()) return a.coverage() > b.coverage();
                 return a.add > b.add;
             });
-            cand_cache.emplace(iv.name, std::move(cands));
+            temp_cands[i] = std::move(cands);
+        });
+
+        for (size_t i = 0; i < intervals.size(); ++i) {
+            if (has_pref[i]) prefs.push_back(std::move(temp_prefs[i]));
+            if (intervals[i].hi - intervals[i].lo > 1) {
+                cand_cache.emplace(intervals[i].name, std::move(temp_cands[i]));
+            }
         }
         auto t1 = Clock::now();
+
+        std::unordered_map<uint64_t, Pref*> pref_map;
+        pref_map.reserve(prefs.size());
+        for (auto& p : prefs) pref_map[p.iv->name] = &p;
 
         // DAG edge: src_name -> target_name (target depends on source).
         // Only introduce an edge when the preferred candidate has cov >= kMinCoverage
@@ -1605,8 +1762,8 @@ private:
         std::vector<std::vector<int>> outs(N), ins(N);
         std::vector<int> indeg(N, 0);
         auto pref_of = [&](uint64_t name) -> Pref* {
-            for (auto& p : prefs) if (p.iv->name == name) return &p;
-            return nullptr;
+            auto it = pref_map.find(name);
+            return it != pref_map.end() ? it->second : nullptr;
         };
         for (auto& p : prefs) {
             if (p.cand.coverage() < kMinCoverage) continue;   // no preference-DAG edge below floor
@@ -2113,6 +2270,7 @@ private:
         rank_of_.assign(m, 0);
         for (size_t r = 0; r < m; ++r) rank_of_[G_.sa[r]] = (int32_t)r;
         removed_.assign(m, 0);
+        removed_words_.assign((m + 63) / 64, 0);
         pin_count_.assign(m, 0);
         pin_owner_.assign(m, 0);
         multi_pin_owners_.clear();
