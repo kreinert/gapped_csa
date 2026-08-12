@@ -1286,6 +1286,11 @@ private:
     //                             before stopping. Default 0 = disabled.
     //   GCSA_PHASE2_MIN_GAIN=G  – min total kept-drop (|C| reduction) per dirty
     //                             generation to count as progress (default 1).
+    //
+    // Env GCSA_DISABLE_PHASE2 (optional): skip Phase II entirely, so callers
+    // (DepOrder, TreeDp, PseudoforestDp) can be compared on their Phase I /
+    // DP output alone, without the shared retarget sweep smoothing over
+    // differences between them.
     void run_phase2_(const std::vector<Interval>& intervals,
                      std::unordered_map<uint64_t, Candidate>& accepted,
                      const char* label,
@@ -1294,6 +1299,10 @@ private:
                      std::unordered_map<uint64_t, std::vector<Candidate>>* precomputed = nullptr,
                      double phase1_ms = 0.0) {
         using Clock = std::chrono::steady_clock;
+        if (std::getenv("GCSA_DISABLE_PHASE2") != nullptr) {
+            std::fprintf(stderr, "[%s] Phase II: disabled (GCSA_DISABLE_PHASE2)\n", label);
+            return;
+        }
         const char* iters_src = "default";
         const int max_iters = phase2_budget_(iters_src);
         int min_gain = 1;
