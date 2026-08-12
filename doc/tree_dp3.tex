@@ -1,0 +1,1354 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[expansion=false]{microtype}
+\usepackage{array}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{hyperref}
+
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{remark}
+\newtheorem{fact}{Fact}
+\newtheorem{remark}{Remark}
+\newtheorem{example}{Example}
+
+\newcommand{\cov}{\operatorname{cov}}
+\newcommand{\orig}{\operatorname{orig}}
+\newcommand{\name}{\operatorname{name}}
+\newcommand{\isize}{\operatorname{isize}}
+\newcommand{\Feas}{\mathcal{F}}
+\newcommand{\Links}{\mathcal{K}}
+\newcommand{\Names}{\mathcal{N}}
+\newcommand{\scap}{\operatorname{scap}}
+
+\algrenewcommand\algorithmicrequire{\textbf{Input:}}
+\algrenewcommand\algorithmicensure{\textbf{Output:}}
+
+\title{\texttt{tree-dp3}: exact cluster-local re-optimization\\
+for differential compression of the gapped suffix array}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+The differential compression of a gapped suffix array chooses a set of
+\emph{links}, each replacing a run of stored positions by a pointer plus
+a shift. We show that the resulting optimization problem is a
+maximum-weight set packing subject to exactly two constraints --- at most
+one link per name, and a chosen link's source ranks must all be kept ---
+and that, crucially, \emph{both are pairwise} and there is no acyclicity
+requirement, because the compressed array stores literal positions and
+the decoder never recurses. Pairwise feasibility licenses an exact
+\emph{local} optimization: freeze the links of all but a bounded set of
+names and re-solve that set optimally. We prove the composition theorem
+that makes this sound --- a link's covered ranks always lie in its own
+interval, so a frozen link can never drop a rank belonging to a cluster
+member, and the entire interface to the frozen part collapses to two
+conditions --- and identify the correct notion of dependency between
+names (one's link sources from the other's interval), showing why the two
+tempting alternatives (competition for covered ranks, sharing a source)
+are not conflicts. The resulting algorithm, \texttt{tree-dp3}, runs the
+existing preference-forest DP and unpin/retarget loop and then performs
+branch-and-bound over bounded dependency clusters. It repairs both known
+counterexamples to the forest DP, attains the ILP optimum on $9$ of $10$
+fixed test instances, and on a $139$-configuration suite at
+$a_{\max}=16$ reduces total $|C|$ from $252329$ to $213078$
+($15.5\,\%$), improving $122$ configurations and worsening none. At the
+default $a_{\max}=8$ the same exact solve buys only $3$ positions
+suite-wide: the binding constraint is the candidate universe, not the
+neighbourhood size.
+\end{abstract}
+
+\tableofcontents
+
+\section{The compression problem}
+\label{sec:problem}
+
+\subsection{Setting and notation}
+
+We reuse the setting of the walkthrough (\texttt{dep\_order\_walkthrough})
+and of the pseudoforest note (\texttt{exact\_pseudoforest\_dp}) without
+change. Fix a binary shape $S$ of span $s$ over a text $T[0..n)$. The
+DisLex transform lays the gapped $k$-mer names out grouped by residue
+class $p \bmod s$; the suffix array of the resulting lextext is the
+\textbf{gapped suffix array} (GSA), with $m=n+1$ ranks. We write
+$\orig(r)$ for the original text position of rank $r$, and $\name(r)$ for
+the gapped $k$-mer at $\orig(r)$, which is the first symbol of the
+rank-$r$ gapped suffix.
+
+Because the GSA is sorted by gapped suffix, the ranks carrying a fixed
+name $c$ form a contiguous \textbf{interval}
+\[
+  I_c = [\ell_c, r_c) \subseteq \{0,\dots,m-1\},
+  \qquad
+  \isize(c) = |I_c| = r_c - \ell_c .
+\]
+The intervals $\{I_c\}_c$ \emph{partition} $\{0,\dots,m-1\}$: every rank
+has exactly one first symbol. We write $\Names$ for the set of names $c$
+with $\isize(c) > 1$; singletons are never compressed. Throughout,
+$a_{\max}$ is the maximum shift considered (\texttt{--max-add}, default
+$8$) and $\kappa = 3$ is the minimum coverage
+(\texttt{kMinCoverage}).
+
+\subsection{What is stored, and what a link is}
+
+Compression drops a subset of ranks. The surviving positions, in rank
+order, form the \textbf{compressed array} $C$. For each name $c$ the hash
+table stores at most two entries,
+\[
+  H_{\mathrm{offset}} = (\mathit{pos}, a, \mathit{num}),
+  \qquad
+  H_{\mathrm{rest}} = (\mathit{pos}', \mathit{num}'),
+\]
+decoding to
+\begin{equation}
+\label{eq:decode}
+  \text{positions}(c)
+  \;=\;
+  \bigl\{\, C[\mathit{pos}+t] + a\cdot s \;:\; 0 \le t < \mathit{num} \,\bigr\}
+  \;\cup\;
+  \bigl\{\, C[\mathit{pos}'+t] \;:\; 0 \le t < \mathit{num}' \,\bigr\}.
+\end{equation}
+Everything the compressor decides is which $H_{\mathrm{offset}}$ entries
+to install. We call one such decision a \emph{link}.
+
+\begin{definition}[Link]
+\label{def:link}
+A \textbf{link} is a quadruple $k = (c_k,\, a_k,\, S_k,\, T_k)$ where
+$c_k$ is a name, $1 \le a_k \le a_{\max}$ is the \emph{add},
+$S_k = [\sigma_k, \tau_k)$ is a contiguous range of ranks (the
+\textbf{source run}), and
+$T_k = (t_0,\dots,t_{|S_k|-1})$ is the sequence of \textbf{covered ranks},
+subject to
+\begin{enumerate}
+\item[(V1)] for every $0 \le j < |S_k|$:
+  $\orig(t_j) = \orig(\sigma_k + j) + a_k\cdot s$ and $\name(t_j) = c_k$
+  --- so $T_k \subseteq I_{c_k}$, and the map $\sigma_k+j \mapsto t_j$ is
+  a bijection $S_k \to T_k$ that is order-preserving;
+\item[(V2)] $S_k \cap T_k = \emptyset$;
+\item[(V3)] $\cov(k) := |T_k| = |S_k| \ge \kappa$.
+\end{enumerate}
+We write $\Links$ for the set of all links and
+$\Links_c = \{k \in \Links : c_k = c\}$.
+\end{definition}
+
+Condition (V1) is the note's order-preservation argument: prepending
+$a$ symbols to a gapped suffix preserves relative order and shifts the
+original position by exactly $+a\cdot s$. It is checked in the code by
+\texttt{pred\_lexpos\_} / \texttt{succ\_lexpos\_}. Condition (V2) is an
+intrinsic validity condition, not an interaction between two links: a
+link may not use as a source a rank it itself drops. It is what
+\texttt{emit\_intra\_runs\_} enforces by a two-pointer scan, and what the
+\texttt{clash} test of \texttt{enumerate\_all\_links\_} enforces in the
+source-centric enumeration. Note that (V2) does \emph{not} require
+$S_k \cap I_{c_k} = \emptyset$: intra-interval links, whose source run
+overlaps the target's own interval but avoids the ranks it covers, are
+perfectly legal, and \texttt{GCSA\_INTRA\_LINKS=0} exists only to restore
+the historical, stricter rule.
+
+\subsection{The objective and the two constraints}
+
+Let $X \subseteq \Links$ be a set of accepted links. A rank is dropped
+from $C$ exactly when it is covered by some $k \in X$. Hence
+
+\begin{equation}
+\label{eq:objective}
+  |C|(X) \;=\; m \;-\; \cov(X),
+  \qquad
+  \cov(X) := \sum_{k \in X} \cov(k),
+\end{equation}
+\emph{provided} the covered sets are disjoint --- which
+Proposition~\ref{prop:target-free} below shows is automatic. Minimizing
+$|C|$ is therefore maximizing total coverage.
+
+\begin{definition}[Feasibility]
+\label{def:feasible}
+$X \subseteq \Links$ is \textbf{feasible} iff
+\begin{itemize}
+\item[(F1)] \textbf{one link per name}: $c_k \ne c_{k'}$ for all
+  distinct $k,k' \in X$;
+\item[(F2)] \textbf{source integrity}: $S_k \cap T_{k'} = \emptyset$ for
+  all $k, k' \in X$ with $k \ne k'$.
+\end{itemize}
+We write $\Feas$ for the family of feasible sets.
+\end{definition}
+
+(F1) is a storage restriction: a \texttt{HashEntry} holds a single
+$H_{\mathrm{offset}}$. (F2) says a source must be physically present in
+$C$: if some other accepted link dropped a rank of $S_k$, then
+$C[\mathit{pos}+t]$ in \eqref{eq:decode} would silently read a different
+rank's position. In the implementation, (F2) is what
+\texttt{run\_kept\_} verifies before an accept, and what the
+\texttt{pin\_count\_} array tracks incrementally.
+
+\begin{proposition}[Target-disjointness is free]
+\label{prop:target-free}
+If $X$ satisfies (F1) then the covered sets $\{T_k\}_{k \in X}$ are
+pairwise disjoint, and \eqref{eq:objective} holds exactly.
+\end{proposition}
+
+\begin{proof}
+Let $k \ne k' \in X$. By (F1), $c_k \ne c_{k'}$. By (V1),
+$T_k \subseteq I_{c_k}$ and $T_{k'} \subseteq I_{c_{k'}}$, and distinct
+names have disjoint intervals. Hence $T_k \cap T_{k'} = \emptyset$, so
+$|\bigcup_{k \in X} T_k| = \sum_{k\in X}\cov(k)$.
+\end{proof}
+
+This small observation is the seed of everything that follows: because a
+link's covered ranks are confined to its own interval, and (F1) makes the
+per-name decision unique, \emph{the name owns its ranks}. We will use
+this twice more, in Lemma~\ref{lem:dep} and Theorem~\ref{thm:compose}.
+
+\subsection{There is no acyclicity constraint}
+\label{sec:noacyclic}
+
+It is tempting to expect a third constraint of the form ``the
+points-to relation among names must be acyclic'', by analogy with
+delta-encoded or recursively-defined structures. There is none.
+
+\begin{proposition}[Non-recursive decoding]
+\label{prop:noacyclic}
+For any feasible $X$, the decoder \eqref{eq:decode} is well defined and
+terminates in $O(\mathit{num}+\mathit{num}')$ time for every name,
+independently of the structure of $X$.
+\end{proposition}
+
+\begin{proof}
+$C$ stores \emph{literal} text positions of kept ranks in rank order.
+Given $k \in X$, (F2) guarantees every rank of $S_k$ is kept, so $S_k$
+occupies $|S_k|$ consecutive entries of $C$ starting at some index
+$\mathit{pos}$; this index is exactly what is written into
+$H_{\mathrm{offset}}$. Evaluating \eqref{eq:decode} therefore reads
+$\mathit{num}$ consecutive entries of $C$ and adds $a\cdot s$ to each. No
+term on the right-hand side of \eqref{eq:decode} refers to
+$\text{positions}(c')$ for any name $c'$; the definition is not
+recursive, so there is nothing to be well-founded.
+\end{proof}
+
+A hypothetical scheme in which $H_{\mathrm{offset}}$ could point at
+\emph{dropped} (virtual) ranks would decode a chain
+$c_1 \to c_2 \to \cdots$, and would need that chain to terminate --- an
+acyclicity condition, and a global, non-pairwise one. Constraint (F2)
+forbids such chains outright, and in exchange the feasible region stays
+simple:
+
+\begin{lemma}[Pairwise feasibility]
+\label{lem:pairwise}
+$X \in \Feas$ if and only if every $k \in X$ satisfies (V1)--(V3) and
+every pair $\{k,k'\} \subseteq X$ with $k \ne k'$ satisfies (F1) and
+(F2). Consequently $\Feas$ is downward closed: $X \in \Feas$ and
+$Y \subseteq X$ imply $Y \in \Feas$.
+\end{lemma}
+
+\begin{proof}
+Both (F1) and (F2) are universally quantified over ordered pairs of
+distinct elements of $X$ and involve no other member of $X$; so the
+conjunction over $X$ is exactly the conjunction over its $2$-element
+subsets. Downward closure is immediate, since a conjunction over the
+pairs of $Y$ is a sub-conjunction of the one over the pairs of $X$.
+\end{proof}
+
+\begin{corollary}[Set-packing formulation]
+\label{cor:packing}
+Differential compression is the maximum-weight independent set problem
+\[
+  \min_{X \in \Feas} |C|(X)
+  \;=\;
+  m - \max_{X \text{ independent in } G} \ \sum_{k \in X} \cov(k),
+\]
+on the conflict graph $G = (\Links, E)$ with
+$\{k,k'\} \in E$ iff $c_k = c_{k'}$, or
+$S_k \cap T_{k'} \ne \emptyset$, or $S_{k'} \cap T_k \ne \emptyset$.
+\end{corollary}
+
+Corollary~\ref{cor:packing} is the same formulation the pseudoforest note
+starts from; what is new here is the emphasis on Lemma~\ref{lem:pairwise}.
+Pairwise-ness is precisely the licence for \emph{cluster-local exact
+optimization}: if feasibility were a global property of $X$ (an
+acyclicity or an ordering condition), freezing part of a solution and
+re-solving the rest could produce a globally infeasible result even when
+every local check passed. Because it is pairwise, the interaction between
+a frozen part and a re-solved part is fully described by a finite set of
+two-element checks, and those checks can be precomputed once from the
+frozen part --- which is exactly what \S\ref{sec:compose} does.
+
+\section{Background: the forest DP and why it is not optimal}
+\label{sec:treedp}
+
+\subsection{Recap of \texttt{tree-dp}}
+
+\texttt{tree-dp} (documented in \texttt{dep\_order\_walkthrough}, \S7)
+proceeds as follows.
+
+\begin{enumerate}
+\item \textbf{Preferences.} For each name $c$ with $\isize(c) > 2$,
+  enumerate $\hat\Links_c$ --- the heuristics' view of the link universe
+  (\texttt{enumerate\_candidates\_}: maximal source runs with internal
+  $\mathrm{lcp} \ge a+1$) --- and record the \textbf{preferred} link
+  $\pi(c)$, of maximum coverage with ties broken towards larger $a$.
+  Preferences ignore availability; they are a static, structural notion.
+\item \textbf{Preference graph.} Draw a directed edge $c \to w$ whenever
+  $\pi(c)$'s source lies inside $I_w$. Since $S_{\pi(c)}$ has
+  $\mathrm{lcp} \ge a+1 \ge 2$ throughout, it lies inside a single
+  interval, so this graph has out-degree $\le 1$: as an undirected graph
+  it is a pseudoforest.
+\item \textbf{Cycle-breaking.} The implementation processes preferences
+  in ascending name order and installs $\mathrm{parent}(c) := w$ only if
+  $c$ is not already an ancestor of $w$ (\texttt{has\_ancestor}). Edges
+  that would close a cycle are \emph{discarded}. The result is a forest.
+\item \textbf{KEEP/COMPRESS DP.} With
+  $\mathit{src\_ok}$ recording whether the node's preferred source is
+  still available,
+  \[
+    \mathrm{DP}(v,\mathsf{true}) = \min\Bigl(
+      \isize(v) + \!\!\sum_{w \in \mathrm{ch}(v)}\!\! \mathrm{DP}(w,\mathsf{true}),\;\;
+      \isize(v) - \cov(\pi(v)) + \!\!\sum_{w \in \mathrm{ch}(v)}\!\! \mathrm{DP}(w,\mathsf{false})
+    \Bigr),
+  \]
+  \[
+    \mathrm{DP}(v,\mathsf{false}) = \isize(v) + \sum_{w \in \mathrm{ch}(v)} \mathrm{DP}(w,\mathsf{true}),
+  \]
+  with KEEP on ties. A root may COMPRESS only when its preferred source
+  lies outside its own tree.
+\item \textbf{Materialize, leftover, Phase II.} The DP's choices are
+  accepted deepest-first; names that never entered the forest are handled
+  by a size-ordered availability greedy; then the shared Phase II
+  unpin/retarget fixed point runs.
+\end{enumerate}
+
+The DP is exact \emph{for the model it is given}. Two restrictions of
+that model cost optimality: each name is allowed only its single
+preferred link, and each name is allowed only its single forest parent,
+with any surplus preference edge silently deleted in step~3. The two
+counterexamples below isolate the two failures.
+
+\subsection{Counterexample I: cycle-breaking fixes the wrong orientation}
+\label{sec:ce1}
+
+Take $T = (\mathtt{AC})^6 = \mathtt{ACACACACACAC}$, $n = 12$,
+$S = \mathtt{\#.\#}$, $s = 3$, $m = 13$. Position $p$ carries the name
+$\mathtt{AA}$ for even $p \le 8$ and $\mathtt{CC}$ for odd $p \le 9$; the
+three tail positions give the singletons $\mathtt{A\$}, \mathtt{C\$},
+\mathtt{\$\$}$. The GSA is
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrrrrrrrrrrrrr@{}}
+\toprule
+rank $r$ & 0 & 1 & 2 & 3 & 4 & 5 & 6 & 7 & 8 & 9 & 10 & 11 & 12 \\
+$\orig(r)$ & 12 & 10 & 8 & 6 & 4 & 2 & 0 & 11 & 9 & 7 & 5 & 3 & 1 \\
+$\name(r)$ & \$\$ & A\$ & AA & AA & AA & AA & AA & C\$ & CC & CC & CC & CC & CC \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+so $I_{\mathtt{AA}} = [2,7)$ and $I_{\mathtt{CC}} = [8,13)$, both of size
+$5$, and $m = 13 = 5 + 5 + 3$.
+
+\paragraph{The whole link universe.}
+A link shifts original positions by $+a\cdot s = 3a$. Since AA sits on
+even and CC on odd positions, $3a$ must be odd, i.e.\ $a$ odd, and
+$a \ge 3$ overshoots the text. So $a = 1$ throughout, and the universe
+(as reported by \texttt{ilp\_baseline}: \texttt{candidates=4}) is
+
+\begin{center}
+\small
+\begin{tabular}{@{}llllrl@{}}
+\toprule
+link & target & $a$ & source $S_k$ & $\cov$ & covered $T_k$ \\
+\midrule
+$k_1$   & AA & 1 & $[10,13)$, i.e.\ $\orig = 5,3,1$ & 3 & $(2,3,4)$, i.e.\ $\orig = 8,6,4$ \\
+$k_2$   & CC & 1 & $[3,7)$,\ \ i.e.\ $\orig = 6,4,2,0$ & 4 & $(8,9,10,11)$, i.e.\ $\orig = 9,7,5,3$ \\
+$k_2'$  & CC & 1 & $[3,6)$ & 3 & $(8,9,10)$ \\
+$k_2''$ & CC & 1 & $[4,7)$ & 3 & $(9,10,11)$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+($k_2', k_2''$ are the two sub-runs of $k_2$ of length $\ge\kappa$; only
+$k_1$ and $k_2$ are maximal, hence only those two are visible to
+\texttt{enumerate\_candidates\_}.)
+
+\paragraph{Every feasible set has coverage at most $4$.}
+$S_{k_1} = \{10,11,12\}$ meets $T_{k_2} = \{8,9,10,11\}$ in $\{10,11\}$,
+meets $T_{k_2'}$ in $\{10\}$ and $T_{k_2''}$ in $\{10,11\}$; so $k_1$
+conflicts with every CC link by (F2). Symmetrically
+$S_{k_2} = \{3,4,5,6\}$ meets $T_{k_1} = \{2,3,4\}$ in $\{3,4\}$. At most
+one of the two names can compress, and the best single choice is $k_2$:
+\[
+  |C|^\star = 13 - 4 = 9,
+\]
+which \texttt{ilp\_baseline} confirms (\texttt{optimal |C| = 9},
+$1$ selected candidate).
+
+\paragraph{What \texttt{tree-dp} does.}
+The preferred links are
+$\pi(\mathtt{AA}) = k_1$ ($\cov 3$) and $\pi(\mathtt{CC}) = k_2$
+($\cov 4$), giving a $2$-cycle
+$\mathtt{AA} \leftrightarrow \mathtt{CC}$ in the preference graph. Both
+names have $\isize = 5 > 2$ and both preferences clear $\cov \ge \kappa$,
+so, unlike on the $\mathtt{GCCTTTAAAG}^3$ instance of the walkthrough,
+the cycle is \emph{not} filtered away and the cycle-breaking rule fires.
+Names are processed in ascending order, and $\mathtt{AA} < \mathtt{CC}$
+as arithmetic codes ($2 < 8$), so:
+
+\begin{center}
+\small
+\begin{tabular}{@{}llp{9.2cm}@{}}
+\toprule
+step & edge & outcome \\
+\midrule
+1 & $\mathtt{AA} \to \mathtt{CC}$ &
+  installed: $\mathrm{parent}(\mathtt{AA}) = \mathtt{CC}$ \\
+2 & $\mathtt{CC} \to \mathtt{AA}$ &
+  \textbf{discarded}: \texttt{has\_ancestor(AA,\,CC)} is true, so this
+  edge would close a cycle \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The forest is the single edge $\mathtt{CC} \to \mathtt{AA}$ with root
+$\mathtt{CC}$. The DP then evaluates
+\[
+\begin{aligned}
+  \mathrm{DP}(\mathtt{AA},\mathsf{true}) &= \min(5,\ 5-3) = 2 \quad(\text{COMPRESS}),\\
+  \mathrm{cost}_{\mathrm{keep}}(\mathtt{CC}) &= 5 + 2 = 7,
+\end{aligned}
+\]
+and COMPRESS is \emph{not available} at the root: $\mathtt{CC}$'s
+preferred source $\mathtt{AA}$ is a forest descendant, which is exactly
+the special case the root rule patches. So $\mathtt{CC}$ is forced to
+KEEP and the DP returns $7$, i.e.
+\[
+  |C| \;=\; 7 + 3\ \text{singletons} \;=\; 10 .
+\]
+The subsequent leftover greedy and Phase II find nothing (both names are
+saturated), so $\texttt{tree-dp} = \texttt{tree-dp2} = 10$ against the
+optimum $9$.
+
+\paragraph{Diagnosis.}
+The instance contains a genuine, high-coverage mutual preference, and the
+two orientations are \emph{not} equally good: $\mathtt{CC}\!\leftarrow\!\mathtt{AA}$
+is worth $4$, $\mathtt{AA}\!\leftarrow\!\mathtt{CC}$ only $3$.
+Cycle-breaking does not compare them; it keeps whichever edge it meets
+first in a deterministic but semantically arbitrary order, and the DP
+then optimizes exactly --- inside a model from which the better option
+has already been removed. The pseudoforest DP of
+\texttt{exact\_pseudoforest\_dp} fixes precisely this failure by folding
+the cycle instead of cutting it. Note that plain \texttt{dep-order}
+happens to get $9$ here (its Phase II retarget lets $\mathtt{CC}$ take
+the coverage-$4$ link), while size-order greedy gets $10$: no method
+below is uniformly better than another, which is itself part of the
+motivation for an exact local solve.
+
+\subsection{Counterexample II: the optimum is not built from preferred links}
+\label{sec:ce2}
+
+Take $T = (\mathtt{ACGT})^5$, $n = 20$, $S = \mathtt{\#.\#}$, $m = 21$.
+The four compressible names and their preferred links are
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrllrl@{}}
+\toprule
+name $c$ & $\isize$ & $I_c$ & $\pi(c)$ sources from & $\cov$ & detail \\
+\midrule
+AG & 5 & $[1,6)$   & CT & 4 & $a=1$, $S = [7,11)$,  $T = (1,2,3,4)$ \\
+CT & 5 & $[6,11)$  & GA & 4 & $a=1$, $S = [12,16)$, $T = (6,7,8,9)$ \\
+GA & 4 & $[12,16)$ & AG & 3 & $a=2$, $S = [3,6)$,   $T = (12,13,14)$ \\
+TC & 4 & $[17,21)$ & AG & 4 & $a=1$, $S = [2,6)$,   $T = (17,18,19,20)$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+plus three singletons ($\mathtt{\$\$}$, $\mathtt{G\$}$, $\mathtt{T\$}$),
+so $m = 5+5+4+4+3 = 21$.
+
+The preference graph has a $3$-cycle
+$\mathtt{AG} \to \mathtt{GA} \to \mathtt{CT} \to \mathtt{AG}$
+(reading ``$w \to c$'' as ``$c$ prefers a source in $I_w$'') with
+$\mathtt{TC}$ hanging off $\mathtt{AG}$. Cycle-breaking in ascending name
+order installs $\mathrm{parent}(\mathtt{AG}) = \mathtt{CT}$, then
+$\mathrm{parent}(\mathtt{CT}) = \mathtt{GA}$, then \emph{discards}
+$\mathtt{GA} \to \mathtt{AG}$ (which would close the cycle), then
+installs $\mathrm{parent}(\mathtt{TC}) = \mathtt{AG}$. The forest is the
+path
+\[
+  \mathtt{GA} \;\to\; \mathtt{CT} \;\to\; \mathtt{AG} \;\to\; \mathtt{TC},
+\]
+rooted at $\mathtt{GA}$, exactly as \texttt{GCSA\_TRACE\_DP=1} reports.
+The DP unrolls to
+\[
+\begin{aligned}
+  \mathrm{DP}(\mathtt{TC},\mathsf{true}) &= \min(4,\ 4-4) = 0,
+    &\qquad \mathrm{DP}(\mathtt{TC},\mathsf{false}) &= 4, \\
+  \mathrm{DP}(\mathtt{AG},\mathsf{true}) &= \min(5+0,\ 1+4) = 5,
+    &\qquad \mathrm{DP}(\mathtt{AG},\mathsf{false}) &= 5+0 = 5, \\
+  \mathrm{DP}(\mathtt{CT},\mathsf{true}) &= \min(5+5,\ 1+5) = 6,
+    &\qquad \mathrm{cost}(\mathtt{GA}) &= 4 + 6 = 10,
+\end{aligned}
+\]
+where $\mathtt{AG}$ takes KEEP on the tie, $\mathtt{CT}$ takes COMPRESS,
+and the root $\mathtt{GA}$ has no COMPRESS option at all because its
+preferred source $\mathtt{AG}$ is a forest descendant. The DP therefore
+accepts two links --- $\mathtt{TC}\!\leftarrow\!\mathtt{AG}$
+($\cov 4$) and $\mathtt{CT}\!\leftarrow\!\mathtt{GA}$ ($\cov 4$) --- for
+total coverage $8$ and
+\[
+  |C| \;=\; 21 - 8 \;=\; 13 .
+\]
+
+The ILP optimum is $11$, i.e.\ coverage $10$, realised by \emph{three}
+links, all sourcing from the (fully kept) interval $I_{\mathtt{AG}}$:
+
+\begin{center}
+\small
+\begin{tabular}{@{}llrrll@{}}
+\toprule
+target & source & $a$ & $\cov$ & source ranks & preferred? \\
+\midrule
+TC & AG & 1 & 4 & $[2,6)$ & yes \\
+GA & AG & 2 & 3 & $[3,6)$ & yes --- but this is the edge cycle-breaking deleted \\
+CT & AG & 3 & 3 & $[3,6)$ & \textbf{no} ($\pi(\mathtt{CT})$ is
+  $\mathtt{CT}\!\leftarrow\!\mathtt{GA}$ at $a=1$, $\cov 4$) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Two things go wrong for the forest model simultaneously. First, one of the
+three links is on the cycle edge that step~3 discarded. Second, and more
+fundamentally, the optimal solution asks $\mathtt{CT}$ to take a
+\emph{worse} link than its preferred one ($\cov 3$ at $a=3$ instead of
+$\cov 4$ at $a=1$), because doing so moves its source off $I_{\mathtt{GA}}$
+and onto $I_{\mathtt{AG}}$, freeing $\mathtt{GA}$ to compress in turn. No
+amount of cycle-folding recovers this: the model that allows one link per
+name is not rich enough, and a genuinely non-preferred add must be
+considered.
+
+Note also that the three optimal links all read from the same ranks
+$[3,6) \subseteq S_{\mathtt{TC}} = [2,6)$. That is not an accident, and it
+is the phenomenon Lemma~\ref{lem:dep}\,(b) below is about: sources are
+shared for free.
+
+\section{The dependency relation}
+\label{sec:dep}
+
+We now identify exactly when two names can constrain one another. This is
+the relation whose connected balls will become the clusters.
+
+\begin{definition}[Dependency]
+\label{def:dep}
+Two distinct names $c, d \in \Names$ are \textbf{dependent}, written
+$c \sim d$, iff some link of one draws its source from the other's
+interval:
+\[
+  c \sim d
+  \quad:\Longleftrightarrow\quad
+  \bigl(\exists\, k \in \hat\Links_c :\ S_k \cap I_d \ne \emptyset\bigr)
+  \ \ \text{or}\ \
+  \bigl(\exists\, k \in \hat\Links_d :\ S_k \cap I_c \ne \emptyset\bigr).
+\]
+The \textbf{dependency graph} is $D = (\Names, {\sim})$.
+\end{definition}
+
+In the implementation this graph is built by walking, for every cached
+candidate of every name $c$, the ranks of its source run and adding the
+undirected edge $\{c, \name(r)\}$ (deduplicated, and with consecutive
+equal names skipped, since a source run typically lies in one interval).
+
+\begin{lemma}[$\sim$ is the only binding relation]
+\label{lem:dep}
+Let $c \ne d$ be names with $c \not\sim d$. Then for every
+$k \in \hat\Links_c$ and every $k' \in \hat\Links_d$, the pair
+$\{k,k'\}$ is feasible. Consequently, in the conflict graph of
+Corollary~\ref{cor:packing}, there is no edge between $\hat\Links_c$ and
+$\hat\Links_d$.
+\end{lemma}
+
+\begin{proof}
+(F1) cannot bind, since $c_k = c \ne d = c_{k'}$. For (F2), consider
+$S_k \cap T_{k'}$. By (V1), $T_{k'} \subseteq I_{d}$, and by
+$c \not\sim d$ we have $S_k \cap I_{d} = \emptyset$; hence
+$S_k \cap T_{k'} = \emptyset$. The symmetric argument, using
+$T_k \subseteq I_c$ and $S_{k'} \cap I_c = \emptyset$, gives
+$S_{k'} \cap T_k = \emptyset$.
+\end{proof}
+
+Two other relations look like conflicts and are not. Getting either one
+wrong would silently enlarge the clusters (making the algorithm slower
+without making it better) or, worse, suggest constraints that do not
+exist.
+
+\begin{lemma}[Two non-conflicts]
+\label{lem:nonconflicts}
+Let $k, k'$ be links with $c_k \ne c_{k'}$.
+\begin{enumerate}
+\item[(a)] \emph{Names never compete for covered ranks:}
+  $T_k \cap T_{k'} = \emptyset$ always.
+\item[(b)] \emph{Sharing a source is not a conflict:} $S_k \cap S_{k'}$
+  may be arbitrary --- in particular $S_k = S_{k'}$ is allowed --- without
+  affecting feasibility of $\{k,k'\}$.
+\end{enumerate}
+\end{lemma}
+
+\begin{proof}
+(a) is Proposition~\ref{prop:target-free}: $T_k \subseteq I_{c_k}$,
+$T_{k'} \subseteq I_{c_{k'}}$, and distinct names have disjoint
+intervals. Note this holds even for intra-interval links, whose
+\emph{sources} may straddle interval boundaries; only the covered set is
+confined.
+
+(b) Definition~\ref{def:feasible} constrains $S_k$ against $T_{k'}$ and
+$S_{k'}$ against $T_k$; the pair $(S_k, S_{k'})$ does not occur in either
+(F1) or (F2). Semantically: an accepted link only ever \emph{reads} the
+entries of $C$ indexed by its source run, and reading is not exclusive.
+This is why \texttt{pin\_count\_} is a counter rather than a lock ---
+a rank may be pinned by many links at once, and \texttt{revoke\_} merely
+decrements.
+\end{proof}
+
+\begin{remark}
+Counterexample~II (\S\ref{sec:ce2}) is a witness for
+Lemma~\ref{lem:nonconflicts}\,(b) with three links, not two: the optimal
+solution has $\mathtt{TC}$, $\mathtt{GA}$ and $\mathtt{CT}$ all sourcing
+from $I_{\mathtt{AG}}$, with $S_{\mathtt{GA}} = S_{\mathtt{CT}} = [3,6)$
+literally equal and $S_{\mathtt{TC}} = [2,6)$ a superset. Had we modelled
+source-sharing as a conflict, that solution would have been declared
+infeasible and the algorithm would have reproduced \texttt{tree-dp}'s
+$13$.
+\end{remark}
+
+\begin{remark}[$\sim$ is necessary but not sufficient]
+Definition~\ref{def:dep} quantifies over the whole candidate list of each
+name, not over the chosen link, so $c \sim d$ does not imply that the
+\emph{selected} links conflict. This is deliberate and conservative: the
+cluster must contain every name whose choice could possibly interact with
+a member's choice, so $\sim$ over-approximates. Real conflicts are then
+tested exactly, per pair of concrete links, during the enumeration
+(\S\ref{sec:algo}).
+\end{remark}
+
+\section{The composition theorem}
+\label{sec:compose}
+
+We can now state the result that makes exact local re-optimization
+sound. Fix a feasible $X$ and a set of names $P \subseteq \Names$ (the
+\textbf{cluster}). Write
+\[
+  X_P = \{k \in X : c_k \in P\},
+  \qquad
+  F = X \setminus X_P \quad (\text{the \textbf{frozen} links}),
+\]
+and define the two \emph{interface sets} of the frozen part,
+\[
+  \mathrm{Drop}(F) = \bigcup_{f \in F} T_f,
+  \qquad
+  \mathrm{Src}(F) = \bigcup_{f \in F} S_f .
+\]
+
+\begin{lemma}[Cluster ownership]
+\label{lem:ownership}
+Let $R_P = \bigcup_{c \in P} I_c$ be the ranks owned by the cluster.
+Then $\mathrm{Drop}(F) \cap R_P = \emptyset$. That is, no frozen link can
+drop a rank of a cluster member's interval; whether a rank of $R_P$ is
+kept or dropped is decided entirely by the links chosen for $P$.
+\end{lemma}
+
+\begin{proof}
+Let $f \in F$. By definition of $F$, $c_f \notin P$. By (V1),
+$T_f \subseteq I_{c_f}$. Since the intervals partition the ranks and
+$c_f \ne c$ for every $c \in P$, we get
+$T_f \cap I_c = \emptyset$ for every $c \in P$, hence
+$T_f \cap R_P = \emptyset$.
+\end{proof}
+
+\begin{theorem}[Composition]
+\label{thm:compose}
+Let $X \in \Feas$, $P \subseteq \Names$, $F = X \setminus X_P$ as above.
+Let $Y$ be any set of links such that
+\begin{enumerate}
+\item[(C1)] every $y \in Y$ satisfies (V1)--(V3) and $c_y \in P$, and
+  $Y$ contains at most one link per name;
+\item[(C2)] every pair of distinct $y, y' \in Y$ satisfies (F2);
+\item[(C3)] $S_y \cap \mathrm{Drop}(F) = \emptyset$ for every $y \in Y$
+  \quad (``do not source from a rank a frozen link drops'');
+\item[(C4)] $T_y \cap \mathrm{Src}(F) = \emptyset$ for every $y \in Y$
+  \quad (``do not drop a rank a frozen link uses as a source'').
+\end{enumerate}
+Then $F \cup Y \in \Feas$ and
+\[
+  |C|(F \cup Y) \;=\; |C|(X) \;+\; \cov(X_P) \;-\; \cov(Y).
+\]
+Conversely, every feasible $Z \in \Feas$ with $Z \setminus Z_P = F$
+satisfies (C1)--(C4) with $Y = Z_P$. Hence (C1)--(C4) characterise
+exactly the completions of $F$, and
+\[
+  \min\bigl\{\, |C|(Z) \;:\; Z \in \Feas,\ Z \setminus Z_P = F \,\bigr\}
+  \;=\;
+  |C|(X) + \cov(X_P) - \max\bigl\{\, \cov(Y) : Y \text{ satisfies (C1)--(C4)} \,\bigr\}.
+\]
+\end{theorem}
+
+\begin{proof}
+\emph{Feasibility.} We check (F1) and (F2) for $F \cup Y$ by
+Lemma~\ref{lem:pairwise}, i.e.\ pair by pair. Pairs inside $F$ are
+feasible because $F \subseteq X \in \Feas$ and $\Feas$ is downward
+closed. Pairs inside $Y$ are (C1) and (C2). For a mixed pair
+$f \in F$, $y \in Y$: (F1) holds because $c_f \notin P \ni c_y$; (F2)
+requires $S_y \cap T_f = \emptyset$, which is (C3), and
+$S_f \cap T_y = \emptyset$, which is (C4).
+
+\emph{Objective.} By Proposition~\ref{prop:target-free} applied to the
+feasible sets $X$ and $F \cup Y$, the coverages add, so
+$|C|(F\cup Y) = m - \cov(F) - \cov(Y)$ and
+$|C|(X) = m - \cov(F) - \cov(X_P)$; subtracting gives the claim.
+
+\emph{Converse.} Let $Z \in \Feas$ with $Z \setminus Z_P = F$ and set
+$Y = Z_P$. (C1) is (V1)--(V3) plus (F1) restricted to $Z_P$; (C2) is
+(F2) restricted to $Z_P$; and (C3), (C4) are (F2) applied to the mixed
+pairs of $Z$, since $\mathrm{Drop}(F)$ and $\mathrm{Src}(F)$ are unions
+over $F$ and (F2) is quantified pairwise.
+\end{proof}
+
+Theorem~\ref{thm:compose} says the interface between a cluster and the
+rest of the world is exactly two conditions --- and note what is
+\emph{absent} from that list. There is no condition of the form
+``$T_y$ must not collide with $T_f$'': by Lemma~\ref{lem:ownership} it is
+vacuous, because a frozen link's covered ranks live in a non-cluster
+interval. Nor is there any condition on $S_y$ versus $S_f$, by
+Lemma~\ref{lem:nonconflicts}\,(b). And there is no global condition at
+all --- no ordering, no acyclicity --- by Proposition~\ref{prop:noacyclic}.
+That is what reduces an exact re-solve to a finite enumeration whose
+only external input is the pair of static bitmasks
+$\mathrm{Drop}(F)$, $\mathrm{Src}(F)$.
+
+\begin{corollary}[Never worse]
+\label{cor:neverworse}
+$Y = X_P$ satisfies (C1)--(C4). Hence if $Y^\star$ maximises $\cov(Y)$
+subject to (C1)--(C4), then $\cov(Y^\star) \ge \cov(X_P)$ and
+\[
+  |C|\bigl(F \cup Y^\star\bigr) \;\le\; |C|(X).
+\]
+An accepted cluster solve can never increase $|C|$, whatever $P$ is.
+\end{corollary}
+
+\begin{proof}
+$X$ is feasible, so by the converse direction of
+Theorem~\ref{thm:compose} (with $Z = X$) the incumbent $X_P$ satisfies
+(C1)--(C4); it is therefore in the feasible region of the local
+maximisation, which gives $\cov(Y^\star) \ge \cov(X_P)$. Apply the
+objective identity.
+\end{proof}
+
+\begin{remark}[How the code tests (C3) and (C4)]
+\label{rem:avail}
+The implementation never materialises $\mathrm{Drop}(F)$ or
+$\mathrm{Src}(F)$. It observes that the global arrays
+\texttt{removed\_} and \texttt{pin\_count\_} describe $X$, and that
+subtracting the cluster's own contribution turns them into a description
+of $F$:
+\[
+\begin{aligned}
+  \texttt{kept\_after\_revoke}(r) &\equiv
+    \neg\texttt{removed\_}[r] \ \vee\ r \in \textstyle\bigcup_{k \in X_P} T_k
+    &&\Longleftrightarrow\quad r \notin \mathrm{Drop}(F), \\
+  \texttt{external\_pins}(r) &\equiv
+    \texttt{pin\_count\_}[r] - \bigl|\{k \in X_P : r \in S_k\}\bigr|
+    &&\Longleftrightarrow\quad
+    \bigl|\{f \in F : r \in S_f\}\bigr| .
+\end{aligned}
+\]
+Then \texttt{avail}$(y)$ requires \texttt{kept\_after\_revoke} on every
+rank of $S_y$ --- which is (C3) --- and, on every rank of $T_y$, both
+\texttt{kept\_after\_revoke} and \texttt{external\_pins} $= 0$; the
+latter is (C4), and the former is redundant by
+Lemma~\ref{lem:ownership}. Computing this \emph{without} revoking
+anything is what allows the solve to be non-mutating: the global state is
+touched only when an improvement is actually found
+(\S\ref{sec:algo:solve}).
+\end{remark}
+
+\section{The algorithm}
+\label{sec:algo}
+
+\texttt{tree-dp3} is \texttt{tree-dp} --- preference forest, KEEP/COMPRESS
+DP, deepest-first materialization, leftover greedy, Phase~II
+unpin/retarget --- followed by the pass described here
+(\texttt{run\_phase2\_local\_} in \texttt{compress.hpp}). We describe its
+five components in turn.
+
+\subsection{Preprocessing: caches, the dependency graph, and static caps}
+
+\paragraph{Candidate cache.}
+For every $c \in \Names$ the static list
+$\hat\Links_c = $ \texttt{enumerate\_candidates\_}$(c,\ \text{avail} =
+\textsf{false})$ is computed once and sorted by coverage descending, then
+$a$ descending. When the pass is invoked from \texttt{tree-dp3} this
+cache is handed over from the preference build, so no re-enumeration is
+paid. Availability is deliberately \emph{not} used as a filter here: the
+cache must be valid across all the mutations the pass performs.
+
+\paragraph{Dependency graph.}
+$D$ is built as in Definition~\ref{def:dep}: for each $c$ and each
+$k \in \hat\Links_c$, walk $S_k$ and add $\{c, \name(r)\}$. Adjacency
+lists are truncated to the degree cap $d_{\max} = 16$
+(\texttt{GCSA\_LNS\_DEGREE}). This is a heuristic restriction of the
+neighbourhood, not of correctness: by Corollary~\ref{cor:neverworse}, any
+$P$ whatsoever yields a sound solve.
+
+\paragraph{Static caps.}
+For every name, $\scap(c) := \max_{k \in \hat\Links_c} \cov(k)$ (the head
+of the sorted cache, or $0$). Since a feasible $Y$ takes at most one link
+per name (C1), $\sum_{c \in P} \scap(c)$ upper-bounds $\cov(Y)$ for every
+completion $Y$ of every frozen part. This bound is \emph{static}: it does
+not depend on $X$, so it can be compared against the incumbent before any
+work is done on the cluster. This is the single most important
+performance device in the pass (\S\ref{sec:complexity}).
+
+\subsection{Cluster construction}
+
+Seeds are the names of $\Names$ in decreasing interval size, matching the
+greedy Phase~II's bias towards large wins. For a seed $c$, the cluster
+$P$ is the BFS ball around $c$ in $D$, truncated at
+$q_{\max} = 8$ names (\texttt{GCSA\_LNS\_CLUSTER}); members must have an
+interval and a cache entry. Each name is used as a seed at most once per
+generation, but may belong to arbitrarily many clusters.
+
+\subsection{The exact solve}
+\label{sec:algo:solve}
+
+Algorithm~\ref{alg:solve} states the per-cluster solve. Note the
+following design points.
+
+\begin{itemize}
+\item \textbf{Incumbent seeding.} \texttt{best} is initialised to the
+  incumbent $X_P$ and \texttt{best\_total} to $\cov(X_P)$, so the search
+  can only ever return something at least as good
+  (Corollary~\ref{cor:neverworse}). Moreover the incumbent link of a
+  member is \emph{explicitly appended} to that member's option list if
+  it is not already present. This is not redundant: a link produced by
+  the retarget loop can carry a composite add $a > a_{\max}$ and
+  therefore be absent from the static cache altogether, and even a
+  cached link can be cut off by the per-name option cap. Without this
+  step ``never worse'' would fail.
+\item \textbf{Options.} Member $i$ gets the first $p_{\max} = 12$
+  (\texttt{GCSA\_LNS\_OPTS}) entries of $\hat\Links_{c_i}$ with
+  $\cov \ge \kappa$ that pass \texttt{avail} (Remark~\ref{rem:avail}),
+  i.e.\ conditions (C3)--(C4). Since the cache is coverage-sorted, this
+  keeps the most valuable options.
+\item \textbf{Branch-and-bound.} Members are ordered by their best option
+  coverage, descending, so the search commits to the high-value decisions
+  first and the bound bites early. With
+  $\mathrm{cap}(i) = \max_{y \in \mathrm{opts}(i)} \cov(y)$ and the
+  suffix sums $\mathrm{suf}[k] = \sum_{j \ge k} \mathrm{cap}(\mathrm{ord}[j])$,
+  the node at depth $k$ with accumulated coverage $\mathit{tot}$ is
+  pruned whenever $\mathit{tot} + \mathrm{suf}[k] \le \mathit{best}$;
+  this is valid because at most one link per remaining member may be
+  taken, each worth at most its cap.
+\item \textbf{The ``no link'' branch.} Every member also has the option of
+  taking nothing. It is tried \emph{last}, after all concrete options,
+  because it never improves the running total and the bound is most
+  effective when a good incumbent has already been established. Its
+  presence is what makes the search a search over the full downward-closed
+  family $\Feas$ (Lemma~\ref{lem:pairwise}) rather than over perfect
+  matchings.
+\item \textbf{Internal conflicts.} The pairwise (F2) test against the
+  currently live picks uses interval bounds as an $O(1)$ reject
+  ($T_{y'} \subseteq [\ell_{c_{y'}}, r_{c_{y'}})$, so the covered ranks are
+  scanned only when the source range actually overlaps that interval).
+\item \textbf{Non-mutating.} Nothing in the global state is touched until
+  a strict improvement is found. On large inputs the overwhelming
+  majority of solves end at ``incumbent stands'', and
+  \texttt{revoke\_}/\texttt{accept\_} round trips --- which rewrite
+  \texttt{removed\_}, \texttt{pin\_count\_} and \texttt{pin\_owner\_} ---
+  are the dominant cost if paid speculatively.
+\end{itemize}
+
+\begin{algorithm}[t]
+\caption{\textsc{SolveCluster}$(P)$ --- exact re-optimization of one cluster}
+\label{alg:solve}
+\begin{algorithmic}[1]
+\Require cluster $P = (c_1,\dots,c_q)$, current assignment $X$, node budget $B$
+\Ensure coverage gain $\ge 0$, or $-1$ if the budget was exhausted (state untouched)
+\State $\mathit{cur}_i \gets$ link of $c_i$ in $X$ (or none);\quad
+       $\mathit{tot}_0 \gets \sum_i \cov(\mathit{cur}_i)$
+\State build \textsc{Avail} from $X$ minus the cluster's own links \Comment{(C3)--(C4); Remark~\ref{rem:avail}}
+\For{$i \gets 1$ \textbf{to} $q$}
+  \State $\mathrm{opts}(i) \gets$ first $p_{\max}$ links of $\hat\Links_{c_i}$
+         with $\cov \ge \kappa$ and \textsc{Avail}
+  \If{$\mathit{cur}_i$ exists and $\mathit{cur}_i \notin \mathrm{opts}(i)$}
+    \State append $\mathit{cur}_i$ to $\mathrm{opts}(i)$ \Comment{keeps the incumbent expressible}
+  \EndIf
+  \State $\mathrm{cap}(i) \gets \max_{y \in \mathrm{opts}(i)} \cov(y)$ \quad(0 if empty)
+\EndFor
+\State $\mathrm{ord} \gets$ indices sorted by $\mathrm{cap}(\cdot)$ descending;\quad
+       $\mathrm{suf}[k] \gets \sum_{j \ge k} \mathrm{cap}(\mathrm{ord}[j])$
+\State $\mathit{best} \gets \mathit{tot}_0$;\quad $Y^\star \gets (\mathit{cur}_i)_i$;\quad
+       $\mathit{nodes} \gets 0$
+\Procedure{Dfs}{$k$, $\mathit{tot}$, $L$} \Comment{$L$ = links picked so far}
+  \State $\mathit{nodes} \gets \mathit{nodes}+1$;
+         \textbf{if} $\mathit{nodes} > B$ \textbf{then abort}
+  \State \textbf{if} $\mathit{tot} + \mathrm{suf}[k] \le \mathit{best}$ \textbf{then return}
+         \Comment{suffix-sum bound}
+  \If{$k = q$}
+    \State $\mathit{best} \gets \mathit{tot}$;\quad $Y^\star \gets L$;\quad \Return
+  \EndIf
+  \State $i \gets \mathrm{ord}[k]$
+  \ForAll{$y \in \mathrm{opts}(i)$}
+    \If{$y$ conflicts with no element of $L$} \Comment{pairwise (F2)}
+      \State \Call{Dfs}{$k+1$, $\mathit{tot}+\cov(y)$, $L \cup \{y\}$}
+    \EndIf
+  \EndFor
+  \State \Call{Dfs}{$k+1$, $\mathit{tot}$, $L$} \Comment{leave $c_i$ uncompressed}
+\EndProcedure
+\State \Call{Dfs}{$0$, $0$, $\emptyset$}
+\State \textbf{if} aborted \textbf{then return} $-1$
+\State \textbf{if} $\mathit{best} = \mathit{tot}_0$ \textbf{then return} $0$
+       \Comment{incumbent stands; nothing mutated}
+\State \textbf{for} $i \gets 1$ \textbf{to} $q$: \textsc{Revoke}$(c_i)$;\quad
+       \textbf{for} $y \in Y^\star$: \textsc{Accept}$(y)$
+\State \Return $\mathit{best} - \mathit{tot}_0$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{The driver}
+
+Algorithm~\ref{alg:driver} wraps the solve in the precheck, the fallback,
+and the dirty-set generation loop.
+
+\paragraph{The $\sum \scap \le$ incumbent precheck.}
+Before a cluster is touched, the pass compares
+$\sum_{c \in P} \scap(c)$ against $\cov(X_P)$. If the static upper bound
+does not strictly exceed the incumbent, no completion can improve, and
+the cluster is skipped without building \textsc{Avail}, without filtering
+options, and without entering the search. This is exact --- it never skips
+an improvable cluster --- and, empirically, it removes the great majority
+of the work (\S\ref{sec:complexity}).
+
+\paragraph{The size-$4$ retry.}
+A cluster whose search exhausts the node budget $B = 20000$
+(\texttt{GCSA\_LNS\_NODES}) is not abandoned. It is truncated to its
+first $q_{\mathrm{fb}} = 4$ BFS members (\texttt{kLnsFallbackCluster}) and
+re-solved. Skipping outright would forfeit the improvements a
+sub-cluster would still have found, and by Corollary~\ref{cor:neverworse}
+the smaller solve is just as sound. Only if the retry also aborts is the
+cluster left alone.
+
+\paragraph{Generations.}
+When a cluster improves, its members and their $D$-neighbours are marked
+dirty for the next generation, since their option sets and their frozen
+context have changed. Generations run until the dirty set is empty (a
+fixed point) or the shared Phase~II budget (default $100$,
+\texttt{kPhase2DefaultIters}) is spent. In practice one to three
+generations suffice.
+
+\begin{algorithm}[t]
+\caption{\textsc{ClusterLNS} --- the \texttt{tree-dp3} Phase~II pass}
+\label{alg:driver}
+\begin{algorithmic}[1]
+\Require intervals, current assignment $X$ (from the forest DP + retarget loop)
+\State build $\hat\Links_c$ for all $c \in \Names$ (reused from the preference build if available)
+\State build the dependency graph $D$ (Def.~\ref{def:dep}), truncating degrees to $d_{\max}$
+\State $\scap(c) \gets \max_{k \in \hat\Links_c}\cov(k)$ for all $c$
+\State $\mathit{dirty} \gets \Names$ sorted by $\isize$ descending
+\For{$\mathit{gen} \gets 1$ \textbf{to} $G$ \textbf{while} $\mathit{dirty} \ne \emptyset$}
+  \State $\mathit{next} \gets \emptyset$
+  \ForAll{seeds $c \in \mathit{dirty}$, each seed used once}
+    \State $P \gets$ BFS ball around $c$ in $D$, capped at $q_{\max}$ names
+    \If{$\sum_{d \in P} \scap(d) \le \cov(X_P)$}
+      \State \textbf{continue} \Comment{static precheck: no completion can improve}
+    \EndIf
+    \State $g \gets$ \Call{SolveCluster}{$P$}
+    \If{$g < 0$ \textbf{and} $|P| > q_{\mathrm{fb}}$}
+      \State $P \gets$ first $q_{\mathrm{fb}}$ members of $P$;\quad
+             $g \gets$ \Call{SolveCluster}{$P$}
+    \EndIf
+    \If{$g > 0$}
+      \State $\mathit{next} \gets \mathit{next} \cup P \cup N_D(P)$
+    \EndIf
+  \EndFor
+  \State $\mathit{dirty} \gets \mathit{next}$
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Correctness}
+
+\begin{theorem}[Soundness and monotonicity]
+\label{thm:sound}
+Every intermediate assignment produced by Algorithm~\ref{alg:driver} is
+feasible, and $|C|$ is non-increasing over the run. Moreover, each
+applied solve returns an assignment that is \emph{optimal} among all
+completions of its frozen part that are expressible in the member option
+lists.
+\end{theorem}
+
+\begin{proof}
+The pass starts from a feasible $X$ (the output of the forest DP,
+leftover greedy and retarget loop, each of which maintains feasibility).
+A solve applies $F \cup Y^\star$ where $Y^\star$ satisfies (C1) by
+construction (one option per member, options are valid links of member
+names), (C2) by the explicit pairwise conflict test, and (C3)--(C4) by
+the \textsc{Avail} filter (Remark~\ref{rem:avail}). By
+Theorem~\ref{thm:compose}, $F \cup Y^\star$ is feasible; by
+Corollary~\ref{cor:neverworse} and the incumbent seeding of line~11 of
+Algorithm~\ref{alg:solve}, $\cov(Y^\star) \ge \cov(X_P)$, so $|C|$ does
+not increase. Optimality within the option lists is the exhaustiveness of
+the DFS: it enumerates every element of
+$\prod_i (\mathrm{opts}(i) \cup \{\bot\})$ except those cut by the bound
+$\mathit{tot} + \mathrm{suf}[k] \le \mathit{best}$, which discards only
+assignments whose total cannot strictly exceed the incumbent best, and
+those cut by a pairwise conflict, which are infeasible. If the node
+budget is exhausted the solve returns $-1$ and nothing is mutated.
+\end{proof}
+
+Note what Theorem~\ref{thm:sound} does \emph{not} claim: global
+optimality. The pass is a large-neighbourhood search --- exact within a
+neighbourhood, heuristic in the choice of neighbourhoods --- and its
+fixed point is a local optimum with respect to the family of BFS balls of
+size $\le q_{\max}$. Section~\ref{sec:experiments} measures how far that
+falls short of the ILP optimum in practice (usually: not at all, on
+instances small enough to check).
+
+\section{Why it composes with, rather than replaces, the retarget loop}
+\label{sec:compose-phase2}
+
+Because a cluster solve can never increase $|C|$, it is safe to run
+\emph{after} anything. The interesting question is whether it should
+\emph{replace} the pre-existing Phase~II unpin/retarget loop, which is
+the more expensive of the two. It should not.
+
+The retarget loop does something the cluster solve structurally cannot.
+When it accepts a new link $w$ for some name and a dependent $D$ was
+sourcing from ranks that $w$ now covers, it \emph{rewrites} $D$ to point
+at the corresponding sub-run of $S_w$ with
+\[
+  a'_D \;=\; a_D + a_w
+\]
+(\texttt{try\_accept\_with\_retarget\_}: \texttt{d.add += cand.add}).
+The synthesized link is a legitimate element of $\Links$ --- (V1) holds
+because the two shifts compose --- but it is \emph{not} an element of any
+$\hat\Links_c$: \texttt{enumerate\_candidates\_} only ever emits
+$a \le a_{\max}$, whereas $a'_D$ may exceed $a_{\max}$, and even when it
+does not, the composite source run need not be a maximal
+$\mathrm{lcp} \ge a+1$ run. The cluster solve chooses from the static
+cache; it can preserve such a link (that is exactly what the incumbent
+appending of Algorithm~\ref{alg:solve}, line~6, is for) but it can never
+invent one.
+
+On long repeats this matters a great deal, because composite adds are how
+a deep chain of repeated motifs gets collapsed onto a single stored
+prefix. Running the cluster solve \emph{instead of} the retarget loop
+(\texttt{GCSA\_LNS\_ONLY=1}) loses ground on exactly those inputs: over
+the $139$-configuration suite at $a_{\max} = 8$,
+
+\begin{center}
+\begin{tabular}{@{}lrr@{}}
+\toprule
+Phase~II configuration & total $|C|$ & vs.\ \texttt{tree-dp} \\
+\midrule
+retarget loop only (\texttt{tree-dp})           & $252397$ & --- \\
+cluster solve only (\texttt{GCSA\_LNS\_ONLY=1}) & $253675$ & $+1278$ \\
+retarget loop then cluster solve (\texttt{tree-dp3}) & $252394$ & $-3$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The two passes are therefore complementary, not competing: the retarget
+loop enlarges the link universe along composite-add chains, and the
+cluster solve makes exact choices within the static universe. The
+composition is safe in one direction only --- the solve after the loop,
+never in place of it.
+
+\section{Complexity}
+\label{sec:complexity}
+
+\paragraph{Preprocessing.}
+Building $D$ costs one pass over the source runs of all cached
+candidates, $O\bigl(\sum_{c}\sum_{k \in \hat\Links_c} |S_k|\bigr)$, plus
+the linear-scan deduplication of adjacency lists, which is $O(d_{\max})$
+per insertion after the degree cap. Static caps are $O(|\Names|)$, since
+the caches are already coverage-sorted.
+
+\paragraph{One cluster.}
+A cluster has $q \le q_{\max}$ members with at most $p_{\max}$ options
+each, plus the ``no link'' branch, so the raw search tree has at most
+\[
+  (p_{\max} + 1)^{q_{\max}} \;=\; 13^8 \;\approx\; 8.2 \times 10^8
+\]
+leaves in the worst case --- which is why the node budget $B$ exists at
+all. Each visited node performs $O(q)$ conflict tests, each $O(1)$
+except on a genuine source/interval overlap, where it is $O(\cov)$. In
+practice the suffix-sum bound and the descending-capacity member order
+collapse this by orders of magnitude: the very first root-to-leaf path
+takes the highest-capacity option of every member, which typically
+establishes a bound close to $\mathrm{suf}[0]$ and prunes almost
+everything else. The budget therefore caps the pathological cases rather
+than the typical ones; the fallback then re-solves at $q = 4$, i.e.\ at
+most $13^4 \approx 2.9 \times 10^4$ leaves.
+
+\paragraph{The pass.}
+Each generation seeds at most $|\Names|$ clusters; cluster construction is
+$O(q_{\max} d_{\max})$ and the precheck is $O(q_{\max})$. So the
+per-generation cost is
+\[
+  O\bigl(|\Names| \cdot q_{\max} d_{\max}\bigr)
+  \;+\;
+  \sum_{\text{clusters not skipped}} O(B \cdot q_{\max}),
+\]
+and the number of generations is bounded by the Phase~II budget $G$.
+Because a generation's dirty set is confined to the neighbourhoods of the
+clusters that actually improved, later generations are far cheaper than
+the first.
+
+\paragraph{The precheck in practice.}
+The second term above is what the $\sum \scap \le$ incumbent test
+attacks, and it attacks it very effectively. On
+\texttt{r300-3000.fasta} ($n = 9\,000\,000$) with shape
+\texttt{\#\#\#\#.\#\#\#\#} and $a_{\max} = 8$ there are $24034$ names with
+$|I_c| > 1$, hence $24034$ seeded clusters; the precheck skips
+\[
+  22168 \ \text{of}\ 24034 \quad (92.2\,\%),
+\]
+leaving $1866$ actual solves, of which none improved (with $a_{\max}=8$
+the retarget loop has already saturated this instance) and none aborted.
+The whole pass costs $0.61$\,s ($0.20$\,s of which is building $D$) on top
+of a $23.4$\,s retarget loop:
+
+\begin{center}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+algorithm & Phase~II & total compress & $|C|$ \\
+\midrule
+\texttt{tree-dp}  & $23.6$\,s & $24.0$\,s & $1919406$ \\
+\texttt{tree-dp3} & $24.0$\,s & $24.5$\,s & $1919406$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+so the exact pass is at parity with \texttt{tree-dp} on a nine-megabase
+input --- it adds about $2\,\%$ to the compression time. Without the
+precheck, and with a mutating solve that pays
+\texttt{revoke\_}/\texttt{accept\_} on every cluster rather than only on
+improvement, the same pass was reported to take about $352$\,s; we were
+not able to reproduce that figure with the current code (the two
+optimizations are not switchable), and record it here as the historical
+motivation for both devices rather than as a measurement.
+
+\section{Experimental results}
+\label{sec:experiments}
+
+\subsection{The $139$-configuration suite}
+
+\texttt{compare\_algos} runs five hand instances, four short repetitive
+instances, and a weight-$30$ suite of $13$ shapes $\times$ $10$
+repetition counts of a random $200$\,bp motif ($139$ configurations in
+total), verifying every result against brute force and against a
+serialized round-trip. Totals of $|C|$ over all $139$ configurations:
+
+\begin{center}
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+$a_{\max}$ & greedy & dep-order & \texttt{tree-dp} & \texttt{tree-dp2} & \texttt{tree-dp3} \\
+\midrule
+$8$  & $259518$ & $252357$ & $252397$ & $256197$ & $\mathbf{252394}$ \\
+$16$ & $255785$ & $252175$ & $252329$ & $255370$ & $\mathbf{213078}$ \\
+$32$ & $253709$ & $252155$ & $252177$ & $252917$ & $\mathbf{225814}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Per-configuration, \texttt{tree-dp3} is never worse than \texttt{tree-dp}
+at any $a_{\max}$ --- as Corollary~\ref{cor:neverworse} requires, since
+the two share everything up to the final pass:
+
+\begin{center}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+$a_{\max}$ & better than \texttt{tree-dp} & equal & worse & reduction in total $|C|$ \\
+\midrule
+$8$  & $2$   & $137$ & $0$ & $0.001\,\%$ \\
+$16$ & $122$ & $17$  & $0$ & $15.56\,\%$ \\
+$32$ & $122$ & $17$  & $0$ & $10.46\,\%$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{The counterexamples and the ILP optimum}
+
+On small instances the exact optimum is available from
+\texttt{ilp\_baseline}, which enumerates the full link universe of
+Definition~\ref{def:link} (all sub-runs, no maximality or lcp filter) and
+solves the set-packing ILP with \texttt{cbc}. The two counterexamples of
+\S\ref{sec:ce1}--\ref{sec:ce2}, and the hardest case of the fixed
+suite:
+
+\begin{center}
+\begin{tabular}{@{}llrrrrrr@{}}
+\toprule
+instance & shape & opt & greedy & dep-order & \texttt{tree-dp} & \texttt{tree-dp2} & \texttt{tree-dp3} \\
+\midrule
+$(\mathtt{AC})^6$              & \texttt{\#.\#}  & $9$  & $10$ & $9$  & $10$ & $10$ & $\mathbf{9}$ \\
+$(\mathtt{ACGT})^5$            & \texttt{\#.\#}  & $11$ & $14$ & $11$ & $13$ & $13$ & $\mathbf{11}$ \\
+$(\mathtt{GCCTTTAAAG})^4$      & \texttt{\#..\#} & $22$ & $25$ & $27$ & $27$ & $27$ & $\mathbf{22}$ \\
+note text ($n=40$)             & \texttt{\#\#}   & $19$ & $20$ & $20$ & $20$ & $20$ & $20$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Over the whole ten-case fixed suite (\texttt{test\_ilp\_cases.sh}),
+\texttt{tree-dp3} attains the ILP optimum on $9$ of $10$ instances; the
+sole exception is the last row above, where every heuristic stores one
+position too many. The $(\mathtt{GCCTTTAAAG})^4$ / \texttt{\#..\#} case is
+the most striking: the optimum needs six simultaneous links, and the
+cluster solve finds all six, cutting $|C|$ from \texttt{tree-dp}'s $27$ to
+$22$ --- an $18.5\,\%$ reduction on that instance, and also better than
+greedy's $25$, which no other heuristic achieves.
+
+\subsection{On the ILP being a lower bound}
+\label{sec:ilpcaveat}
+
+\texttt{ilp\_baseline} reports \texttt{bounds all algos}, i.e.\ whether
+the computed optimum is $\le$ every heuristic's $|C|$. This is checked,
+not proven. The universe it enumerates is
+$\{k \in \Links : a_k \le a_{\max}\}$, and by
+\S\ref{sec:compose-phase2} the retarget loop can synthesize links with
+$a > a_{\max}$; such a link is decodable and would be feasible in a
+larger universe, so in principle a heuristic could reach a solution the
+ILP never considered. We are not aware of an instance where this
+happens, and the randomized stress harness (\texttt{test\_ilp\_stress.sh},
+$410$ instances of length $10$--$39$ over two alphabets and six shapes)
+reports no violation --- but the claim is empirical. Closing it properly
+would require enumerating links with $a$ up to the largest composite add
+any heuristic can build, which is bounded only by the text length.
+
+\section{Discussion}
+\label{sec:discussion}
+
+\subsection{At the default $a_{\max}$, the exact solve is starved}
+
+The most important number in \S\ref{sec:experiments} is the smallest one.
+At $a_{\max} = 8$, exact re-optimization over bounded dependency
+neighbourhoods --- a genuinely exact procedure, applied to every name in
+the instance --- buys $3$ stored positions across $139$ configurations,
+all of them on the two hand-built counterexamples ($10 \to 9$ and
+$13 \to 11$). On all $137$ real configurations the answer is unchanged.
+
+This is not a failure of the neighbourhood size. At $a_{\max} = 8$ on the
+large repetitive instances, the precheck reports that for over $90\,\%$
+of clusters the \emph{static} bound $\sum_{c \in P} \scap(c)$ does not
+even exceed what the incumbent already achieves: there is no better
+assignment to find, no matter how large a neighbourhood one is willing to
+solve, because the candidate lists do not contain anything better. What
+binds is the \emph{candidate universe}, not the search.
+
+Raising $a_{\max}$ to $16$ enlarges that universe and the same algorithm
+becomes worth $15.5\,\%$ of total $|C|$, improving $122$ of $139$
+configurations. It is worth being precise about the division of labour
+here: greedy, dep-order, \texttt{tree-dp} and \texttt{tree-dp2} \emph{all}
+barely move between $a_{\max} = 8$ and $a_{\max} = 16$ (totals change by
+under $1.5\,\%$), because none of them can exploit the extra candidates
+--- they commit to one preferred link per name and the preferred link
+rarely changes. The exact solve can, because it evaluates the whole
+option list against its neighbours. The lesson generalises: enriching the
+candidate universe pays only if the selection procedure is strong enough
+to use it, and strengthening the selection procedure pays only if the
+universe is rich enough to reward it. \texttt{tree-dp3} at
+$a_{\max} = 16$ is the first configuration in which both halves are in
+place.
+
+\subsection{The $a_{\max} = 32$ regression is a neighbourhood-size artifact}
+
+Going from $a_{\max} = 16$ to $32$ makes \texttt{tree-dp3} worse
+($213078 \to 225814$) while leaving every other algorithm essentially
+unchanged. Since larger $a_{\max}$ strictly enlarges the candidate
+universe, this must be an artifact of the caps rather than of the
+problem. We measured which cap:
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+suite configuration ($\times 100$ reps, $a_{\max}=32$)
+  & $q_{\max}=8$ & aborts & $q_{\max}=12$ & aborts & ($a_{\max}=16$, $q_{\max}=8$) \\
+\midrule
+\texttt{5+g4+20+g4+5}  & $3270$ & $0$ & $2796$ & $25$ & $2717$ \\
+\texttt{10+g8+20}      & $3270$ & $0$ & $2890$ & $28$ & $2807$ \\
+\texttt{5+g2+20+g2+5}  & $3063$ & $1$ & $2679$ & $29$ & $2881$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The node budget is not the binding constraint: at $q_{\max} = 8$ the
+abort count is $0$ or $1$, and raising \texttt{GCSA\_LNS\_NODES} by a
+factor of $20$ changes nothing at all. Raising the \emph{cluster} cap
+from $8$ to $12$ recovers most of the loss --- and on one of the three
+configurations overshoots the $a_{\max}=16$ result. The mechanism is
+straightforward once stated: a larger $a_{\max}$ gives each name
+candidates sourcing from more distinct intervals, so the dependency
+graph densifies, and a BFS ball of a fixed $8$ names covers a
+progressively smaller fraction of each name's true dependency
+neighbourhood. More of the relevant structure ends up frozen at the
+cluster boundary, and conditions (C3)--(C4) of
+Theorem~\ref{thm:compose} bind harder. The regression is thus a tuning
+artifact of $q_{\max}$, and the natural fix is to scale $q_{\max}$ with
+the observed dependency degree rather than fixing it at $8$.
+
+(An earlier account attributed this regression to node-cap aborts. The
+measurements above do not support that: at the default cluster cap the
+aborts are essentially absent, and the node budget is not the active
+constraint.)
+
+\subsection{What remains}
+
+Three directions follow directly from the analysis above.
+
+\begin{enumerate}
+\item \textbf{Cluster sizing.} $q_{\max}$ is a fixed constant chosen for
+  the $a_{\max}=8$ regime. Given a per-instance measurement of the
+  dependency degree it could be chosen adaptively, with the node budget
+  --- which is currently slack --- absorbing the variance.
+\item \textbf{Bringing composite adds into the universe.} The retarget
+  loop's composite links are exactly the ones the static cache lacks
+  (\S\ref{sec:compose-phase2}). Emitting them into $\hat\Links_c$, rather
+  than only preserving them when they happen to be incumbent, would let
+  the exact solve reason about them --- and would also close the ILP
+  lower-bound caveat of \S\ref{sec:ilpcaveat}.
+\item \textbf{Beyond BFS balls.} The neighbourhood family is currently
+  ``bounded balls around each name''. Since the algorithm is exact within
+  whatever family it is given, a family chosen from the structure of the
+  incumbent --- for instance the tight cycles of the preference graph,
+  which are precisely what \S\ref{sec:ce1} and \S\ref{sec:ce2} show
+  \texttt{tree-dp} mishandles --- might buy more per unit of work than
+  uniform balls.
+\end{enumerate}
+
+What the present note establishes is the structural point underneath all
+three: because the compressed array stores literal positions, the
+feasible region of differential compression is a plain set-packing
+region with pairwise constraints and no acyclicity condition, and
+because a link's covered ranks lie in its own interval, any set of names
+can be carved out and re-optimized exactly against a two-condition
+interface. Exactness on a neighbourhood is therefore cheap and always
+safe. Whether it is \emph{useful} is entirely a question of how rich the
+candidate universe is, and at the default $a_{\max}$ it is not yet rich
+enough.
+
+\end{document}
