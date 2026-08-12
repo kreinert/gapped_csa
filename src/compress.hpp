@@ -323,6 +323,7 @@ public:
         removed_.assign(m, 0);
         pin_count_.assign(m, 0);
         pin_owner_.assign(m, 0);
+        multi_pin_owners_.clear();
         kept_count_ = m;
 
         DiffProblem P;
@@ -358,6 +359,7 @@ public:
         removed_.assign(m, 0);
         pin_count_.assign(m, 0);
         pin_owner_.assign(m, 0);
+        multi_pin_owners_.clear();
         kept_count_ = m;
         table_.clear();
         C_.clear();
@@ -390,6 +392,7 @@ private:
     std::vector<uint8_t> removed_;
     std::vector<int32_t> pin_count_;   // #accepted candidates using this rank as source
     std::vector<uint64_t> pin_owner_;  // one owner name when pin_count==1 (undef if 0)
+    std::unordered_map<int32_t, std::vector<uint64_t>> multi_pin_owners_; // owners when pin_count>1
     size_t kept_count_ = 0;            // #ranks with removed_==0
     int last_pin_path_ = 0;            // 0=none 1=fast 2=multi (debug/timing)
 
@@ -628,7 +631,13 @@ private:
     // ---- accept / revoke helpers ------------------------------------------
     void accept_(Candidate& c, std::unordered_map<uint64_t, Candidate>& accepted) {
         for (int32_t r = c.src_lo; r < c.src_hi; ++r) {
-            if (pin_count_[r] == 0) pin_owner_[r] = c.name;
+            if (pin_count_[r] == 0) {
+                pin_owner_[r] = c.name;
+            } else if (pin_count_[r] == 1) {
+                multi_pin_owners_[r] = {pin_owner_[r], c.name};
+            } else {
+                multi_pin_owners_[r].push_back(c.name);
+            }
             ++pin_count_[r];
         }
         for (int32_t r : c.covered) {
@@ -650,15 +659,18 @@ private:
             --pin_count_[r];
             if (pin_count_[r] == 0) {
                 pin_owner_[r] = 0;
-            } else if (pin_owner_[r] == name) {
-                // Rare multi-pin: pick any remaining owner of r.
-                pin_owner_[r] = 0;
-                for (const auto& kv : accepted) {
-                    if (kv.first == name) continue;
-                    if (r >= kv.second.src_lo && r < kv.second.src_hi) {
-                        pin_owner_[r] = kv.first;
-                        break;
+                multi_pin_owners_.erase(r);
+            } else {
+                auto mit = multi_pin_owners_.find(r);
+                if (mit != multi_pin_owners_.end()) {
+                    auto& vec = mit->second;
+                    vec.erase(std::remove(vec.begin(), vec.end(), name), vec.end());
+                    if (pin_count_[r] == 1) {
+                        if (!vec.empty()) pin_owner_[r] = vec.front();
+                        multi_pin_owners_.erase(mit);
                     }
+                } else if (pin_owner_[r] == name) {
+                    pin_owner_[r] = 0;
                 }
             }
         }
@@ -736,14 +748,21 @@ private:
                 if (!can_retarget_(it->second, cand, nlo, nhi)) return false;
             }
         } else if (!pinned.empty()) {
-            // Multi-pin: scan accepted once against the (usually small) pinned list.
+            // Multi-pin: look up owners via pin_owner_ / multi_pin_owners_.
             std::unordered_set<uint64_t> deps;
-            for (auto& kv : accepted) {
-                const Candidate& d = kv.second;
-                for (int32_t r : pinned) {
-                    if (r >= d.src_lo && r < d.src_hi) {
-                        deps.insert(kv.first);
-                        break;
+            for (int32_t r : pinned) {
+                if (pin_count_[r] == 1) {
+                    deps.insert(pin_owner_[r]);
+                } else if (pin_count_[r] > 1) {
+                    auto mit = multi_pin_owners_.find(r);
+                    if (mit != multi_pin_owners_.end()) {
+                        for (uint64_t nm : mit->second) deps.insert(nm);
+                    } else {
+                        for (const auto& kv : accepted) {
+                            if (r >= kv.second.src_lo && r < kv.second.src_hi) {
+                                deps.insert(kv.first);
+                            }
+                        }
                     }
                 }
             }
@@ -812,6 +831,12 @@ private:
     int phase2_budget_(const char*& src) const {
         int iters = kPhase2DefaultIters;
         src = "default";
+        if (const char* env = std::getenv("GCSA_PHASE2_FAST")) {
+            if (std::atoi(env) != 0) {
+                iters = 1;
+                src = "GCSA_PHASE2_FAST";
+            }
+        }
         if (const char* env = std::getenv("GCSA_PHASE2_MAX_ITERS")) {
             int v = std::atoi(env);
             if (v > 0) { iters = v; src = "GCSA_PHASE2_MAX_ITERS"; }
@@ -1214,7 +1239,8 @@ private:
                      const char* label,
                      bool trace,
                      bool timing,
-                     std::unordered_map<uint64_t, std::vector<Candidate>>* precomputed = nullptr) {
+                     std::unordered_map<uint64_t, std::vector<Candidate>>* precomputed = nullptr,
+                     double phase1_ms = 0.0) {
         using Clock = std::chrono::steady_clock;
         const char* iters_src = "default";
         const int max_iters = phase2_budget_(iters_src);
@@ -1229,6 +1255,28 @@ private:
             if (v >= 0) stall_limit = v;
         }
         const bool adaptive = (stall_limit > 0);
+
+        double time_ratio = 1.0;
+        if (const char* env = std::getenv("GCSA_PHASE2_TIME_RATIO")) {
+            double v = std::atof(env);
+            if (v > 0.0) time_ratio = v;
+        }
+        double min_ms = 50.0;
+        if (const char* env = std::getenv("GCSA_PHASE2_MIN_MS")) {
+            double v = std::atof(env);
+            if (v >= 0.0) min_ms = v;
+        }
+
+        bool fast_mode = false;
+        if (const char* env = std::getenv("GCSA_PHASE2_FAST")) {
+            fast_mode = (std::atoi(env) != 0);
+        }
+
+        const bool time_budgeted = (fast_mode || phase1_ms > 0.0);
+        const double time_limit_ms = time_budgeted
+            ? std::max(min_ms, (phase1_ms > 0.0 ? phase1_ms : min_ms) * time_ratio)
+            : 0.0;
+
         gcsa_log("[%s] Phase II: unpin/retarget...\n", label);
         if (timing && precomputed) {
             gcsa_log("[timing] %s Phase II precomputed cache size=%zu\n",
@@ -1321,7 +1369,16 @@ private:
             // order[] is size-desc; sorting dirty indices restores size order.
             std::sort(dirty.begin(), dirty.end());
 
+            bool hit_time_limit = false;
             for (int oi : dirty) {
+                if (time_budgeted && (phase2_tries & 63) == 0 && phase2_tries > 0) {
+                    double elapsed = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                    if (elapsed >= time_limit_ms) {
+                        stop_reason = "phase1-time-budget";
+                        hit_time_limit = true;
+                        break;
+                    }
+                }
                 const Interval* ivp = order[oi];
                 const int isize = ivp->hi - ivp->lo;
                 int cur_cov = cov_of(ivp->name);
@@ -1384,6 +1441,15 @@ private:
                 // accepted a suboptimal cand) — retry next generation if anyone
                 // improved (pins / kept sets may have moved).
                 if (best_cov > got_cov) still_open.push_back(oi);
+            }
+
+            if (hit_time_limit) break;
+            if (time_budgeted) {
+                double elapsed = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                if (elapsed >= time_limit_ms) {
+                    stop_reason = "phase1-time-budget";
+                    break;
+                }
             }
 
             last_gen_kept_drop = gen_kept_drop;
@@ -1637,7 +1703,8 @@ private:
             gcsa_log("after Phase I: kept=%zu accepted=%zu\n", kept, accepted.size());
         }
 
-        run_phase2_(intervals, accepted, "dep-order", trace, timing, &cand_cache);
+        double phase1_ms = std::chrono::duration<double, std::milli>(t3 - t0).count();
+        run_phase2_(intervals, accepted, "dep-order", trace, timing, &cand_cache, phase1_ms);
         auto t4 = Clock::now();
         if (timing) {
             auto ms = [](Clock::time_point a, Clock::time_point b) {
@@ -2007,8 +2074,9 @@ private:
 
         // Phase II (reuses cand_cache either way).
         auto t_p2_0 = Clock::now();
+        double phase1_ms = std::chrono::duration<double, std::milli>(t_left1 - t_pref0).count();
         if (phase2 == Phase2Mode::Greedy) {
-            run_phase2_(intervals, accepted, label, trace, timing, &cand_cache);
+            run_phase2_(intervals, accepted, label, trace, timing, &cand_cache, phase1_ms);
         } else if (phase2 == Phase2Mode::Local) {
             // The cluster solve only ever lowers |C|, so it composes with the
             // retarget loop instead of replacing it: retargeting reaches links
@@ -2016,7 +2084,7 @@ private:
             // which is exactly where the LNS alone gives ground on long
             // repeats. GCSA_LNS_ONLY=1 measures the LNS on its own.
             if (gcsa_env_int("GCSA_LNS_ONLY", 0) == 0)
-                run_phase2_(intervals, accepted, label, trace, timing, &cand_cache);
+                run_phase2_(intervals, accepted, label, trace, timing, &cand_cache, phase1_ms);
             run_phase2_local_(intervals, accepted, label, timing, &cand_cache);
         }
         auto t_p2_1 = Clock::now();
@@ -2047,6 +2115,7 @@ private:
         removed_.assign(m, 0);
         pin_count_.assign(m, 0);
         pin_owner_.assign(m, 0);
+        multi_pin_owners_.clear();
         kept_count_ = m;
         table_.clear();
         C_.clear();
