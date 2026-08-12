@@ -371,17 +371,17 @@ DepOrder & \textbf{14} & 45.2\% \\
 \end{tabular}
 \end{center}
 
-(On this instance Greedy-DFS reaches~15 --- better than greedy, still
-one above DepOrder.)
-
 \section{Complexity and when DepOrder helps}
 
 Phase~I is a single pass over a topological (or size-refined) order,
 each step re-enumerating candidates for one interval --- inexpensive
-relative to GSA construction. Phase~II may repeat enumeration,
-snapshotting, and retarget attempts over \(O(N)\) rounds
-(\(N=\#\) intervals) and is the asymptotic bottleneck on large
-instances; on the present toy example it is a no-op.
+relative to GSA construction. Phase~II repeats enumeration,
+snapshotting, and retarget attempts over successive dirty generations,
+stopping at a fixed point or once a fixed iteration budget
+(default~100) is spent, whichever comes first. It is the asymptotic
+bottleneck on large instances, although in practice the fixed point is
+reached after one or two generations; on the present toy example it is
+a no-op.
 
 DepOrder helps precisely when the preference graph has \textbf{high
 fan-out hubs} whose own preferred self-compression edges are

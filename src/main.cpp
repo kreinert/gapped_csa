@@ -4,7 +4,9 @@
 // Usage:
 //   ./gcsa                                  # run the note's #.# example + self-test
 //   ./gcsa -g <fasta> -s <shape> [-q <query>] [--table] [--max-add N]
+//                                           [--algo A] [--phase2-iters N]
 //   ./gcsa -g <fasta> -s <shape> -r <reads.fasta>   # locate reads (like kmer/locate)
+//   ./gcsa --help                           # full option list
 
 #include "compress.hpp"
 #include "serialize.hpp"
@@ -140,10 +142,34 @@ static void print_hash_table(const CompressedIndex& idx) {
     }
 }
 
+static void print_usage(const char* argv0) {
+    std::cout
+        << "Usage:\n"
+        << "  " << argv0 << "                                 # note's #.# example + self-test\n"
+        << "  " << argv0 << " -g <fasta> -s <shape> [options]\n"
+        << "  " << argv0 << " -g <fasta> -s <shape> -r <reads.fasta>   # locate reads\n"
+        << "\nOptions:\n"
+        << "  -g <fasta>          genome FASTA (default: the note's example text)\n"
+        << "  -s <shape>          gapped shape, e.g. \"#.#\" (default: #.#)\n"
+        << "  -q <query>          query string to locate\n"
+        << "  -r <reads.fasta>    locate every read in a FASTA\n"
+        << "  --algo <name>       greedy|dep-order|tree-dp|tree-dp2 (default: greedy)\n"
+        << "  --max-add N         max differential offset (default: 8)\n"
+        << "  --phase2-iters N    Phase II dirty-generation budget (default: "
+        << kPhase2DefaultIters << ").\n"
+        << "                      Phase II stops earlier at a fixed point. Applies to\n"
+        << "                      dep-order and tree-dp. Precedence: this flag >\n"
+        << "                      GCSA_PHASE2_MAX_ITERS > default.\n"
+        << "  --table             print the hash table\n"
+        << "  --sa                print the full gapped suffix array\n"
+        << "  -h, --help          this message\n";
+}
+
 int main(int argc, char** argv) {
     std::string genome_path, shape_str = "#.#", query, reads_path;
     bool want_table = false, want_sa = false;
     int max_add = 8;
+    int phase2_iters = 0;  // 0 = unset: GCSA_PHASE2_MAX_ITERS, else the default
     CompressAlgo algo = CompressAlgo::Greedy;
 
     for (int i = 1; i < argc; ++i) {
@@ -156,21 +182,26 @@ int main(int argc, char** argv) {
         else if (k == "--table") want_table = true;
         else if (k == "--sa") want_sa = true;
         else if (k == "--max-add") max_add = std::stoi(need("--max-add"));
+        else if (k == "--phase2-iters") {
+            phase2_iters = std::stoi(need("--phase2-iters"));
+            if (phase2_iters < 1) {
+                std::cerr << "--phase2-iters must be >= 1\n";
+                return 1;
+            }
+        }
+        else if (k == "--help" || k == "-h") { print_usage(argv[0]); return 0; }
         else if (k == "--algo") {
             std::string a = need("--algo");
             if (a == "greedy") algo = CompressAlgo::Greedy;
             else if (a == "dep-order" || a == "dep") algo = CompressAlgo::DepOrder;
-            else if (a == "greedy-dfs" || a == "dfs") algo = CompressAlgo::GreedyDfs;
             else if (a == "tree-dp" || a == "dp") algo = CompressAlgo::TreeDp;
             else if (a == "tree-dp2" || a == "dp2") algo = CompressAlgo::TreeDp2;
-            else if (a == "product-greedy" || a == "pl-greedy" || a == "product")
-                algo = CompressAlgo::ProductGreedy;
             else {
-                std::cerr << "--algo must be greedy|dep-order|greedy-dfs|tree-dp|tree-dp2|product-greedy\n";
+                std::cerr << "--algo must be greedy|dep-order|tree-dp|tree-dp2\n";
                 return 1;
             }
         }
-        else { std::cerr << "unknown arg: " << k << "\n"; return 1; }
+        else { std::cerr << "unknown arg: " << k << "\n"; print_usage(argv[0]); return 1; }
     }
 
     bool is_example = genome_path.empty();
@@ -203,7 +234,7 @@ int main(int argc, char** argv) {
               << " n=" << text.size() << "  algo=" << algo_name(algo) << "\n";
 
     CompressedIndex idx;
-    idx.build(sh, text, max_add, algo);
+    idx.build(sh, text, max_add, algo, phase2_iters);
 
     std::cout << "distinct k-mers      : " << idx.num_kmers() << "\n";
     std::cout << "SA entries (m)       : " << idx.total_positions() << "\n";

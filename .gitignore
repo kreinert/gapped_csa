@@ -18,3 +18,16 @@ external/
 *.fasta
 /out
 .DS_Store
+
+# LaTeX build artifacts (only the .tex and .pdf are tracked)
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz
+
+# solver output / one-off run scratch
+*.sol
+/outp
+/table
+/ilp_____lp

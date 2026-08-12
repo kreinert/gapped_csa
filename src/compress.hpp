@@ -27,19 +27,43 @@
 // one contiguous run (H_rest).  This is the two-hash-entries-per-shape scheme of
 // the note.
 //
+// ---------------------------------------------------------------------------
+// Link universe
+// ---------------------------------------------------------------------------
+// A hash entry H_offset = (pos, add, num) decodes to
+//     { C[pos + t] + add*span : 0 <= t < num },
+// where pos is the C-index of a source rank s_lo.  C stores literal positions
+// in rank order, so the decode simply reads `num` consecutive *kept* entries
+// and shifts them.  A link (name c, add, src = [s_lo, s_hi), covered) is
+// therefore decodable iff
+//   (L1) every rank in [s_lo, s_hi) is kept (otherwise C[pos+t] is some other
+//        rank's position);
+//   (L2) for every t, orig(s_lo+t) + add*span is the position of rank
+//        covered[t], whose first symbol is c  (succ_lexpos_ valid, name == c);
+//   (L3) every rank in `covered` is dropped, and covered ∪ kept(I_c) = I_c;
+//   (L4) num = |covered| = s_hi - s_lo >= kMinCoverage;
+//   (L5) at most one H_offset per name.
+// (L1) and (L3) already force src ∩ covered = ∅.  Nothing else is required: in
+// particular decoding never recurses (C holds literal positions), so no
+// acyclicity constraint exists and *intra-interval* links — a source run that
+// overlaps I_c itself — are perfectly legal, as are non-maximal source runs and
+// runs whose internal lcp is below add+1.
+//
+// enumerate_candidates_ is the heuristics' target-centric view of this
+// universe.  It emits only maximal runs with lcp >= add+1 (the note's
+// lcp-interval argument), which keeps the per-interval candidate list short;
+// GCSA_INTRA_LINKS=0 additionally restores the historical "source outside I_c"
+// rule.  enumerate_all_links_ emits the whole universe and is what
+// collect_diff_problem hands to the ILP baseline, so the ILP optimum is a true
+// lower bound for every algorithm below.
+//
 // Compression strategies (CompressAlgo):
 //   Greedy    – size-order availability-aware greedy; pins sources forever.
 //   DepOrder  – dependency-order + un-pin / retarget.
-//   GreedyDfs – pick the add=+1 source hub of greatest total coverage; DFS to
-//               its add=+1 targets (|I|>2), then their add=+1 targets, etc.,
-//               always pointing at the DFS root with cumulative add (1,2,3,...).
 //   TreeDp    – DP on the preference forest (strong cov>=kMinCoverage edges, |I_c|>2):
 //               for each source hub, choose KEEP vs COMPRESS knowing how
 //               dependents' costs change; then Phase II unpin/retarget.
 //   TreeDp2   – same as TreeDp but without Phase II (forest DP + accept + leftover).
-//   ProductGreedy – source-centric: enumerate SA LCP-intervals, process in
-//               descending (ℓ × length) order, pin each as a source and try
-//               differential links with add = 1..ℓ (no Phase II; like Greedy).
 
 #pragma once
 
@@ -63,9 +87,46 @@
 
 namespace gcsa {
 
+// Progress / stage / trace logging.  Everything the compressor prints goes to
+// stderr through gcsa_log(); set GCSA_QUIET=1 or call gcsa_set_quiet(true) to
+// silence it (used by compare_algos so only its table is printed).
+inline bool& gcsa_quiet_flag() {
+    static bool q = (std::getenv("GCSA_QUIET") != nullptr);
+    return q;
+}
+inline void gcsa_set_quiet(bool q) { gcsa_quiet_flag() = q; }
+
+inline void gcsa_log(const char* msg) {
+    if (gcsa_quiet_flag()) return;
+    std::fputs(msg, stderr);
+}
+
+template <class A, class... Args>
+inline void gcsa_log(const char* fmt, A a, Args... args) {
+    if (gcsa_quiet_flag()) return;
+    std::FILE* out = stderr;
+    std::fprintf(out, fmt, a, args...);
+}
+
 // Minimum coverage to accept a compression link (all algos + Phase II).
 // Preference-forest / DAG *edges* use the same floor (see DepOrder / TreeDp).
 constexpr int kMinCoverage = 3;
+
+// Phase II runs this many dirty generations unless it reaches a fixed point
+// first. Callers override it per build (CompressedIndex::build's phase2_iters,
+// i.e. --phase2-iters), or process-wide with GCSA_PHASE2_MAX_ITERS.
+constexpr int kPhase2DefaultIters = 100;
+
+// Let the heuristics' enumerate_candidates_ see intra-interval links (source
+// run overlapping I_c but never the ranks it covers) — see "Link universe".
+// GCSA_INTRA_LINKS=0 restores the old "source entirely outside I_c" rule.
+inline bool gcsa_intra_links() {
+    static const bool v = [] {
+        const char* e = std::getenv("GCSA_INTRA_LINKS");
+        return !e || std::atoi(e) != 0;
+    }();
+    return v;
+}
 
 // Parallelism for independent work (pref enum, per-root forest DP).
 // Override with GCSA_THREADS=N (N=1 disables).
@@ -107,20 +168,16 @@ inline void gcsa_parallel_for(size_t n, Fn&& fn) {
 enum class CompressAlgo {
     Greedy,        // size-first, pin sources
     DepOrder,      // dependency-order + un-pin / retarget
-    GreedyDfs,     // DFS from best add=+1 hub, cumulative add to root
     TreeDp,        // preference-forest DP (KEEP vs COMPRESS per hub) + Phase II
     TreeDp2,       // same as TreeDp without Phase II
-    ProductGreedy, // LCP-interval product (ℓ×len) source-greedy; no Phase II
 };
 
 inline const char* algo_name(CompressAlgo a) {
     switch (a) {
         case CompressAlgo::Greedy:        return "greedy";
         case CompressAlgo::DepOrder:      return "dep-order";
-        case CompressAlgo::GreedyDfs:     return "greedy-dfs";
         case CompressAlgo::TreeDp:        return "tree-dp";
         case CompressAlgo::TreeDp2:       return "tree-dp2";
-        case CompressAlgo::ProductGreedy: return "product-greedy";
     }
     return "?";
 }
@@ -139,8 +196,11 @@ struct HashEntry {
 
 class CompressedIndex {
 public:
+    // phase2_iters: Phase II dirty-generation budget; 0 = unspecified, which
+    // falls back to GCSA_PHASE2_MAX_ITERS and then kPhase2DefaultIters.
     void build(const Shape& shape, std::string text,
-               int max_add = 8, CompressAlgo algo = CompressAlgo::Greedy) {
+               int max_add = 8, CompressAlgo algo = CompressAlgo::Greedy,
+               int phase2_iters = 0) {
         using Clock = std::chrono::steady_clock;
         const bool timing = (std::getenv("GCSA_TIMING") != nullptr);
         auto t0 = Clock::now();
@@ -149,13 +209,14 @@ public:
         span_ = shape.span;
         max_add_ = std::max(1, max_add);
         algo_ = algo;
+        phase2_iters_ = std::max(0, phase2_iters);
         compress_();
         auto t2 = Clock::now();
         if (timing) {
             auto ms = [](Clock::time_point a, Clock::time_point b) {
                 return std::chrono::duration<double, std::milli>(b - a).count();
             };
-            std::fprintf(stderr,
+            gcsa_log(
                 "[timing] gapped_sa=%.1fms  compress(%s)=%.1fms  m=%zu intervals~kmers later\n",
                 ms(t0, t1), algo_name(algo_), ms(t1, t2), G_.m());
         }
@@ -210,14 +271,20 @@ public:
         int coverage() const { return (int)covered.size(); }
     };
 
-    // Intervals + all viable candidates (kMinCoverage, no availability filter).
-    // Builds the gapped SA but does not compress / fill C_ or the hash table.
+    // Intervals + the candidate universe (kMinCoverage, no availability
+    // filter).  Builds the gapped SA but does not compress / fill C_ or the
+    // hash table.  `universe` records which enumeration produced `candidates`.
     struct DiffProblem {
         size_t m = 0;
+        std::string universe = "full";
         std::vector<Interval> intervals;
         std::vector<Candidate> candidates;
     };
 
+    // GCSA_LINK_UNIVERSE selects the candidate set:
+    //   full    – every decodable link incl. sub-runs (default; exact optimum)
+    //   maximal – maximal source runs only (no sub-runs)
+    //   legacy  – enumerate_candidates_, i.e. what the heuristics see
     DiffProblem collect_diff_problem(const Shape& shape, std::string text,
                                      int max_add = 8) {
         G_ = build_gapped_sa(shape, std::move(text));
@@ -242,11 +309,45 @@ public:
             P.intervals.push_back({name, (int32_t)r, (int32_t)r2});
             r = r2;
         }
-        for (const auto& iv : P.intervals) {
-            auto cs = enumerate_candidates_(iv.name, iv.lo, iv.hi, /*avail=*/false);
-            for (auto& c : cs) P.candidates.push_back(std::move(c));
+        const char* env = std::getenv("GCSA_LINK_UNIVERSE");
+        P.universe = env ? env : "full";
+        if (P.universe == "legacy") {
+            for (const auto& iv : P.intervals) {
+                auto cs = enumerate_candidates_(iv.name, iv.lo, iv.hi, /*avail=*/false);
+                for (auto& c : cs) P.candidates.push_back(std::move(c));
+            }
+        } else {
+            P.candidates = enumerate_all_links_(P.intervals,
+                                                /*sub_runs=*/P.universe != "maximal");
         }
         return P;
+    }
+
+    // Materialize C_ / the hash table from an explicit link set, e.g. an ILP
+    // solution.  Requires a preceding collect_diff_problem() on this object.
+    // Returns false if the links are not simultaneously feasible (two offsets
+    // for one name, or a source rank dropped by another link).
+    bool apply_links(const std::vector<Interval>& intervals,
+                     const std::vector<Candidate>& links) {
+        const size_t m = G_.m();
+        removed_.assign(m, 0);
+        pin_count_.assign(m, 0);
+        pin_owner_.assign(m, 0);
+        kept_count_ = m;
+        table_.clear();
+        C_.clear();
+
+        std::unordered_map<uint64_t, Candidate> accepted;
+        for (const Candidate& link : links) {
+            if (accepted.count(link.name)) return false;
+            Candidate c = link;
+            accept_(c, accepted);
+        }
+        for (const auto& kv : accepted)
+            if (!run_kept_(kv.second.src_lo, kv.second.src_hi)) return false;
+
+        finalize_(intervals, accepted);
+        return true;
     }
 
 private:
@@ -254,6 +355,7 @@ private:
     int span_ = 1;
     int max_add_ = 8;
     CompressAlgo algo_ = CompressAlgo::Greedy;
+    int phase2_iters_ = 0;  // 0 = unspecified; see run_phase2_ for precedence
 
     std::vector<int64_t> C_;
     std::vector<int64_t> rank_to_C_;
@@ -310,6 +412,7 @@ private:
         const int add_lo = (only_add >= 1) ? only_add : 1;
         const int add_hi = (only_add >= 1) ? only_add : max_add_;
         const int cov_floor = std::max(kMinCoverage, min_cov);
+        const bool intra = gcsa_intra_links();
         for (int add = add_lo; add <= add_hi; ++add) {
             std::vector<std::pair<int32_t,int32_t>> pr;
             pr.reserve(hi - lo);
@@ -325,28 +428,137 @@ private:
                 while (j < pr.size()
                        && pr[j].first == pr[j-1].first + 1
                        && G_.lcp[pr[j].first] >= add + 1) ++j;
-                int32_t s_lo = pr[i].first, s_hi = pr[j-1].first + 1;
-                bool disjoint = (s_hi <= lo || s_lo >= hi);
-                int cov = (int)(j - i);
-                if (disjoint && cov >= cov_floor) {
-                    bool ok = true;
-                    if (require_avail) {
-                        ok = run_kept_(s_lo, s_hi);
-                        for (size_t t = i; t < j && ok; ++t) {
-                            int32_t r = pr[t].second;
-                            if (removed_[r] || pin_count_[r] > 0) ok = false;
+                const int32_t s_lo = pr[i].first, s_hi = pr[j-1].first + 1;
+                if (s_hi <= lo || s_lo >= hi)
+                    emit_run_(name, lo, hi, add, pr, i, j, cov_floor,
+                              require_avail, out);
+                else if (intra)
+                    emit_intra_runs_(name, lo, hi, add, pr, i, j, cov_floor,
+                                     require_avail, out);
+                i = j;
+            }
+        }
+        return out;
+    }
+
+    // Turn the source sub-run pr[i..j) into a candidate for I_c = [lo,hi).
+    void emit_run_(uint64_t name, int32_t lo, int32_t hi, int add,
+                   const std::vector<std::pair<int32_t,int32_t>>& pr,
+                   size_t i, size_t j, int cov_floor, bool require_avail,
+                   std::vector<Candidate>& out) const {
+        const int cov = (int)(j - i);
+        if (cov < cov_floor) return;
+        const int32_t s_lo = pr[i].first, s_hi = pr[j-1].first + 1;
+        if (require_avail) {
+            if (!run_kept_(s_lo, s_hi)) return;
+            for (size_t t = i; t < j; ++t) {
+                int32_t r = pr[t].second;
+                if (removed_[r] || pin_count_[r] > 0) return;
+            }
+        }
+        Candidate c;
+        c.target_lo = lo; c.target_hi = hi; c.name = name;
+        c.add = add; c.src_lo = s_lo; c.src_hi = s_hi;
+        c.covered.reserve((size_t)cov);
+        for (size_t t = i; t < j; ++t) c.covered.push_back(pr[t].second);
+        out.push_back(std::move(c));
+    }
+
+    // A source run reaching into I_c is still decodable as long as it holds
+    // none of the ranks it covers (see "Link universe"), so instead of dropping
+    // it we emit its maximal such sub-runs. Two-pointer scan in run-relative
+    // coordinates: the window [p,q) is bad iff some t in [p,q) covers a rank in
+    // [p,q), i.e. iff it contains both endpoints of one of the `forbid` pairs.
+    void emit_intra_runs_(uint64_t name, int32_t lo, int32_t hi, int add,
+                          const std::vector<std::pair<int32_t,int32_t>>& pr,
+                          size_t i, size_t j, int cov_floor, bool require_avail,
+                          std::vector<Candidate>& out) const {
+        const int32_t len = (int32_t)(j - i);
+        const int32_t s0 = pr[i].first;
+        // forbid[b] = smallest window start that still traps a pair ending at b.
+        std::vector<int32_t> forbid((size_t)len, -1);
+        for (int32_t t = 0; t < len; ++t) {
+            const int32_t u = pr[i + (size_t)t].second - s0;
+            if (u < 0 || u >= len) continue;
+            const int32_t a = std::min(t, u), b = std::max(t, u);
+            forbid[(size_t)b] = std::max(forbid[(size_t)b], a + 1);
+        }
+        int32_t p = 0;
+        for (int32_t q = 1; q <= len; ++q) {
+            p = std::max(p, forbid[(size_t)(q - 1)]);
+            // Only emit windows that cannot grow to the right without moving p;
+            // p is non-decreasing, so no emitted window contains another.
+            if (q == len || forbid[(size_t)q] > p)
+                emit_run_(name, lo, hi, add, pr, i + (size_t)p, i + (size_t)q,
+                          cov_floor, require_avail, out);
+        }
+    }
+
+    // Every decodable link of the whole instance (see "Link universe"), the
+    // superset the ILP baseline optimizes over.  Source-centric: for a fixed
+    // add the ranks split into maximal runs of consecutive ranks whose
+    // add-successor exists and carries the same k-mer name; each sub-run of
+    // length >= kMinCoverage that contains none of the ranks it covers is a
+    // candidate.  No lcp >= add+1 and no maximality filter — those are the
+    // heuristics' pruning rules, not correctness ones.
+    //
+    // Cost is O(m) per add plus O(L^2) per maximal run of length L (only the
+    // ILP, i.e. tiny instances, uses this); sub_runs=false keeps it O(m).
+    std::vector<Candidate> enumerate_all_links_(const std::vector<Interval>& intervals,
+                                                bool sub_runs) const {
+        const int32_t m = (int32_t)G_.m();
+        std::unordered_map<uint64_t, Interval> by_name;
+        by_name.reserve(intervals.size() * 2);
+        for (const auto& iv : intervals) by_name[iv.name] = iv;
+
+        std::vector<Candidate> out;
+        std::vector<int32_t> tgt((size_t)m, -1);      // add-successor rank, -1 if none
+        std::vector<int32_t> src_of((size_t)m, -1);   // inverse of tgt, per run
+        for (int add = 1; add <= max_add_; ++add) {
+            for (int32_t r = 0; r < m; ++r) {
+                int64_t y = succ_lexpos_(r, add);
+                tgt[(size_t)r] = (y < 0) ? -1 : rank_of_[(size_t)y];
+            }
+            int32_t a = 0;
+            while (a < m) {
+                if (tgt[(size_t)a] < 0) { ++a; continue; }
+                const uint64_t name = G_.first_symbol(tgt[(size_t)a]);
+                int32_t b = a + 1;
+                while (b < m && tgt[(size_t)b] >= 0
+                       && G_.first_symbol(tgt[(size_t)b]) == name) ++b;
+                if (b - a >= kMinCoverage) {
+                    for (int32_t t = a; t < b; ++t) src_of[(size_t)tgt[(size_t)t]] = t;
+                    const Interval& iv = by_name[name];
+                    const int32_t p_hi = sub_runs ? b - kMinCoverage : a;
+                    for (int32_t p = a; p <= p_hi; ++p) {
+                        // Grow the source run one rank at a time; `clash` marks
+                        // the first q where [p,q] contains one of its own
+                        // covered ranks (monotone in q, so we can stop there).
+                        bool clash = false;
+                        for (int32_t q = p; q < b; ++q) {
+                            if (tgt[(size_t)q] >= p && tgt[(size_t)q] <= q) clash = true;
+                            int32_t w = src_of[(size_t)q];
+                            if (w >= p && w < q) clash = true;
+                            if (clash) break;
+                            const int32_t len = q + 1 - p;
+                            if (len < kMinCoverage) continue;
+                            if (!sub_runs && q + 1 != b) continue;
+                            Candidate c;
+                            c.name = name;
+                            c.add = add;
+                            c.src_lo = p;
+                            c.src_hi = q + 1;
+                            c.target_lo = iv.lo;
+                            c.target_hi = iv.hi;
+                            c.covered.reserve((size_t)len);
+                            for (int32_t t = p; t <= q; ++t)
+                                c.covered.push_back(tgt[(size_t)t]);
+                            out.push_back(std::move(c));
                         }
                     }
-                    if (ok) {
-                        Candidate c;
-                        c.target_lo = lo; c.target_hi = hi; c.name = name;
-                        c.add = add; c.src_lo = s_lo; c.src_hi = s_hi;
-                        c.covered.reserve(cov);
-                        for (size_t t = i; t < j; ++t) c.covered.push_back(pr[t].second);
-                        out.push_back(std::move(c));
-                    }
+                    for (int32_t t = a; t < b; ++t) src_of[(size_t)tgt[(size_t)t]] = -1;
                 }
-                i = j;
+                a = b;
             }
         }
         return out;
@@ -584,17 +796,19 @@ private:
     //   failures, exhausted tries with best-cached > cur, or suboptimal
     //   accepts). Avoids re-scanning skip_best / saturated names.
     //   Each interval is processed at most once per generation; generations
-    //   stop when next_dirty is empty (fixed point), max_iters is hit, or
-    //   adaptive stall triggers (low |C| gain for a streak of generations).
+    //   stop when next_dirty is empty (fixed point) or the iteration budget is
+    //   spent.
     //
-    // Env GCSA_PHASE2_MAX_ITERS=K (optional): hard-cap dirty generations.
-    // Default is min(|I|+5, 32). A cap may leave |C| slightly larger.
+    // Phase II runs a fixed number of dirty generations. The budget is, in
+    // precedence order: the caller's phase2_iters (--phase2-iters) if > 0, else
+    // GCSA_PHASE2_MAX_ITERS=K, else kPhase2DefaultIters (100). Reaching a fixed
+    // point stops earlier; a budget below the fixed point leaves |C| larger.
     //
-    // Adaptive early-stop (cuts long REPLACE-only plateaus; hard cap still applies):
+    // Adaptive early-stop (cuts long REPLACE-only plateaus), off by default:
+    //   GCSA_PHASE2_STALL=S     – consecutive generations with kept-drop < G
+    //                             before stopping. Default 0 = disabled.
     //   GCSA_PHASE2_MIN_GAIN=G  – min total kept-drop (|C| reduction) per dirty
     //                             generation to count as progress (default 1).
-    //   GCSA_PHASE2_STALL=S     – consecutive generations with kept-drop < G
-    //                             before stopping (default 3). S=0 disables.
     void run_phase2_(const std::vector<Interval>& intervals,
                      std::unordered_map<uint64_t, Candidate>& accepted,
                      const char* label,
@@ -602,27 +816,31 @@ private:
                      bool timing,
                      std::unordered_map<uint64_t, std::vector<Candidate>>* precomputed = nullptr) {
         using Clock = std::chrono::steady_clock;
-        const int N = (int)intervals.size();
-        int max_iters = std::min(N + 5, 32);
+        int max_iters = kPhase2DefaultIters;
+        const char* iters_src = "default";
         if (const char* env = std::getenv("GCSA_PHASE2_MAX_ITERS")) {
             int v = std::atoi(env);
-            if (v > 0) max_iters = v;
+            if (v > 0) { max_iters = v; iters_src = "GCSA_PHASE2_MAX_ITERS"; }
+        }
+        if (phase2_iters_ > 0) {
+            max_iters = phase2_iters_;
+            iters_src = "--phase2-iters";
         }
         int min_gain = 1;
         if (const char* env = std::getenv("GCSA_PHASE2_MIN_GAIN")) {
             int v = std::atoi(env);
             if (v >= 0) min_gain = v;
         }
-        int stall_limit = 3;
+        int stall_limit = 0;
         if (const char* env = std::getenv("GCSA_PHASE2_STALL")) {
             int v = std::atoi(env);
             if (v >= 0) stall_limit = v;
         }
         const bool adaptive = (stall_limit > 0);
-        std::fprintf(stderr, "[%s] Phase II: unpin/retarget...\n", label);
+        gcsa_log("[%s] Phase II: unpin/retarget...\n", label);
         if (timing && precomputed) {
-            std::fprintf(stderr, "[timing] %s Phase II precomputed cache size=%zu\n",
-                         label, precomputed->size());
+            gcsa_log("[timing] %s Phase II precomputed cache size=%zu\n",
+                     label, precomputed->size());
         }
         auto t0 = Clock::now();
 
@@ -754,13 +972,13 @@ private:
                     if (after < before) gen_kept_drop += (int)(before - after);
                     if (trace) {
                         if (after < before)
-                            std::fprintf(stderr,
+                            gcsa_log(
                                 "II.%d IMPROVE I_%s src=I_%s[%d,%d) add=%d cov=%d  kept %zu->%zu\n",
                                 guard, name_to_string(G_.shape, ivp->name).c_str(),
                                 name_to_string(G_.shape, name_of_rank_(c.src_lo)).c_str(),
                                 c.src_lo, c.src_hi, c.add, c.coverage(), before, after);
                         else
-                            std::fprintf(stderr,
+                            gcsa_log(
                                 "II.%d REPLACE I_%s cov %d->%d (kept unchanged %zu)\n",
                                 guard, name_to_string(G_.shape, ivp->name).c_str(),
                                 cur_cov, c.coverage(), after);
@@ -800,14 +1018,14 @@ private:
             }
         }
         auto t1 = Clock::now();
-        std::fprintf(stderr, "[%s] Phase II done\n", label);
+        gcsa_log("[%s] Phase II done\n", label);
         if (trace) {
-            std::fprintf(stderr, "after Phase II: kept=%zu accepted=%zu\n",
-                         kept_count_, accepted.size());
+            gcsa_log("after Phase II: kept=%zu accepted=%zu\n",
+                     kept_count_, accepted.size());
         }
         if (timing) {
             double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-            std::fprintf(stderr,
+            gcsa_log(
                 "[timing] %s Phase II: %.1fms  iters=%d stop=%s "
                 "enums=%zu cache_hits=%zu "
                 "skip_sat=%zu skip_best=%zu tries=%zu "
@@ -820,13 +1038,14 @@ private:
                 phase2_no_pin, phase2_fast_pin, phase2_multi_pin,
                 ms_enum, ms_try);
             if (std::strcmp(stop_reason, "adaptive-stall") == 0) {
-                std::fprintf(stderr,
+                gcsa_log(
                     "  (kept_drop=%d < min_gain=%d for stall=%d/%d)",
                     last_gen_kept_drop, min_gain, stall, stall_limit);
             } else if (std::strcmp(stop_reason, "max-iters") == 0) {
-                std::fprintf(stderr, "  (hit GCSA_PHASE2_MAX_ITERS=%d)", max_iters);
+                gcsa_log("  (spent the %d-iteration budget from %s)",
+                         max_iters, iters_src);
             }
-            std::fprintf(stderr, "\n");
+            gcsa_log("\n");
         }
     }
 
@@ -836,7 +1055,7 @@ private:
         using Clock = std::chrono::steady_clock;
         const bool timing = (std::getenv("GCSA_TIMING") != nullptr);
         auto t0 = Clock::now();
-        std::fprintf(stderr, "[greedy] size-order accept...\n");
+        gcsa_log("[greedy] size-order accept...\n");
         std::vector<const Interval*> order;
         for (const auto& iv : intervals) if (iv.hi - iv.lo > 1) order.push_back(&iv);
         std::sort(order.begin(), order.end(),
@@ -845,23 +1064,23 @@ private:
         const bool trace = (std::getenv("GCSA_TRACE_GREEDY") != nullptr);
         int step = 0;
         if (trace) {
-            std::fprintf(stderr, "greedy order:");
+            gcsa_log("greedy order:");
             for (auto* ivp : order)
-                std::fprintf(stderr, " %s(size=%d)",
-                             name_to_string(G_.shape, ivp->name).c_str(), ivp->hi - ivp->lo);
-            std::fprintf(stderr, "\n");
+                gcsa_log(" %s(size=%d)",
+                         name_to_string(G_.shape, ivp->name).c_str(), ivp->hi - ivp->lo);
+            gcsa_log("\n");
         }
         for (const Interval* ivp : order) {
             Candidate c = best_candidate_(ivp->name, ivp->lo, ivp->hi, /*avail=*/true);
             ++step;
             if (trace) {
-                std::fprintf(stderr, "step %d: I_%s [%d,%d) size=%d",
-                             step, name_to_string(G_.shape, ivp->name).c_str(),
-                             ivp->lo, ivp->hi, ivp->hi - ivp->lo);
+                gcsa_log("step %d: I_%s [%d,%d) size=%d",
+                         step, name_to_string(G_.shape, ivp->name).c_str(),
+                         ivp->lo, ivp->hi, ivp->hi - ivp->lo);
                 if (c.coverage() < kMinCoverage)
-                    std::fprintf(stderr, " -> SKIP\n");
+                    gcsa_log(" -> SKIP\n");
                 else
-                    std::fprintf(stderr,
+                    gcsa_log(
                         " -> ACCEPT src=I_%s[%d,%d) add=%d cov=%d covered={%s}\n",
                         name_to_string(G_.shape, name_of_rank_(c.src_lo)).c_str(),
                         c.src_lo, c.src_hi, c.add, c.coverage(),
@@ -877,230 +1096,11 @@ private:
             if (c.coverage() < kMinCoverage) continue;
             accept_(c, accepted);
         }
-        std::fprintf(stderr, "[greedy] size-order accept done\n");
+        gcsa_log("[greedy] size-order accept done\n");
         if (timing) {
             double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-            std::fprintf(stderr, "[timing] greedy: %.1fms  (#I>1=%zu accepted=%zu)\n",
-                         ms, order.size(), accepted.size());
-        }
-    }
-
-    // Abouelhoda-style LCP-interval: [lo, hi) with value ℓ means
-    //   min_{k=lo+1..hi-1} lcp[k] = ℓ, and the interval is inclusion-maximal
-    //   for that ℓ (lcp[lo] < ℓ if lo>0; lcp[hi] < ℓ if hi<m).
-    // String depth ℓ admits differential sources with add satisfying
-    //   ℓ >= add+1  (same check as enumerate_candidates_).
-    struct LcpInterval {
-        int32_t lo = 0, hi = 0;
-        int32_t lcp = 0;  // ℓ-value
-        int32_t length() const { return hi - lo; }
-        int64_t product() const { return (int64_t)lcp * (int64_t)(hi - lo); }
-    };
-
-    // All proper LCP-intervals with ℓ >= 1 and length >= 2 (suffix-tree internals).
-    std::vector<LcpInterval> enumerate_lcp_intervals_() const {
-        const int32_t m = (int32_t)G_.m();
-        std::vector<LcpInterval> out;
-        // stack: (ℓ, left boundary). Sentinel (0, 0).
-        std::vector<std::pair<int32_t, int32_t>> st;
-        st.push_back({0, 0});
-        for (int32_t i = 1; i <= m; ++i) {
-            int32_t lb = i - 1;
-            int32_t cur = (i < m) ? G_.lcp[i] : 0;
-            while (!st.empty() && cur < st.back().first) {
-                auto top = st.back();
-                st.pop_back();
-                // Popped interval [top.second, i) with value top.first.
-                if (top.first > 0 && i - top.second >= 2)
-                    out.push_back({top.second, i, top.first});
-                lb = top.second;
-            }
-            if (st.empty() || cur > st.back().first) {
-                st.push_back({cur, lb});
-            }
-            // cur == top.ℓ: extend existing interval (left boundary unchanged).
-        }
-        return out;
-    }
-
-    // Source-centric candidates: from kept LCP-interval [s_lo,s_hi) with fixed
-    // add, emit every maximal contiguous sub-run that maps onto a name interval
-    // I_c (same validity rules as enumerate_candidates_).
-    std::vector<Candidate> candidates_from_source_(
-            int32_t s_lo, int32_t s_hi, int add,
-            const std::unordered_map<uint64_t, Interval>& by_name) const {
-        std::vector<Candidate> out;
-        if (s_hi - s_lo < kMinCoverage || add < 1) return out;
-
-        int32_t r = s_lo;
-        while (r < s_hi) {
-            int64_t y = succ_lexpos_(r, add);
-            if (y < 0) { ++r; continue; }
-            int32_t t0 = rank_of_[(size_t)y];
-            uint64_t name = G_.first_symbol(t0);
-
-            int32_t r2 = r + 1;
-            int32_t expect_t = t0 + 1;
-            while (r2 < s_hi) {
-                if (G_.lcp[r2] < add + 1) break;
-                int64_t y2 = succ_lexpos_(r2, add);
-                if (y2 < 0) break;
-                int32_t t2 = rank_of_[(size_t)y2];
-                if (t2 != expect_t) break;
-                if (G_.first_symbol(t2) != name) break;
-                ++r2;
-                ++expect_t;
-            }
-            const int cov = r2 - r;
-            const int32_t t_lo = t0, t_hi = t0 + cov;
-            const bool disjoint = (r2 <= t_lo || r >= t_hi);
-            if (disjoint && cov >= kMinCoverage) {
-                Candidate c;
-                c.name = name;
-                c.add = add;
-                c.src_lo = r;
-                c.src_hi = r2;
-                auto it = by_name.find(name);
-                if (it != by_name.end()) {
-                    c.target_lo = it->second.lo;
-                    c.target_hi = it->second.hi;
-                } else {
-                    c.target_lo = t_lo;
-                    c.target_hi = t_hi;
-                }
-                c.covered.reserve(cov);
-                for (int32_t t = t_lo; t < t_hi; ++t) c.covered.push_back(t);
-                out.push_back(std::move(c));
-            }
-            r = (r2 > r) ? r2 : r + 1;
-        }
-        return out;
-    }
-
-    // Product-greedy (CLI: product-greedy / pl-greedy):
-    //   1. Enumerate SA LCP-intervals (suffix-tree internal nodes).
-    //   2. Process in descending (ℓ × length); ties: smaller lo, then longer,
-    //      then larger ℓ.
-    //   3. For each still-kept interval, treat it as a pinned source hub and
-    //      try add = 1, 2, …, min(ℓ, max_add).  A tight ℓ-interval only yields
-    //      links for add ≤ ℓ−1 (need internal LCP ≥ add+1); add==ℓ is attempted
-    //      per the user's wording but finds nothing on a tight interval.
-    //   4. Accept every still-available cov≥kMinCoverage link (one offset per
-    //      name, first-wins in coverage order). Then a size-order leftover
-    //      sweep on uncompressed name intervals (like greedy-dfs leftover).
-    //      No Phase II — same family as plain Greedy.
-    void compress_product_greedy_(const std::vector<Interval>& intervals,
-                                  std::unordered_map<uint64_t, Candidate>& accepted) {
-        using Clock = std::chrono::steady_clock;
-        const bool timing = (std::getenv("GCSA_TIMING") != nullptr);
-        const bool trace = (std::getenv("GCSA_TRACE_PRODUCT") != nullptr);
-        auto t0 = Clock::now();
-
-        std::unordered_map<uint64_t, Interval> by_name;
-        by_name.reserve(intervals.size() * 2);
-        for (const auto& iv : intervals) by_name[iv.name] = iv;
-
-        std::fprintf(stderr, "[product-greedy] enumerate LCP-intervals...\n");
-        std::vector<LcpInterval> lcp_ivs = enumerate_lcp_intervals_();
-        // Only intervals that can ever source an add≥1 link (need ℓ ≥ 2).
-        lcp_ivs.erase(std::remove_if(lcp_ivs.begin(), lcp_ivs.end(),
-                        [](const LcpInterval& iv) {
-                            return iv.lcp < 2 || iv.length() < kMinCoverage;
-                        }),
-                      lcp_ivs.end());
-        std::sort(lcp_ivs.begin(), lcp_ivs.end(),
-                  [](const LcpInterval& a, const LcpInterval& b) {
-                      if (a.product() != b.product()) return a.product() > b.product();
-                      if (a.lo != b.lo) return a.lo < b.lo;
-                      if (a.length() != b.length()) return a.length() > b.length();
-                      return a.lcp > b.lcp;
-                  });
-
-        std::fprintf(stderr, "[product-greedy] product-order accept (%zu intervals)...\n",
-                     lcp_ivs.size());
-        int step = 0, used = 0;
-        for (const auto& S : lcp_ivs) {
-            ++step;
-            // Skip if already partially consumed as a target — cannot pin as source.
-            if (!run_kept_(S.lo, S.hi)) {
-                if (trace)
-                    std::fprintf(stderr, "step %d: LCP[%d,%d) ℓ=%d |I|=%d prod=%lld -> SKIP (not kept)\n",
-                                 step, S.lo, S.hi, S.lcp, S.length(),
-                                 (long long)S.product());
-                continue;
-            }
-
-            if (trace)
-                std::fprintf(stderr, "step %d: LCP[%d,%d) ℓ=%d |I|=%d prod=%lld pin+scan adds 1..%d\n",
-                             step, S.lo, S.hi, S.lcp, S.length(),
-                             (long long)S.product(),
-                             std::min(S.lcp, max_add_));
-
-            // "Pin" = reserve this run as a source hub for this step. accept_()
-            // increments pin_count_ on the chosen src sub-run; we never remove
-            // ranks inside S while scanning its adds.
-            const int add_hi = std::min(S.lcp, max_add_);
-            for (int add = 1; add <= add_hi; ++add) {
-                // Need string depth ≥ add+1; tight ℓ-interval ⇒ add ≤ ℓ−1.
-                if (S.lcp < add + 1) continue;
-
-                auto cands = candidates_from_source_(S.lo, S.hi, add, by_name);
-                std::sort(cands.begin(), cands.end(),
-                          [](const Candidate& a, const Candidate& b) {
-                              if (a.coverage() != b.coverage())
-                                  return a.coverage() > b.coverage();
-                              if (a.name != b.name) return a.name < b.name;
-                              return a.src_lo < b.src_lo;
-                          });
-                for (auto& c : cands) {
-                    if (accepted.count(c.name)) continue;
-                    if (c.coverage() < kMinCoverage) continue;
-                    if (!cand_available_(c)) continue;
-                    if (trace)
-                        std::fprintf(stderr,
-                            "  ACCEPT I_%s <- src[%d,%d) add=%d cov=%d\n",
-                            name_to_string(G_.shape, c.name).c_str(),
-                            c.src_lo, c.src_hi, c.add, c.coverage());
-                    accept_(c, accepted);
-                    ++used;
-                }
-            }
-        }
-        std::fprintf(stderr, "[product-greedy] product-order done (accepted=%zu)\n",
-                     accepted.size());
-
-        // Leftover: same size-order availability-aware sweep as plain greedy /
-        // greedy-dfs leftover — product pass is source-centric and can leave
-        // compressible name intervals untouched. Not Phase II (no unpin/retarget).
-        std::fprintf(stderr, "[product-greedy] leftover greedy sweep...\n");
-        std::vector<const Interval*> leftover;
-        for (const auto& iv : intervals) {
-            if (iv.hi - iv.lo <= 1) continue;
-            if (accepted.count(iv.name)) continue;
-            leftover.push_back(&iv);
-        }
-        std::sort(leftover.begin(), leftover.end(),
-                  [](const Interval* a, const Interval* b) {
-                      return (a->hi - a->lo) > (b->hi - b->lo);
-                  });
-        for (const Interval* ivp : leftover) {
-            Candidate c = best_candidate_(ivp->name, ivp->lo, ivp->hi, /*avail=*/true);
-            if (c.coverage() < kMinCoverage) continue;
-            if (trace)
-                std::fprintf(stderr, "leftover I_%s <- src[%d,%d) add=%d cov=%d\n",
-                    name_to_string(G_.shape, ivp->name).c_str(),
-                    c.src_lo, c.src_hi, c.add, c.coverage());
-            accept_(c, accepted);
-            ++used;
-        }
-
-        std::fprintf(stderr, "[product-greedy] done (scanned=%d accepts=%d kept=%zu)\n",
-                     step, used, kept_count_);
-        if (timing) {
-            double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-            std::fprintf(stderr,
-                "[timing] product-greedy: %.1fms  lcp_ivs=%zu accepts=%d kept=%zu\n",
-                ms, lcp_ivs.size(), used, kept_count_);
+            gcsa_log("[timing] greedy: %.1fms  (#I>1=%zu accepted=%zu)\n",
+                     ms, order.size(), accepted.size());
         }
     }
 
@@ -1121,7 +1121,7 @@ private:
         // (cardinality-2 intervals are ignored for prefs / DAG / Phase I).
         // Static cand lists for all |I|>1 are reused by Phase II.
         std::unordered_map<uint64_t, std::vector<Candidate>> cand_cache;
-        std::fprintf(stderr, "[dep-order] preference / DAG build...\n");
+        gcsa_log("[dep-order] preference / DAG build...\n");
         auto t0 = Clock::now();
         for (const auto& iv : intervals) {
             if (iv.hi - iv.lo <= 1) continue;
@@ -1164,17 +1164,17 @@ private:
 
         const bool trace = (std::getenv("GCSA_TRACE_DEP") != nullptr);
         if (trace) {
-            std::fprintf(stderr, "=== preferred ===\n");
+            gcsa_log("=== preferred ===\n");
             for (auto& p : prefs)
-                std::fprintf(stderr, "  %s -> prefers %s add=%d cov=%d src[%d,%d)\n",
+                gcsa_log("  %s -> prefers %s add=%d cov=%d src[%d,%d)\n",
                     name_to_string(G_.shape, p.iv->name).c_str(),
                     name_to_string(G_.shape, p.src_name).c_str(),
                     p.cand.add, p.cand.coverage(), p.cand.src_lo, p.cand.src_hi);
-            std::fprintf(stderr, "=== DAG edges (src -> target, cov>=%d) ===\n", kMinCoverage);
+            gcsa_log("=== DAG edges (src -> target, cov>=%d) ===\n", kMinCoverage);
             for (auto& p : prefs) {
                 if (p.cand.coverage() < kMinCoverage) continue;
                 if (p.iv->name == p.src_name) continue;
-                std::fprintf(stderr, "  %s -> %s\n",
+                gcsa_log("  %s -> %s\n",
                     name_to_string(G_.shape, p.src_name).c_str(),
                     name_to_string(G_.shape, p.iv->name).c_str());
             }
@@ -1203,22 +1203,22 @@ private:
             });
             for (int u : rest) topo.push_back(u);
         }
-        std::fprintf(stderr, "[dep-order] preference / DAG done\n");
+        gcsa_log("[dep-order] preference / DAG done\n");
 
         if (trace) {
-            std::fprintf(stderr, "=== Phase I accept order (reverse topo, sinks first) ===\n  ");
+            gcsa_log("=== Phase I accept order (reverse topo, sinks first) ===\n  ");
             for (int k = N - 1; k >= 0; --k) {
                 const auto& iv = intervals[topo[k]];
                 if (iv.hi - iv.lo <= 2) continue;
                 if (!pref_of(iv.name)) continue;
-                std::fprintf(stderr, "%s ", name_to_string(G_.shape, iv.name).c_str());
+                gcsa_log("%s ", name_to_string(G_.shape, iv.name).c_str());
             }
-            std::fprintf(stderr, "\n");
+            gcsa_log("\n");
         }
 
         // Pass 1: accept preferred candidates in reverse topo (sinks first),
         // with availability. This pins sources that dependents need.
-        std::fprintf(stderr, "[dep-order] Phase I: reverse-topo accept...\n");
+        gcsa_log("[dep-order] Phase I: reverse-topo accept...\n");
         auto t2 = Clock::now();
         int step = 0;
         for (int k = N - 1; k >= 0; --k) {
@@ -1229,9 +1229,9 @@ private:
             Candidate c = best_candidate_(p->iv->name, p->iv->lo, p->iv->hi, /*avail=*/true);
             ++step;
             if (trace) {
-                std::fprintf(stderr, "I.%d I_%s", step, name_to_string(G_.shape, name).c_str());
-                if (c.coverage() < kMinCoverage) std::fprintf(stderr, " -> SKIP\n");
-                else std::fprintf(stderr, " -> ACCEPT src=I_%s[%d,%d) add=%d cov=%d\n",
+                gcsa_log("I.%d I_%s", step, name_to_string(G_.shape, name).c_str());
+                if (c.coverage() < kMinCoverage) gcsa_log(" -> SKIP\n");
+                else gcsa_log(" -> ACCEPT src=I_%s[%d,%d) add=%d cov=%d\n",
                     name_to_string(G_.shape, name_of_rank_(c.src_lo)).c_str(),
                     c.src_lo, c.src_hi, c.add, c.coverage());
             }
@@ -1239,10 +1239,10 @@ private:
             accept_(c, accepted);
         }
         auto t3 = Clock::now();
-        std::fprintf(stderr, "[dep-order] Phase I done\n");
+        gcsa_log("[dep-order] Phase I done\n");
         if (trace) {
             size_t kept = 0; for (auto x : removed_) if (!x) ++kept;
-            std::fprintf(stderr, "after Phase I: kept=%zu accepted=%zu\n", kept, accepted.size());
+            gcsa_log("after Phase I: kept=%zu accepted=%zu\n", kept, accepted.size());
         }
 
         run_phase2_(intervals, accepted, "dep-order", trace, timing, &cand_cache);
@@ -1251,235 +1251,11 @@ private:
             auto ms = [](Clock::time_point a, Clock::time_point b) {
                 return std::chrono::duration<double, std::milli>(b - a).count();
             };
-            std::fprintf(stderr,
+            gcsa_log(
                 "[timing] dep-order prefs=%.1fms phaseI=%.1fms phaseII=%.1fms total=%.1fms\n"
                 "         N=%d prefs=%zu\n",
                 ms(t0, t1), ms(t2, t3), ms(t3, t4), ms(t_all, t4),
                 N, prefs.size());
-        }
-    }
-
-    // Best add=1 candidate for target whose source lies entirely inside source_iv.
-    Candidate best_add1_from_(const Interval& target, const Interval& source,
-                              bool require_avail) const {
-        Candidate best;
-        // Only enumerate add=1 — callers never accept other adds here.
-        auto cands = enumerate_candidates_(target.name, target.lo, target.hi,
-                                           require_avail, /*only_add=*/1);
-        for (auto& c : cands) {
-            if (c.src_lo < source.lo || c.src_hi > source.hi) continue;
-            if (c.coverage() > best.coverage()
-                || (c.coverage() == best.coverage() && c.src_lo < best.src_lo))
-                best = c;
-        }
-        return best;
-    }
-
-    // Greedy-DFS: root = interval maximizing total add=+1 outbound coverage to
-    // targets with |I|>2.  DFS along add=+1 links; every reached target points
-    // at the DFS root with cumulative add (depth).  Repeat on leftovers, then
-    // a final availability-aware greedy sweep.
-    void compress_greedy_dfs_(const std::vector<Interval>& intervals,
-                              std::unordered_map<uint64_t, Candidate>& accepted) {
-        using Clock = std::chrono::steady_clock;
-        const bool timing = (std::getenv("GCSA_TIMING") != nullptr);
-        auto t_all = Clock::now();
-        double score_ms = 0, grow_ms = 0;
-        size_t score_calls = 0, trees = 0, enum_calls = 0;
-
-        const bool trace = (std::getenv("GCSA_TRACE_DFS") != nullptr);
-        std::unordered_map<uint64_t, const Interval*> by_name;
-        for (const auto& iv : intervals) by_name[iv.name] = &iv;
-
-        auto isize = [](const Interval& iv) { return iv.hi - iv.lo; };
-
-        // Outbound add=+1 score for a prospective root.
-        auto root_score = [&](const Interval& R) -> int {
-            auto ts = Clock::now();
-            int score = 0;
-            for (const auto& T : intervals) {
-                if (T.name == R.name || isize(T) <= 2) continue;
-                if (accepted.count(T.name)) continue;
-                ++enum_calls;
-                Candidate c = best_add1_from_(T, R, /*avail=*/false);
-                if (c.coverage() >= kMinCoverage) score += c.coverage();
-            }
-            score_ms += std::chrono::duration<double, std::milli>(Clock::now() - ts).count();
-            ++score_calls;
-            return score;
-        };
-
-        // Compose child --add1--> parent into child --add'--> root via parent's
-        // accepted-to-root candidate. Returns empty (cov 0) on failure.
-        auto compose_to_root = [&](const Candidate& link_add1,
-                                   const Candidate& parent_to_root) -> Candidate {
-            Candidate out;
-            int32_t nlo = 0, nhi = 0;
-            // Treat link_add1 as a "dependent" whose source is in parent;
-            // parent_to_root.covered lists the parent ranks recovered from root.
-            if (!can_retarget_(link_add1, parent_to_root, nlo, nhi)) return out;
-            out = link_add1;
-            out.src_lo = nlo;
-            out.src_hi = nhi;
-            out.add = parent_to_root.add + 1;
-            if (out.add > max_add_) { out.covered.clear(); return out; }
-            return out;
-        };
-
-        std::unordered_set<uint64_t> is_root;  // roots stay stored (no offset)
-
-        // Grow as many DFS trees as profitable.
-        std::fprintf(stderr, "[greedy-dfs] DFS trees (score+grow)...\n");
-        while (true) {
-            const Interval* root = nullptr;
-            int best = 0;
-            for (const auto& R : intervals) {
-                if (isize(R) <= 2) continue;
-                if (accepted.count(R.name) || is_root.count(R.name)) continue;
-                // Root ranks must still be kept.
-                bool kept = true;
-                for (int32_t r = R.lo; r < R.hi; ++r) if (removed_[r]) { kept = false; break; }
-                if (!kept) continue;
-                int sc = root_score(R);
-                if (sc > best) { best = sc; root = &R; }
-            }
-            if (!root || best <= 0) break;
-
-            auto tg0 = Clock::now();
-            ++trees;
-            is_root.insert(root->name);
-            if (trace)
-                std::fprintf(stderr, "DFS root=I_%s size=%d outbound_cov=%d\n",
-                    name_to_string(G_.shape, root->name).c_str(), isize(*root), best);
-
-            // Identity map for the root: covered = all its ranks, add=0, src=itself.
-            Candidate root_id;
-            root_id.name = root->name;
-            root_id.target_lo = root->lo;
-            root_id.target_hi = root->hi;
-            root_id.add = 0;
-            root_id.src_lo = root->lo;
-            root_id.src_hi = root->hi;
-            root_id.covered.clear();
-            for (int32_t r = root->lo; r < root->hi; ++r) root_id.covered.push_back(r);
-
-            // parent_to_root[name] for nodes in the tree (including root).
-            std::unordered_map<uint64_t, Candidate> to_root;
-            to_root[root->name] = root_id;
-
-            struct Frame { uint64_t name; };
-            std::vector<Frame> stack;
-
-            // Seed stack with add=+1 children of the root (|I|>2).
-            {
-                std::vector<Candidate> kids;
-                for (const auto& T : intervals) {
-                    if (T.name == root->name || isize(T) <= 2) continue;
-                    if (accepted.count(T.name)) continue;
-                    ++enum_calls;
-                    Candidate link = best_add1_from_(T, *root, /*avail=*/true);
-                    if (link.coverage() < kMinCoverage) continue;
-                    kids.push_back(std::move(link));
-                }
-                std::sort(kids.begin(), kids.end(), [](const Candidate& a, const Candidate& b){
-                    return a.coverage() > b.coverage();
-                });
-                for (auto& link : kids) {
-                    // Directly to root with add=1 (source already inside root).
-                    if (!run_kept_(link.src_lo, link.src_hi)) continue;
-                    bool ok = true;
-                    for (int32_t r : link.covered) if (removed_[r] || pin_count_[r] > 0) { ok = false; break; }
-                    if (!ok) continue;
-                    accept_(link, accepted);
-                    to_root[link.name] = link;
-                    stack.push_back({link.name});
-                    if (trace)
-                        std::fprintf(stderr, "  depth1 I_%s <- root add=1 cov=%d\n",
-                            name_to_string(G_.shape, link.name).c_str(), link.coverage());
-                }
-            }
-
-            // DFS: from each node, attach add=+1 children pointing at root with add+1.
-            while (!stack.empty()) {
-                Frame fr = stack.back();
-                stack.pop_back();
-                const Interval* P = by_name[fr.name];
-                auto itP = to_root.find(fr.name);
-                if (!P || itP == to_root.end()) continue;
-                const Candidate& parent_tr = itP->second;
-
-                std::vector<Candidate> kids;
-                for (const auto& U : intervals) {
-                    if (U.name == fr.name || U.name == root->name) continue;
-                    if (isize(U) <= 2) continue;
-                    if (accepted.count(U.name) || is_root.count(U.name)) continue;
-                    // Link U <- P with add=1 (ignore avail; compose handles pins).
-                    ++enum_calls;
-                    Candidate link = best_add1_from_(U, *P, /*avail=*/false);
-                    if (link.coverage() < kMinCoverage) continue;
-                    kids.push_back(std::move(link));
-                }
-                std::sort(kids.begin(), kids.end(), [](const Candidate& a, const Candidate& b){
-                    return a.coverage() > b.coverage();
-                });
-
-                for (auto& link : kids) {
-                    Candidate composed = compose_to_root(link, parent_tr);
-                    if (composed.coverage() < kMinCoverage) continue;
-                    // Availability on composed source (subset of root) and covered.
-                    if (!run_kept_(composed.src_lo, composed.src_hi)) continue;
-                    bool ok = true;
-                    for (int32_t r : composed.covered)
-                        if (removed_[r] || pin_count_[r] > 0) { ok = false; break; }
-                    if (!ok) continue;
-                    accept_(composed, accepted);
-                    to_root[composed.name] = composed;
-                    stack.push_back({composed.name});
-                    if (trace)
-                        std::fprintf(stderr, "  depth%d I_%s <- root add=%d cov=%d (via I_%s)\n",
-                            composed.add,
-                            name_to_string(G_.shape, composed.name).c_str(),
-                            composed.add, composed.coverage(),
-                            name_to_string(G_.shape, fr.name).c_str());
-                }
-            }
-            grow_ms += std::chrono::duration<double, std::milli>(Clock::now() - tg0).count();
-        }
-        std::fprintf(stderr, "[greedy-dfs] DFS trees done\n");
-
-        // Leftover sweep: classic size-greedy on remaining intervals.
-        std::fprintf(stderr, "[greedy-dfs] leftover greedy sweep...\n");
-        auto tl0 = Clock::now();
-        std::vector<const Interval*> order;
-        for (const auto& iv : intervals)
-            if (isize(iv) > 1 && !accepted.count(iv.name)) order.push_back(&iv);
-        std::sort(order.begin(), order.end(),
-                  [](const Interval* a, const Interval* b){ return (a->hi-a->lo) > (b->hi-b->lo); });
-        for (const Interval* ivp : order) {
-            Candidate c = best_candidate_(ivp->name, ivp->lo, ivp->hi, /*avail=*/true);
-            if (c.coverage() < kMinCoverage) continue;
-            accept_(c, accepted);
-            if (trace)
-                std::fprintf(stderr, "leftover I_%s <- I_%s add=%d cov=%d\n",
-                    name_to_string(G_.shape, ivp->name).c_str(),
-                    name_to_string(G_.shape, name_of_rank_(c.src_lo)).c_str(),
-                    c.add, c.coverage());
-        }
-        auto tl1 = Clock::now();
-        std::fprintf(stderr, "[greedy-dfs] leftover sweep done\n");
-        if (trace) {
-            size_t kept = 0; for (auto x : removed_) if (!x) ++kept;
-            std::fprintf(stderr, "greedy-dfs done: kept=%zu accepted=%zu roots=%zu\n",
-                         kept, accepted.size(), is_root.size());
-        }
-        if (timing) {
-            double leftover_ms = std::chrono::duration<double, std::milli>(tl1 - tl0).count();
-            double total_ms = std::chrono::duration<double, std::milli>(tl1 - t_all).count();
-            std::fprintf(stderr,
-                "[timing] greedy-dfs score=%.1fms grow=%.1fms leftover=%.1fms total=%.1fms\n"
-                "         trees=%zu score_calls=%zu best_add1_enums=%zu #I=%zu\n",
-                score_ms, grow_ms, leftover_ms, total_ms,
-                trees, score_calls, enum_calls, intervals.size());
         }
     }
 
@@ -1515,9 +1291,9 @@ private:
         // coverage-desc order, so we sort only after recording the preferred.
         std::unordered_map<uint64_t, std::vector<Candidate>> cand_cache;
 
-        std::fprintf(stderr, "[%s] preference forest build...\n", label);
+        gcsa_log("[%s] preference forest build...\n", label);
         if (timing)
-            std::fprintf(stderr, "[timing] %s pref threads=%d\n", label, nthreads);
+            gcsa_log("[timing] %s pref threads=%d\n", label, nthreads);
         auto t_pref0 = Clock::now();
 
         std::vector<const Interval*> big_ivs;
@@ -1608,19 +1384,19 @@ private:
         auto t_forest1 = Clock::now();
 
         if (trace) {
-            std::fprintf(stderr, "=== %s forest (src -> dependents) ===\n", label);
+            gcsa_log("=== %s forest (src -> dependents) ===\n", label);
             for (auto& kv : children) {
-                std::fprintf(stderr, "  %s ->",
-                             name_to_string(G_.shape, kv.first).c_str());
+                gcsa_log("  %s ->",
+                         name_to_string(G_.shape, kv.first).c_str());
                 for (uint64_t c : kv.second)
-                    std::fprintf(stderr, " %s",
-                                 name_to_string(G_.shape, c).c_str());
-                std::fprintf(stderr, "\n");
+                    gcsa_log(" %s",
+                             name_to_string(G_.shape, c).c_str());
+                gcsa_log("\n");
             }
-            std::fprintf(stderr, "roots:");
+            gcsa_log("roots:");
             for (uint64_t r : roots)
-                std::fprintf(stderr, " %s", name_to_string(G_.shape, r).c_str());
-            std::fprintf(stderr, "\n");
+                gcsa_log(" %s", name_to_string(G_.shape, r).c_str());
+            gcsa_log("\n");
         }
 
         // Dense forest arrays for DP.
@@ -1656,7 +1432,7 @@ private:
         // Per-root DP (disjoint trees) — parallelize over roots.
         std::vector<std::vector<std::pair<int, Candidate>>> chosen_by_root(roots.size());
 
-        std::fprintf(stderr, "[%s] DP on forest...\n", label);
+        gcsa_log("[%s] DP on forest...\n", label);
         auto t_dp0 = Clock::now();
         gcsa_parallel_for(roots.size(), [&](size_t ri) {
             const int root = id_of.at(roots[ri]);
@@ -1719,9 +1495,9 @@ private:
             if (trace) {
                 // fprintf is not great under parallel; only print when single-threaded.
                 if (nthreads <= 1)
-                    std::fprintf(stderr, "root %s: keep=%d comp=%s\n",
-                                 name_to_string(G_.shape, node_of[root]).c_str(), cost_keep,
-                                 can_comp ? std::to_string(cost_comp).c_str() : "n/a");
+                    gcsa_log("root %s: keep=%d comp=%s\n",
+                             name_to_string(G_.shape, node_of[root]).c_str(), cost_keep,
+                             can_comp ? std::to_string(cost_comp).c_str() : "n/a");
             }
 
             if (can_comp && cost_comp < cost_keep) {
@@ -1738,10 +1514,10 @@ private:
             for (auto& p : vec)
                 chosen.emplace(node_of[p.first], std::move(p.second));
         auto t_dp1 = Clock::now();
-        std::fprintf(stderr, "[%s] DP done\n", label);
+        gcsa_log("[%s] DP done\n", label);
 
         // Materialize: accept deepest dependents first (pins hubs before hubs decide).
-        std::fprintf(stderr, "[%s] accept chosen...\n", label);
+        gcsa_log("[%s] accept chosen...\n", label);
         auto t_acc0 = Clock::now();
         const std::vector<uint64_t> kEmptyKids;
         auto children_of = [&](uint64_t v) -> const std::vector<uint64_t>& {
@@ -1765,7 +1541,7 @@ private:
             }
             if (c.coverage() >= kMinCoverage) {
                 if (trace) {
-                    std::fprintf(stderr, "  ACCEPT %s <- %s add=%d cov=%d\n",
+                    gcsa_log("  ACCEPT %s <- %s add=%d cov=%d\n",
                         name_to_string(G_.shape, v).c_str(),
                         name_to_string(G_.shape, name_of_rank_(c.src_lo)).c_str(),
                         c.add, c.coverage());
@@ -1777,7 +1553,7 @@ private:
         auto t_acc1 = Clock::now();
 
         // Leftover intervals: greedy with availability, using static cand_cache.
-        std::fprintf(stderr, "[%s] leftover greedy...\n", label);
+        gcsa_log("[%s] leftover greedy...\n", label);
         auto t_left0 = Clock::now();
         std::vector<const Interval*> leftover;
         for (const auto& iv : intervals) {
@@ -1800,7 +1576,7 @@ private:
             accept_(c, accepted);
         }
         auto t_left1 = Clock::now();
-        std::fprintf(stderr, "[%s] leftover done\n", label);
+        gcsa_log("[%s] leftover done\n", label);
 
         // Phase II: same unpin/retarget fixed point as DepOrder (reuse cand_cache).
         auto t_p2_0 = Clock::now();
@@ -1812,7 +1588,7 @@ private:
             auto ms = [](Clock::time_point a, Clock::time_point b) {
                 return std::chrono::duration<double, std::milli>(b - a).count();
             };
-            std::fprintf(stderr,
+            gcsa_log(
                 "[timing] %s pref=%.1fms forest=%.1fms dp=%.1fms accept=%.1fms "
                 "leftover=%.1fms phase2=%.1fms total=%.1fms\n"
                 "         roots=%zu forest_nodes=%zu prefs=%zu #I>1=%zu "
@@ -1836,7 +1612,7 @@ private:
         table_.clear();
         C_.clear();
 
-        std::fprintf(stderr, "[%s] compressing...\n", algo_name(algo_));
+        gcsa_log("[%s] compressing...\n", algo_name(algo_));
 
         std::vector<Interval> intervals;
         for (size_t r = 0; r < m; ) {
@@ -1850,19 +1626,23 @@ private:
         std::unordered_map<uint64_t, Candidate> accepted;
         if (algo_ == CompressAlgo::DepOrder)
             compress_dep_order_(intervals, accepted);
-        else if (algo_ == CompressAlgo::GreedyDfs)
-            compress_greedy_dfs_(intervals, accepted);
         else if (algo_ == CompressAlgo::TreeDp)
             compress_tree_dp_(intervals, accepted, /*skip_phase2=*/false);
         else if (algo_ == CompressAlgo::TreeDp2)
             compress_tree_dp_(intervals, accepted, /*skip_phase2=*/true);
-        else if (algo_ == CompressAlgo::ProductGreedy)
-            compress_product_greedy_(intervals, accepted);
         else
             compress_greedy_(intervals, accepted);
 
-        // Build C and hash table.
-        std::fprintf(stderr, "[%s] finalize: build C / hash table...\n", algo_name(algo_));
+        gcsa_log("[%s] finalize: build C / hash table...\n", algo_name(algo_));
+        finalize_(intervals, accepted);
+        gcsa_log("[%s] finalize done\n", algo_name(algo_));
+    }
+
+    // Build C (kept positions in rank order) and the two-entries-per-name hash
+    // table from an accepted link set.
+    void finalize_(const std::vector<Interval>& intervals,
+                   const std::unordered_map<uint64_t, Candidate>& accepted) {
+        const size_t m = G_.m();
         rank_to_C_.assign(m, -1);
         C_.reserve(m);
         for (size_t r = 0; r < m; ++r) {
@@ -1890,7 +1670,6 @@ private:
             if (cnt > 0) { e.has_rest = true; e.rest_pos = (uint64_t)first; e.rest_num = cnt; }
             table_.emplace(iv.name, e);
         }
-        std::fprintf(stderr, "[%s] finalize done\n", algo_name(algo_));
     }
 };
 

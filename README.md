@@ -54,30 +54,32 @@ make
 ./bench_repetition
 ./bench_repetition --min-rep 10 --max-rep 100 --step 10 --seed 1
 
-# Compare / choose compression heuristic (g / d / f / t / t2 / p)
+# Compare / choose compression heuristic (g / d / t / t2)
 ./compare_algos
 ./gcsa --algo greedy
 ./gcsa --algo dep-order
-./gcsa --algo greedy-dfs          # DFS from best add=+1 hub, cumulative add
 ./gcsa --algo tree-dp             # preference-forest DP + Phase II
 ./gcsa --algo tree-dp2            # same as tree-dp without Phase II
-./gcsa --algo product-greedy      # LCP-interval ℓ×length product source-greedy (alias: pl-greedy)
-GCSA_TRACE_DFS=1 ./gcsa -g /tmp/ex.fa -s "#.#" --algo greedy-dfs
 GCSA_TRACE_DP=1  ./gcsa -g /tmp/ex.fa -s "#.#" --algo tree-dp
-GCSA_TRACE_PRODUCT=1 ./gcsa -g /tmp/ex.fa -s "#.#" --algo product-greedy
 GCSA_TIMING=1    ./gcsa -g genome.fasta -s "#####" --algo tree-dp   # stage timings
 GCSA_THREADS=8   ./gcsa -g genome.fasta -s "#####" --algo tree-dp   # parallel pref/DP (default=hw)
-# Optional Phase II dirty-generation cap (default min(|I|+5, 32); may increase |C|):
+# Phase II runs a fixed 100 dirty generations (or fewer, if it reaches a fixed
+# point first). Precedence: --phase2-iters > GCSA_PHASE2_MAX_ITERS > default.
+# A budget below the fixed point may increase |C|:
+./gcsa -g genome.fasta -s "#####" --algo tree-dp --phase2-iters 25
 GCSA_PHASE2_MAX_ITERS=2 ./gcsa -g genome.fasta -s "#####" --algo tree-dp
-# Adaptive Phase II early-stop (defaults: MIN_GAIN=1, STALL=3). Stops when
-# consecutive dirty generations each reduce |C| by < MIN_GAIN kept positions.
-# Hard MAX_ITERS still applies. Set STALL=0 to disable adaptive stop only:
-# GCSA_PHASE2_STALL=0 ./gcsa ...
+# Optional adaptive early-stop, disabled by default (STALL=0). Stops when
+# consecutive dirty generations each reduce |C| by < MIN_GAIN kept positions;
+# the iteration budget still applies:
 # GCSA_PHASE2_MIN_GAIN=2 GCSA_PHASE2_STALL=2 ./gcsa -g genome.fasta -s "#####" --algo tree-dp
 
 # Exact |C| ILP baseline on small texts (needs cbc or glpsol on PATH)
 ./ilp_baseline "ACGTCTTAAACCCTCGTCTTAAACCCAACGTCTTAAACCC" "#.#"
 ./ilp_baseline "GCCTTTAAAGGCCTTTAAAGGCCTTTAAAG" "#.#" --max-add 8
+# Smaller, faster, NOT a valid lower bound — for inspecting the heuristics' view:
+./ilp_baseline "GCCTTTAAAGGCCTTTAAAGGCCTTTAAAG" "#.#" --universe legacy
+# Drop intra-interval links from the heuristics' candidate sets (pre-unification):
+GCSA_INTRA_LINKS=0 ./gcsa --algo greedy
 ```
 
 Shapes use `#` (care) and `.` (don't care), e.g. `#.#`, `##.##`, `#..#..#`.
@@ -156,32 +158,57 @@ compression on a 180 kb repetitive input: `####.####` → **40% of the full SA**
 
 ## Limitations & research extensions
 
-- **Source selection**: six heuristics — `greedy`, `dep-order`, `greedy-dfs`,
-  `tree-dp` (preference-forest DP KEEP vs COMPRESS, then Phase II
-  unpin/retarget), `tree-dp2` (same forest DP without Phase II), and
-  `product-greedy` / `pl-greedy` (enumerate SA LCP-intervals, process in
-  descending `ℓ × length` order, pin each as a source and try adds
-  `1..ℓ`, then a size-order leftover sweep; no Phase II). Use
-  `./gcsa --algo product-greedy` or `./compare_algos`.
+- **Source selection**: four heuristics — `greedy`, `dep-order`, `tree-dp`
+  (preference-forest DP KEEP vs COMPRESS, then Phase II unpin/retarget), and
+  `tree-dp2` (same forest DP without Phase II). Use
+  `./gcsa --algo <name>` or `./compare_algos`.
   Tree-dp preference enumeration and per-root forest DP are parallelized via
   `std::thread` (`GCSA_THREADS=N`, default=`hardware_concurrency`). Set
   `GCSA_TIMING=1` for per-phase ms (pref / forest / dp / accept / leftover /
   Phase II; Phase II also prints `stop=fixed-point|max-iters|adaptive-stall`).
   Leftover greedy reuses the static candidate cache (no re-enum).
   Forest cycle checks walk the parent chain; DP uses dense node ids.
-  Phase II adaptive early-stop (`GCSA_PHASE2_MIN_GAIN`, `GCSA_PHASE2_STALL`;
-  defaults 1 / 3) ends dirty generations when kept-drop plateaus; set
-  `GCSA_PHASE2_STALL=0` to disable. `GCSA_PHASE2_MAX_ITERS` remains the hard cap.
+  Phase II runs a fixed budget of 100 dirty generations
+  (`kPhase2DefaultIters`), stopping earlier if it reaches a fixed point. The
+  budget comes from `--phase2-iters N`, else `GCSA_PHASE2_MAX_ITERS`, else the
+  default; `GCSA_TIMING=1` reports the effective value and its source. The
+  adaptive early-stop
+  (`GCSA_PHASE2_MIN_GAIN`, `GCSA_PHASE2_STALL`) ends generations when kept-drop
+  plateaus, but is disabled by default (`GCSA_PHASE2_STALL=0`).
+- **Link universe (what a differential link may look like)**: an `H_offset`
+  entry `(pos, add, num)` decodes to `{C[pos+t] + add*span}`, i.e. it reads
+  `num` consecutive *kept* entries of `C` and shifts them. A link is therefore
+  decodable iff its source ranks are all kept, its covered ranks are all
+  dropped, every covered rank is the `add*span` successor of the matching
+  source rank and carries the target k-mer, coverage is `>= kMinCoverage`, and
+  the name has at most one offset entry. Keeping the source and dropping the
+  covered set already forces `src ∩ covered = ∅`, and `C` holds literal
+  positions, so decoding never recurses — there is no acyclicity condition.
+  In particular **intra-interval** links (source overlapping `I_c` itself) and
+  **non-maximal / low-lcp source runs** are all legal; the note's
+  `lcp >= add+1` maximal-run rule is a pruning heuristic, not a correctness
+  requirement. `GCSA_INTRA_LINKS=0` restores the old "source entirely outside
+  `I_c`" rule for the heuristics.
 - **ILP baseline (exact |C| on small instances)**: `make ilp_baseline` builds
-  `./ilp_baseline`, which enumerates the same candidates as `compress.hpp`
+  `./ilp_baseline`, which enumerates the **full link universe** above
   (`kMinCoverage=3`, `--max-add` default 8), writes a CPLEX `.lp`, and solves
   with `cbc` / `glpsol` on `PATH` (else brute-force when tiny, else LP-only).
-  Reports optimal `|C|`, heuristic `|C|`, optimality gap, and a keep-set
-  self-check:
+  Since that universe is a superset of what any heuristic can build, the
+  reported optimum is a valid lower bound for all of them. Reports optimal
+  `|C|`, heuristic `|C|`, optimality gap, a keep-set self-check, an end-to-end
+  decode check (materializes the ILP solution and compares `positions_of`
+  against brute force), and whether the optimum bounds every algorithm:
   ```
   ./ilp_baseline "ACGTCTTAAACCCTCGTCTTAAACCCAACGTCTTAAACCC" "#.#"
   ./ilp_baseline "GCCTTTAAAGGCCTTTAAAGGCCTTTAAAG" "#.#"
   ```
+  `--universe` / `GCSA_LINK_UNIVERSE` picks the candidate set: `full`
+  (default, exact), `maximal` (maximal source runs only) or `legacy` (the
+  heuristics' `enumerate_candidates_` view). `full` costs `O(L^2)` links per
+  source run of length `L`, so on repetitive inputs the LP grows quickly —
+  e.g. `GCCTTTAAAG`×12 with `#.#` goes from 77 candidates / 0.07 s (`legacy`)
+  to 3625 candidates / 8.4 s (`full`). `maximal` and `legacy` are faster but
+  are **not** lower bounds.
 - **Suffix array construction**: a linear-time integer-alphabet SA-IS
   (`src/sais.hpp`) is the default; libdivsufsort is no longer a build dependency.
   SA-IS and its indices are currently `int32_t`; for texts longer than 2³¹,

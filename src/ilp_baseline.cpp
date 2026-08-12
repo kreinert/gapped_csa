@@ -1,9 +1,13 @@
-// ilp_baseline.cpp — exact |C| via ILP over the same candidate set as compress.hpp
-// (kMinCoverage=3, max_add default 8). Emits CPLEX .lp; solves with cbc/glpsol
-// if present, else brute-force for tiny instances.
+// ilp_baseline.cpp — exact |C| via ILP over the full differential-link universe
+// of compress.hpp (kMinCoverage=3, max_add default 8): see "Link universe"
+// there. Because that universe is a superset of what every heuristic can build,
+// the optimum reported here is a valid lower bound for all of them. Emits
+// CPLEX .lp; solves with cbc/glpsol if present, else brute-force for tiny
+// instances.
 //
 // Build:  make ilp_baseline
 // Usage:  ./ilp_baseline "<TEXT>" "<SHAPE>" [--max-add 8] [--lp-out path.lp]
+//                        [--universe full|maximal|legacy]
 
 #include "compress.hpp"
 
@@ -343,6 +347,43 @@ static bool self_check(const CompressedIndex::DiffProblem& P, const IlpSolution&
     return true;
 }
 
+// End-to-end check: materialize the ILP solution as a real index and decode
+// every k-mer against brute force. The universe drops the note's lcp >= add+1
+// rule, so this is what actually proves the extra links are decodable.
+static bool decode_check(CompressedIndex& helper,
+                         const CompressedIndex::DiffProblem& P,
+                         const IlpSolution& sol,
+                         const Shape& sh, const std::string& text,
+                         size_t& C_out, std::string& err) {
+    std::vector<CompressedIndex::Candidate> chosen;
+    for (size_t e = 0; e < sol.y.size(); ++e)
+        if (sol.y[e]) chosen.push_back(P.candidates[e]);
+    if (!helper.apply_links(P.intervals, chosen)) {
+        err = "link set not simultaneously feasible";
+        return false;
+    }
+    C_out = helper.stored_positions();
+    if ((int64_t)C_out != sol.opt_C) {
+        err = "|C| after apply_links (" + std::to_string(C_out)
+              + ") != opt_C (" + std::to_string(sol.opt_C) + ")";
+        return false;
+    }
+    std::map<uint64_t, std::vector<int64_t>> truth;
+    for (long p = 0; p <= (long)text.size(); ++p)
+        truth[name_at(sh, text, (size_t)p)].push_back(p);
+    for (auto& kv : truth) {
+        auto got = helper.positions_of(kv.first);
+        std::sort(got.begin(), got.end());
+        auto exp = kv.second;
+        std::sort(exp.begin(), exp.end());
+        if (got != exp) {
+            err = "positions_of mismatch for " + name_to_string(sh, kv.first);
+            return false;
+        }
+    }
+    return true;
+}
+
 static IlpSolution brute_force(const CompressedIndex::DiffProblem& P) {
     IlpSolution sol;
     sol.method = "brute";
@@ -464,7 +505,13 @@ static IlpSolution solve_with_external(const std::string& lp_path,
 
 static void usage(const char* argv0) {
     std::cerr << "Usage: " << argv0
-              << " \"<TEXT>\" \"<SHAPE>\" [--max-add 8] [--lp-out path.lp]\n";
+              << " \"<TEXT>\" \"<SHAPE>\" [--max-add 8] [--lp-out path.lp]\n"
+              << "       [--universe full|maximal|legacy]   (= GCSA_LINK_UNIVERSE)\n"
+              << "  full    every decodable link incl. non-maximal source runs;\n"
+              << "          the only setting that is a true lower bound for all\n"
+              << "          algorithms, but O(L^2) links per run of length L\n"
+              << "  maximal maximal source runs only\n"
+              << "  legacy  the heuristics' enumerate_candidates_ view\n";
 }
 
 int main(int argc, char** argv) {
@@ -485,6 +532,8 @@ int main(int argc, char** argv) {
         };
         if (k == "--max-add") max_add = std::stoi(need("--max-add"));
         else if (k == "--lp-out") lp_out = need("--lp-out");
+        else if (k == "--universe") ::setenv("GCSA_LINK_UNIVERSE",
+                                             need("--universe").c_str(), 1);
         else {
             std::cerr << "unknown arg: " << k << "\n";
             usage(argv[0]);
@@ -515,6 +564,7 @@ int main(int argc, char** argv) {
               << " kMinCoverage=" << kMinCoverage << "\n"
               << "m=" << P.m
               << " intervals=" << P.intervals.size()
+              << " universe=" << P.universe
               << " candidates=" << P.candidates.size() << "\n"
               << "LP written: " << lp_out
               << "  (#vars=" << n_vars << " #constraints=" << n_cons << ")\n";
@@ -522,10 +572,8 @@ int main(int argc, char** argv) {
     // Heuristics
     size_t Cg = heuristic_C(sh, text, max_add, CompressAlgo::Greedy);
     size_t Cd = heuristic_C(sh, text, max_add, CompressAlgo::DepOrder);
-    size_t Cf = heuristic_C(sh, text, max_add, CompressAlgo::GreedyDfs);
     size_t Ct = heuristic_C(sh, text, max_add, CompressAlgo::TreeDp);
     size_t Ct2 = heuristic_C(sh, text, max_add, CompressAlgo::TreeDp2);
-    size_t Cp = heuristic_C(sh, text, max_add, CompressAlgo::ProductGreedy);
 
     IlpSolution sol = solve_with_external(lp_out, P, n_vars, n_cons);
 
@@ -534,18 +582,22 @@ int main(int argc, char** argv) {
                   << "  " << sol.message << "\n"
                   << "heuristic |C|: greedy=" << Cg
                   << " dep-order=" << Cd
-                  << " greedy-dfs=" << Cf
                   << " tree-dp=" << Ct
-                  << " tree-dp2=" << Ct2
-                  << " product-greedy=" << Cp << "\n"
+                  << " tree-dp2=" << Ct2 << "\n"
                   << "Open " << lp_out << " with cbc/glpsol/gurobi to get optimal |C|.\n";
         return 2;
     }
 
     std::string err;
     bool ok = self_check(P, sol, err);
+    std::string derr;
+    size_t decoded_C = 0;
+    bool dec_ok = decode_check(helper, P, sol, sh, text, decoded_C, derr);
     size_t n_sel = 0;
     for (auto v : sol.y) n_sel += v;
+
+    size_t best_h = std::min({Cg, Cd, Ct, Ct2});
+    bool bounds = (sol.opt_C >= 0 && (size_t)sol.opt_C <= best_h);
 
     auto gap = [&](size_t h) -> double {
         if (sol.opt_C <= 0) return 0;
@@ -560,17 +612,17 @@ int main(int argc, char** argv) {
               << "  (selected " << n_sel << " candidates)\n"
               << "heuristic |C|: greedy=" << Cg
               << " dep-order=" << Cd
-              << " greedy-dfs=" << Cf
               << " tree-dp=" << Ct
-              << " tree-dp2=" << Ct2
-              << " product-greedy=" << Cp << "\n"
+              << " tree-dp2=" << Ct2 << "\n"
               << "gap vs opt (%): greedy=" << gap(Cg)
               << " dep-order=" << gap(Cd)
-              << " greedy-dfs=" << gap(Cf)
               << " tree-dp=" << gap(Ct)
-              << " tree-dp2=" << gap(Ct2)
-              << " product-greedy=" << gap(Cp) << "\n"
-              << "self-check: " << (ok ? "OK" : ("FAIL (" + err + ")")) << "\n";
+              << " tree-dp2=" << gap(Ct2) << "\n"
+              << "self-check: " << (ok ? "OK" : ("FAIL (" + err + ")")) << "\n"
+              << "decode-check: " << (dec_ok ? "OK" : ("FAIL (" + derr + ")"))
+              << "  (|C|=" << decoded_C << ")\n"
+              << "bounds all algos: " << (bounds ? "YES" : "NO")
+              << "  (opt=" << sol.opt_C << " min heuristic=" << best_h << ")\n";
 
-    return ok ? 0 : 3;
+    return (ok && dec_ok && bounds) ? 0 : 3;
 }
