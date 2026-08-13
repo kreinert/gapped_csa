@@ -32,11 +32,8 @@
 
 namespace gcsa {
 
-inline int bytes_needed(uint64_t v) {
-    int b = 1;
-    while (b < 8 && v >= (uint64_t(1) << (8 * b))) ++b;
-    return b;
-}
+// bytes_needed() now lives in compress.hpp (compress.hpp is included above)
+// -- min_coverage_breakeven() needs it before any SerializedIndex exists.
 
 inline void put_be(std::vector<uint8_t>& out, uint64_t v, int nbytes) {
     for (int k = 0; k < nbytes; ++k)

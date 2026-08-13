@@ -162,6 +162,12 @@ static void print_usage(const char* argv0) {
         << "                      Phase II stops earlier at a fixed point. Applies to\n"
         << "                      dep-order and tree-dp. Precedence: this flag >\n"
         << "                      GCSA_PHASE2_MAX_ITERS > default.\n"
+        << "  --min-coverage N|auto  Minimum rows a candidate must reroute to be\n"
+        << "                      accepted (default: " << kMinCoverage << "). \"auto\" derives the\n"
+        << "                      break-even coverage from the input length and\n"
+        << "                      --max-add instead (see min_coverage_breakeven() in\n"
+        << "                      compress.hpp). Precedence: this flag >\n"
+        << "                      GCSA_MIN_COVERAGE > default.\n"
         << "  --table             print the hash table\n"
         << "  --sa                print the full gapped suffix array\n"
         << "  -h, --help          this message\n";
@@ -173,6 +179,7 @@ int main(int argc, char** argv) {
     int max_add = 8;
     int phase2_iters = 0;  // 0 = unset: GCSA_PHASE2_MAX_ITERS, else the default
     CompressAlgo algo = CompressAlgo::Greedy;
+    std::string min_cov_arg;  // "" = unset -> GCSA_MIN_COVERAGE -> built-in default
 
     for (int i = 1; i < argc; ++i) {
         std::string k = argv[i];
@@ -191,6 +198,7 @@ int main(int argc, char** argv) {
                 return 1;
             }
         }
+        else if (k == "--min-coverage") min_cov_arg = need("--min-coverage");
         else if (k == "--help" || k == "-h") { print_usage(argv[0]); return 0; }
         else if (k == "--algo") {
             std::string a = need("--algo");
@@ -237,6 +245,37 @@ int main(int argc, char** argv) {
     Shape sh = Shape::parse(shape_str);
     std::cout << "shape=" << shape_str << " span=" << sh.span << " weight=" << sh.weight
               << " n=" << text.size() << "  algo=" << algo_name(algo) << "\n";
+
+    // Resolve the min-coverage floor before building: it gates candidate
+    // enumeration inside idx.build(), so it must be set first. Precedence:
+    // --min-coverage > GCSA_MIN_COVERAGE > built-in default (kMinCoverage's
+    // compiled-in value). Either source may be "auto" to derive the
+    // break-even coverage from the input length (pre-DP pb estimate) and
+    // --max-add instead of the fixed default.
+    {
+        std::string src = min_cov_arg;
+        const char* origin = "--min-coverage";
+        if (src.empty()) {
+            if (const char* env = std::getenv("GCSA_MIN_COVERAGE")) { src = env; origin = "GCSA_MIN_COVERAGE"; }
+        }
+        if (!src.empty()) {
+            if (src == "auto") {
+                const int pb_est = estimate_pb(text.size());
+                const int mc = min_coverage_breakeven(pb_est, max_add);
+                std::cout << "min-coverage: auto (" << origin << ") pb_estimate=" << pb_est
+                          << " max_add=" << max_add << " -> min_coverage=" << mc << "\n";
+                kMinCoverage = mc;
+            } else {
+                int mc = std::stoi(src);
+                if (mc < 1) {
+                    std::cerr << "--min-coverage must be >= 1 (or \"auto\")\n";
+                    return 1;
+                }
+                std::cout << "min-coverage: " << mc << " (" << origin << ")\n";
+                kMinCoverage = mc;
+            }
+        }
+    }
 
     CompressedIndex idx;
     idx.build(sh, text, max_add, algo, phase2_iters);

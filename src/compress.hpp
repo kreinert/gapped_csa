@@ -116,9 +116,55 @@ inline void gcsa_log(const char* fmt, A a, Args... args) {
     std::fprintf(out, fmt, a, args...);
 }
 
+// Fixed-width byte count needed to hold `v` (1..8). Shared by the serialized
+// H_offset/H_rest field widths (serialize.hpp) and by min_coverage_breakeven()
+// below, which needs it before any SerializedIndex exists.
+inline int bytes_needed(uint64_t v) {
+    int b = 1;
+    while (b < 8 && v >= (uint64_t(1) << (8 * b))) ++b;
+    return b;
+}
+
 // Minimum coverage to accept a compression link (all algos + Phase II).
 // Preference-forest / DAG *edges* use the same floor (see DepOrder / TreeDp).
-constexpr int kMinCoverage = 3;
+// Runtime-adjustable (main.cpp's --min-coverage / GCSA_MIN_COVERAGE); the 3
+// below is only the built-in default, read once before CompressedIndex::build
+// so every enumerate_candidates_/enumerate_all_links_ call site (which all
+// default to `kMinCoverage`) sees the same floor. Not constexpr on purpose.
+inline int kMinCoverage = 3;
+
+// Smallest H_offset coverage `num` for which replacing `num` directly-stored
+// positions (num*pb bytes in the serialized C array) with a single H_offset
+// reference (pb + off_add_b + off_cnt_b bytes added to H) is a net byte
+// reduction. The marker byte itself is sunk -- every occurring name pays it
+// whether or not it has an offset (see serialize.hpp's serialize_index) --
+// so only the off_pos/off_add/off_num fields count against the num*pb
+// reclaimed from C. `pb` is the serialized index's bytes/position (see
+// estimate_pb below for a pre-DP estimate); `max_add` bounds off_add exactly
+// since every accepted add is <= max_add by construction.
+inline int min_coverage_breakeven(int pb, int max_add) {
+    if (pb <= 0) return kMinCoverage;
+    const int off_add_b = std::max(1, bytes_needed((uint64_t)std::max(0, max_add)));
+    for (int num = 1; num <= 64; ++num) {
+        const int off_cnt_b = std::max(1, bytes_needed((uint64_t)num));
+        const int savings = pb * (num - 1) - off_add_b - off_cnt_b;
+        if (savings > 0) return num;
+    }
+    return 64;  // pathological pb; shouldn't happen for realistic inputs
+}
+
+// Upper bound on the serialized index's pb (bytes/position), computable from
+// the input length alone -- before building the suffix array or running any
+// compression. pb = bytes_needed(max(maxpos, maxidx)) in serialize.hpp;
+// maxpos is an original text position (< n) and maxidx indexes the kept-
+// positions array C, whose size only shrinks once compression runs, so both
+// are bounded above by n-1. May overestimate pb slightly once real
+// compression shrinks |C| into a smaller byte bracket, which only makes the
+// derived min_coverage_breakeven() conservative (a bit higher than the true
+// post-compression breakeven), never too aggressive.
+inline int estimate_pb(size_t n) {
+    return bytes_needed(n > 1 ? (uint64_t)(n - 1) : 0);
+}
 
 // Phase II runs this many dirty generations unless it reaches a fixed point
 // first. Callers override it per build (CompressedIndex::build's phase2_iters,
