@@ -14,6 +14,7 @@
 //                            [--step S] [--max-add A] [--queries Q]
 
 #include "compress.hpp"
+#include "random_dna.hpp"
 #include "serialize.hpp"
 
 #include <chrono>
@@ -29,14 +30,6 @@
 
 using namespace gcsa;
 using Clock = std::chrono::steady_clock;
-
-static std::string random_dna(size_t len, std::mt19937_64& rng) {
-    static const char bases[] = "ACGT";
-    std::uniform_int_distribution<int> d(0, 3);
-    std::string s(len, 'A');
-    for (size_t i = 0; i < len; ++i) s[i] = bases[d(rng)];
-    return s;
-}
 
 static std::string concat_copies(const std::string& motif, int reps) {
     std::string t;

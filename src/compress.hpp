@@ -1999,6 +1999,13 @@ private:
         const char* label = algo_name(algo_);
         auto t_all = Clock::now();
         const int nthreads = gcsa_num_threads();
+        // |C| before any of this function's stages touch it — i.e. the
+        // uncompressed size (m SA ranks) — so DP/leftover/Phase II below can
+        // each report their own contribution to the reduction.
+        const size_t m0 = kept_count_;
+        auto pct_kept = [&](size_t kept) {
+            return 100.0 * (double)kept / (double)std::max<size_t>(1, m0);
+        };
 
         std::unordered_map<uint64_t, const Interval*> by_name;
         by_name.reserve(intervals.size() * 2);
@@ -2297,6 +2304,9 @@ private:
         };
         for (uint64_t r : roots) accept_subtree(r);
         auto t_acc1 = Clock::now();
+        const size_t after_dp = kept_count_;
+        gcsa_log("[%s] DP alone:   |C| %zu -> %zu  (%.1f%% of original kept, -%zu)\n",
+                 label, m0, after_dp, pct_kept(after_dp), m0 - after_dp);
 
         // Leftover intervals: greedy with availability, using static cand_cache.
         gcsa_log("[%s] leftover greedy...\n", label);
@@ -2323,6 +2333,10 @@ private:
         }
         auto t_left1 = Clock::now();
         gcsa_log("[%s] leftover done\n", label);
+        const size_t after_leftover = kept_count_;
+        gcsa_log("[%s] leftover:   |C| %zu -> %zu  (%.1f%% of original kept, -%zu)\n",
+                 label, after_dp, after_leftover, pct_kept(after_leftover),
+                 after_dp - after_leftover);
 
         // Phase II (reuses cand_cache either way).
         auto t_p2_0 = Clock::now();
@@ -2340,6 +2354,15 @@ private:
             run_phase2_local_(intervals, accepted, label, timing, &cand_cache);
         }
         auto t_p2_1 = Clock::now();
+        const size_t after_phase2 = kept_count_;
+        gcsa_log("[%s] phase II:   |C| %zu -> %zu  (%.1f%% of original kept, -%zu)\n",
+                 label, after_leftover, after_phase2, pct_kept(after_phase2),
+                 after_leftover - after_phase2);
+        gcsa_log(
+            "[%s] success: original |C|=%zu -- DP alone=%.1f%%, "
+            "+leftover=%.1f%%, +phase II=%.1f%% (of original kept)\n",
+            label, m0, pct_kept(after_dp), pct_kept(after_leftover),
+            pct_kept(after_phase2));
 
         if (timing) {
             auto ms = [](Clock::time_point a, Clock::time_point b) {
@@ -2386,6 +2409,11 @@ private:
         const bool timing = (std::getenv("GCSA_TIMING") != nullptr);
         const bool trace = (std::getenv("GCSA_TRACE_PFDP") != nullptr);
         auto t_all = Clock::now();
+        // See compress_tree_dp_'s m0/pct_kept for what this measures.
+        const size_t m0 = kept_count_;
+        auto pct_kept = [&](size_t kept) {
+            return 100.0 * (double)kept / (double)std::max<size_t>(1, m0);
+        };
 
         std::unordered_map<uint64_t, const Interval*> by_name;
         for (const auto& iv : intervals) by_name[iv.name] = &iv;
@@ -2627,6 +2655,10 @@ private:
                 accept_(c, accepted);
             }
         }
+        const size_t after_dp = kept_count_;
+        std::fprintf(stderr,
+            "[pseudoforest-dp] DP alone: |C| %zu -> %zu  (%.1f%% of original kept, -%zu)\n",
+            m0, after_dp, pct_kept(after_dp), m0 - after_dp);
 
         // Leftover: should be empty by construction (every |I_c|>=2 interval
         // is either a root or belongs to exactly one component above); kept
@@ -2648,9 +2680,22 @@ private:
             accept_(c, accepted);
         }
         std::fprintf(stderr, "[pseudoforest-dp] leftover done\n");
+        const size_t after_leftover = kept_count_;
+        std::fprintf(stderr,
+            "[pseudoforest-dp] leftover:  |C| %zu -> %zu  (%.1f%% of original kept, -%zu)\n",
+            after_dp, after_leftover, pct_kept(after_leftover), after_dp - after_leftover);
 
         // Phase II: same unpin/retarget fixed point as DepOrder/TreeDp.
         run_phase2_(intervals, accepted, "pseudoforest-dp", trace, timing, &cand_cache);
+        const size_t after_phase2 = kept_count_;
+        std::fprintf(stderr,
+            "[pseudoforest-dp] phase II:  |C| %zu -> %zu  (%.1f%% of original kept, -%zu)\n",
+            after_leftover, after_phase2, pct_kept(after_phase2),
+            after_leftover - after_phase2);
+        std::fprintf(stderr,
+            "[pseudoforest-dp] success: original |C|=%zu -- DP alone=%.1f%%, "
+            "+leftover=%.1f%%, +phase II=%.1f%% (of original kept)\n",
+            m0, pct_kept(after_dp), pct_kept(after_leftover), pct_kept(after_phase2));
 
         if (timing) {
             double ms = std::chrono::duration<double, std::milli>(Clock::now() - t_all).count();

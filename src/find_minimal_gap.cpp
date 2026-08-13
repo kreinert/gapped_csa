@@ -2,6 +2,7 @@
 // Search for a short DNA string + shape where dep-order |C| < greedy |C|.
 
 #include "compress.hpp"
+#include "random_dna.hpp"
 #include <algorithm>
 #include <iostream>
 #include <map>
@@ -40,14 +41,6 @@ static bool correct(const std::string& text, const std::string& shape, CompressA
     return true;
 }
 
-static std::string rand_dna(int n, std::mt19937_64& rng) {
-    static const char B[] = "ACGT";
-    std::uniform_int_distribution<int> d(0, 3);
-    std::string s(n, 'A');
-    for (int i = 0; i < n; ++i) s[i] = B[d(rng)];
-    return s;
-}
-
 int main() {
     std::vector<std::string> shapes = {
         "#.#", "##.#", "#.##", "#..#", "##.##", "###", "####", "#.#.#",
@@ -62,7 +55,7 @@ int main() {
     // 1) random short strings
     for (int n = 8; n <= 40; ++n) {
         for (int trial = 0; trial < 2000; ++trial) {
-            std::string t = rand_dna(n, rng);
+            std::string t = random_dna(n, rng);
             for (auto& sh : shapes) {
                 if ((int)sh.size() > n) continue;
                 size_t g = stored(t, sh, CompressAlgo::Greedy);
@@ -88,7 +81,7 @@ int main() {
     for (int mlen = 4; mlen <= 12 && best_n > 12; ++mlen) {
         for (int reps = 2; reps <= 8; ++reps) {
             for (int trial = 0; trial < 400; ++trial) {
-                std::string motif = rand_dna(mlen, rng);
+                std::string motif = random_dna(mlen, rng);
                 std::string t;
                 for (int i = 0; i < reps; ++i) t += motif;
                 for (auto& sh : shapes) {

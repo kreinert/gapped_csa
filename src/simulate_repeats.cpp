@@ -11,6 +11,8 @@
 //   ./simulate_repeats -x 50 -y 200 -o repeats.fasta
 //   ./simulate_repeats -x 100 -y 200 --seed 1 -o /tmp/rep.fasta
 
+#include "random_dna.hpp"
+
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -30,14 +32,6 @@ static void usage(const char* prog) {
         << "  --seed S      RNG seed (default: random_device)\n"
         << "  --header NAME FASTA header without '>' (default: repeats_x{X}_y{Y})\n"
         << "  --line-width W  wrap sequence every W columns; 0 = no wrap (default: 60)\n";
-}
-
-static std::string random_dna(size_t len, std::mt19937_64& rng) {
-    static const char bases[] = "ACGT";
-    std::uniform_int_distribution<int> d(0, 3);
-    std::string s(len, 'A');
-    for (size_t i = 0; i < len; ++i) s[i] = bases[d(rng)];
-    return s;
 }
 
 static void write_fasta(std::ostream& out, const std::string& header,
@@ -93,7 +87,7 @@ int main(int argc, char** argv) {
     if (!have_seed) seed = std::random_device{}();
     std::mt19937_64 rng(seed);
 
-    std::string motif = random_dna((size_t)motif_len, rng);
+    std::string motif = gcsa::random_dna((size_t)motif_len, rng);
     std::string seq;
     seq.reserve((size_t)reps * (size_t)motif_len);
     for (long i = 0; i < reps; ++i) seq += motif;
