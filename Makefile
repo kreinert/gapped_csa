@@ -2,7 +2,7 @@ CXX      ?= clang++
 CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -pthread
 INCLUDES := -Isrc
 
-BIN := validate gcsa bench_repetition simulate_repeats compare_algos ilp_baseline
+BIN := validate gcsa bench_repetition simulate_repeats simulate_random simulate_pangenome compare_algos ilp_baseline
 
 all: $(BIN)
 
@@ -17,6 +17,12 @@ bench_repetition: src/bench_repetition.cpp src/shape.hpp src/gapped_sa.hpp src/s
 
 simulate_repeats: src/simulate_repeats.cpp src/random_dna.hpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) src/simulate_repeats.cpp -o $@
+
+simulate_random: src/simulate_random.cpp src/random_dna.hpp
+	$(CXX) $(CXXFLAGS) $(INCLUDES) src/simulate_random.cpp -o $@
+
+simulate_pangenome: src/simulate_pangenome.cpp src/random_dna.hpp
+	$(CXX) $(CXXFLAGS) $(INCLUDES) src/simulate_pangenome.cpp -o $@
 
 compare_algos: src/compare_algos.cpp src/shape.hpp src/gapped_sa.hpp src/sais.hpp src/compress.hpp src/serialize.hpp src/random_dna.hpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) src/compare_algos.cpp -o $@

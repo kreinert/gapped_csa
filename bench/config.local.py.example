@@ -1,0 +1,19 @@
+# Copy this file to config.local.py (gitignored -- see .gitignore) to pin
+# your own paths for the benchmark suite. Only set what you need to
+# override; anything left commented out falls through to the matching
+# GCSA_BENCH_* environment variable, then to config.py's built-in default.
+#
+#   cp config.local.py.example config.local.py
+#   $EDITOR config.local.py
+
+# Where fetched/provided FASTAs live (real genomes, curated frequent-k-mer
+# region files, ...).
+# DATA_DIR = "/absolute/path/to/wherever/you/keep/the/benchmark/data"
+
+# Where the gcsa / simulate_* binaries are (usually the gapped_csa checkout
+# itself, i.e. one level up from bench/).
+# BIN_DIR = "/absolute/path/to/gapped_csa"
+
+# Scratch space for generated synthetic FASTAs (deleted after each run
+# unless --keep-synthetic is passed).
+# TMP_DIR = "/absolute/path/for/scratch"

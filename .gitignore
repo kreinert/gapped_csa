@@ -5,6 +5,8 @@
 /compare_algos
 /ilp_baseline
 /simulate_repeats
+/simulate_random
+/simulate_pangenome
 /dump_graph
 /find_minimal_gap
 *.o
@@ -31,3 +33,10 @@ external/
 /outp
 /table
 /ilp_____lp
+
+# benchmark suite output (run artifact, not source -- see bench/README.md)
+/bench/results/
+
+# per-machine paths for the benchmark suite -- never commit a real
+# filesystem path; see bench/config.local.py.example
+/bench/config.local.py
