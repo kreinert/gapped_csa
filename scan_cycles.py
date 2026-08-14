@@ -11,7 +11,7 @@ import re
 import subprocess
 import sys
 
-ALGOS = ["greedy", "dep-order", "tree-dp", "tree-dp2", "tree-dp3", "tree-dp4"]
+ALGOS = ["greedy", "dep-order", "tree-dp", "tree-dp3", "tree-dp4"]
 
 
 def heur(text, shape, want_opt):

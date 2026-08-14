@@ -54,14 +54,14 @@ make
 ./bench_repetition
 ./bench_repetition --min-rep 10 --max-rep 100 --step 10 --seed 1
 
-# Compare / choose compression heuristic (g / d / t / t2)
+# Compare / choose compression heuristic (g / d / t)
 ./compare_algos
 ./gcsa --algo greedy
 ./gcsa --algo dep-order
 ./gcsa --algo tree-dp             # preference-forest DP + Phase II
-./gcsa --algo tree-dp2            # same as tree-dp without Phase II
 ./gcsa --algo tree-dp3            # tree-dp + exact cluster LNS on top of Phase II
 ./gcsa --algo tree-dp4            # tree-dp + value-based cycle-edge repair (free)
+GCSA_DISABLE_PHASE2=1 ./gcsa --algo tree-dp -g /tmp/ex.fa -s "#.#"  # forest DP + leftover only (any --algo)
 GCSA_TRACE_DP=1  ./gcsa -g /tmp/ex.fa -s "#.#" --algo tree-dp
 GCSA_TIMING=1    ./gcsa -g genome.fasta -s "#####" --algo tree-dp   # stage timings
 GCSA_THREADS=8   ./gcsa -g genome.fasta -s "#####" --algo tree-dp   # parallel pref/DP (default=hw)
@@ -160,12 +160,13 @@ compression on a 180 kb repetitive input: `####.####` → **40% of the full SA**
 
 ## Limitations & research extensions
 
-- **Source selection**: six heuristics — `greedy`, `dep-order`, `tree-dp`
+- **Source selection**: five heuristics — `greedy`, `dep-order`, `tree-dp`
   (preference-forest DP KEEP vs COMPRESS, then Phase II unpin/retarget),
-  `tree-dp2` (same forest DP without Phase II), `tree-dp3` (same forest DP,
-  Phase II unpin/retarget followed by the exact cluster LNS below), and
-  `tree-dp4` (`tree-dp` plus cycle-edge repair below). Use
-  `./gcsa --algo <name>` or `./compare_algos`.
+  `tree-dp3` (same forest DP, Phase II unpin/retarget followed by the exact
+  cluster LNS below), and `tree-dp4` (`tree-dp` plus cycle-edge repair
+  below). `GCSA_DISABLE_PHASE2=1` runs any of these with the forest DP +
+  leftover greedy alone, no Phase II. Use `./gcsa --algo <name>` or
+  `./compare_algos`.
   Tree-dp preference enumeration and per-root forest DP are parallelized via
   `std::thread` (`GCSA_THREADS=N`, default=`hardware_concurrency`). Set
   `GCSA_TIMING=1` for per-phase ms (pref / forest / dp / accept / leftover /

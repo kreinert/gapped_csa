@@ -154,7 +154,7 @@ static void print_usage(const char* argv0) {
         << "  -s <shape>          gapped shape, e.g. \"#.#\" (default: #.#)\n"
         << "  -q <query>          query string to locate\n"
         << "  -r <reads.fasta>    locate every read in a FASTA\n"
-        << "  --algo <name>       greedy|dep-order|tree-dp|tree-dp2|tree-dp3|tree-dp4"
+        << "  --algo <name>       greedy|dep-order|tree-dp|tree-dp3|tree-dp4"
         << " (default: greedy)\n"
         << "  --max-add N         max differential offset (default: 8)\n"
         << "  --phase2-iters N    Phase II dirty-generation budget (default: "
@@ -162,6 +162,8 @@ static void print_usage(const char* argv0) {
         << "                      Phase II stops earlier at a fixed point. Applies to\n"
         << "                      dep-order and tree-dp. Precedence: this flag >\n"
         << "                      GCSA_PHASE2_MAX_ITERS > default.\n"
+        << "                      GCSA_DISABLE_PHASE2=1 skips Phase II entirely, for\n"
+        << "                      any --algo (e.g. to measure the forest DP alone).\n"
         << "  --min-coverage N|auto  Minimum rows a candidate must reroute to be\n"
         << "                      accepted (default: " << kMinCoverage << "). \"auto\" derives the\n"
         << "                      break-even coverage from the input length and\n"
@@ -205,12 +207,11 @@ int main(int argc, char** argv) {
             if (a == "greedy") algo = CompressAlgo::Greedy;
             else if (a == "dep-order" || a == "dep") algo = CompressAlgo::DepOrder;
             else if (a == "tree-dp" || a == "dp") algo = CompressAlgo::TreeDp;
-            else if (a == "tree-dp2" || a == "dp2") algo = CompressAlgo::TreeDp2;
             else if (a == "tree-dp3" || a == "dp3") algo = CompressAlgo::TreeDp3;
             else if (a == "tree-dp4" || a == "dp4") algo = CompressAlgo::TreeDp4;
             else if (a == "pseudoforest-dp" || a == "pf-dp" || a == "pfdp") algo = CompressAlgo::PseudoforestDp;
             else {
-                std::cerr << "--algo must be greedy|dep-order|tree-dp|tree-dp2|tree-dp3|tree-dp4|pseudoforest-dp\n";
+                std::cerr << "--algo must be greedy|dep-order|tree-dp|tree-dp3|tree-dp4|pseudoforest-dp\n";
                 return 1;
             }
         }

@@ -63,7 +63,8 @@
 //   TreeDp    – DP on the preference forest (strong cov>=kMinCoverage edges, |I_c|>2):
 //               for each source hub, choose KEEP vs COMPRESS knowing how
 //               dependents' costs change; then Phase II unpin/retarget.
-//   TreeDp2   – same as TreeDp but without Phase II (forest DP + accept + leftover).
+//               (GCSA_DISABLE_PHASE2=1 runs the forest DP + accept + leftover
+//               alone, without Phase II, on any algorithm below.)
 //   PseudoforestDp – DP on the *whole* preference graph (out-degree<=1, no
 //               cov/size threshold): tree components use the same KEEP vs
 //               COMPRESS recurrence; unicyclic components (e.g. a mutual
@@ -237,7 +238,6 @@ enum class CompressAlgo {
     Greedy,        // size-first, pin sources
     DepOrder,      // dependency-order + un-pin / retarget
     TreeDp,        // preference-forest DP (KEEP vs COMPRESS per hub) + Phase II
-    TreeDp2,       // same as TreeDp without Phase II
     TreeDp3,       // same as TreeDp with the cluster-LNS Phase II
     TreeDp4,       // same as TreeDp with value-based cycle repair in Phase I
     PseudoforestDp, // exact DP on the full out-degree<=1 preference graph
@@ -248,7 +248,6 @@ inline const char* algo_name(CompressAlgo a) {
         case CompressAlgo::Greedy:        return "greedy";
         case CompressAlgo::DepOrder:      return "dep-order";
         case CompressAlgo::TreeDp:        return "tree-dp";
-        case CompressAlgo::TreeDp2:       return "tree-dp2";
         case CompressAlgo::TreeDp3:       return "tree-dp3";
         case CompressAlgo::TreeDp4:       return "tree-dp4";
         case CompressAlgo::PseudoforestDp: return "pseudoforest-dp";
@@ -257,8 +256,9 @@ inline const char* algo_name(CompressAlgo a) {
 }
 
 // What compress_tree_dp_ runs after the forest DP + leftover greedy.
+// (There is no "skip Phase II" mode here: GCSA_DISABLE_PHASE2=1 already
+// covers that generically, for every algorithm, via run_phase2_ itself.)
 enum class Phase2Mode {
-    None,    // tree-dp2
     Greedy,  // tree-dp: dirty-set unpin/retarget
     Local,   // tree-dp3: exact cluster large-neighborhood search
 };
@@ -1982,8 +1982,9 @@ private:
     // KEEP (all ranks stored, children may compress against us) vs COMPRESS
     // (drop cov ranks via the preferred candidate; children lose that source).
     // Exact for |C| on this forest model; leftover names get an avail. greedy.
-    // phase2: which Phase II follows — none (TreeDp2), the dirty-set
-    // unpin/retarget (TreeDp), or the exact cluster LNS (TreeDp3).
+    // phase2: which Phase II follows — the dirty-set unpin/retarget (TreeDp)
+    // or the exact cluster LNS (TreeDp3). GCSA_DISABLE_PHASE2=1 skips
+    // whichever one runs, for any algo.
     //
     // Hot-path notes (large N):
     //   - Preference enum is independent per interval → GCSA_THREADS parallel.
@@ -2735,8 +2736,6 @@ private:
             compress_dep_order_(intervals, accepted);
         else if (algo_ == CompressAlgo::TreeDp)
             compress_tree_dp_(intervals, accepted, Phase2Mode::Greedy);
-        else if (algo_ == CompressAlgo::TreeDp2)
-            compress_tree_dp_(intervals, accepted, Phase2Mode::None);
         else if (algo_ == CompressAlgo::TreeDp3)
             compress_tree_dp_(intervals, accepted, Phase2Mode::Local);
         else if (algo_ == CompressAlgo::TreeDp4)
