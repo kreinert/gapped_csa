@@ -15,338 +15,83 @@
 \newtheorem{fact}{Fact}
 \newtheorem{claim}{Claim}
 
-\title{From weighted independent set to an exact pseudoforest DP:\\
-a derivation, and a comparison with Tree-DP}
-\author{}
-\date{}
+\title{PFDP}
+\author{Mete Minbay (and Claude)}
 
 \begin{document}
 \maketitle
 
-\begin{abstract}
-\noindent
-We derive an exact algorithm for the ``one differential candidate per
-shape'' restriction of the gapped-CSA compression problem, starting
-from the general weighted-independent-set formulation of exact
-compression and showing step by step why the general problem resists
-tractable structure, why restricting to \emph{preferred} candidates
-removes that obstruction, and why the resulting conflict graph is
-always a \emph{pseudoforest} (treewidth $\le 2$) rather than merely a
-forest. We give the resulting linear-time DP and compare it, on the
-existing running example, against the \texttt{Tree-DP} algorithm
-already implemented in \texttt{compress.hpp} and documented in
-\texttt{dep\_order\_walkthrough}. The two coincide on that example;
-we explain precisely why, and identify the structural situation in
-which they would diverge.
-\end{abstract}
+\section{Problem definition}
 
-\section{The exact objective}
+\subsection{The objective}
 
-Fix the gapped suffix array (GSA) of the LexText, with $m$ ranks
-grouped into LCP-intervals $I_c=[\ell_c,r_c)$ by first symbol
-(shape) $c$. A \textbf{candidate} is a triple $k=(T_k,S_k,a_k)$: a
-contiguous target run $T_k\subseteq I_c$ for some shape $c$, a
-contiguous source run $S_k$ disjoint from $I_c$, and a shift
-$a_k\in\{1,\dots,a_{\max}\}$, such that shifting every rank of $S_k$
-forward by $a_k$ symbols reproduces $T_k$ bijectively and in order
-(the alignment condition of the walkthrough, \S1.3). Write
-$\mathrm{cov}(k)=|T_k|$.
+Fix the suffix array $I$ of the text, and let $m = |I|$ denote the number of rows in $I$. For a word $w$, let $I_w = [\ell _w, r_w)$ denote the maximal LCP-interval in $I$ such that every suffix in $I_w$ starts with $w$. At a high level, we would like to prune $I$ by finding contiguous rows whose positions in the text can be recreated by adding a constant offset to the positions of a different contiguous window (in which case the former row range can be deleted and replaced with a constant-size hash entry denoting "this row range is deleted; fetch the positions of this other range and add this offset instead").
 
-Compressing means choosing a set of candidates $X\subseteq\mathcal C$
-to \emph{accept}. A rank is dropped from the stored array $C$ iff it
-lies in $T_k$ for some accepted $k$; $|C| = m - \sum_{k\in X}
-\mathrm{cov}(k)$. Two constraints make $X$ valid:
+Towards this goal, a \textbf{candidate} is a triple $k = (T_k , S_k, a_k)$: a contiguous target interval $T_k \subseteq I_w$ of some word $w$, a contiguous source interval $S_k \subseteq I_{w'}$ of another word $w'$, and a shift $a_k \in [a_{max}]$ such that the $a_k$-th suffix of the suffices in $S_{w'}$ reconstruct the suffices in $T_w$ in order. In terms of compression, accepting a candidate $k$ reduces $m$ by deleting the rows $T_k$ and instead reconstructing their positions via adding a shift $a_k$ to every position in $S_k$. Let $U$ denote the universe of all candidates, and $\mathrm{cov}(k)=|T_k|$ denote the number of rows that are to be deleted when a candidate $k$ is accepted. Under a subset of accepted candidates $X \subseteq U$, the resulting size of $I$ becomes
+\[
+    m - \sum_{k \in X} \mathrm{cov}(k)
+\]
 
+Assuming that the space usage of our $k$-mer lookup structure increases monotonically with the number of remaining rows \footnote{
+    This assumption is not completely accurate: Since every accepted candidate increases the number of hash table entries, accepting many small-coverage candidates can cause the HT index to take up extra space that outweigh the space savings of the accepted candidates.
+}
+, the objective is to find a subset of consistent candidates that minimize the above expression.
+
+\subsection{The constraints}
+
+Accepted candidates are subject to the following constraints:
 \begin{itemize}
-\item \textbf{Target-disjointness}: every rank lies in $T_k$ for at
-  most one accepted $k$ (a rank can be recovered from only one
-  place).
-\item \textbf{Source-integrity}: if $k\in X$, no rank of $S_k$ may lie
-  in $T_{k'}$ for any $k'\in X$ (a source must be physically stored,
-  not itself virtual — this is exactly what \texttt{run\_kept\_}
-  checks before an accept).
+    \item \textbf{One reference per word}: After the suffix array is compressed, constant-time lookup of words is achieved with a hash table that stores the \emph{real} and the \emph{referenced} occurrences of a word. Every word can have at most one entry of each kind. Therefore, candidates $k$ and $k'$ cannot be accepted simultaneously if $T_k, T_{k'} \subseteq I_w$ for some $w$.
+    \item \textbf{Source-integrity}: If a row range $T_k$ has been deleted to reference another range $S_k$, the source range $S_k$ cannot be deleted. Therefore, candidates $k$ and $k'$ cannot be accepted simultaneously if $S_k \cap T_{k'} \neq \emptyset$.
 \end{itemize}
 
-So exact compression is
-\[
-\max_{X\subseteq\mathcal C \text{ independent}} \sum_{k\in X}
-\mathrm{cov}(k)
-\]
-in the conflict graph $G=(\mathcal C,E)$ where $\{k,k'\}\in E$ iff
-$T_k\cap T_{k'}\ne\emptyset$ or $S_k\cap T_{k'}\ne\emptyset$ or
-$S_{k'}\cap T_k\ne\emptyset$. This is weighted maximum independent
-set (equivalently weighted set packing) on $G$.
+\subsection{Maximum weighted independent set}
 
-\section{Why the general problem resists tractable structure}
+Consider a graph $G$ where the vertices are the candidates and two candidates are connected if they cannot be accepted together due to the listed constraints, formally $V(G) = U$ and $E(G) = \{(k, k'): \exists w( T_k, T_{k'} \subseteq I_w) \lor S_k \cap T_{k'} \neq \emptyset \}$. Let the weight of each vertex be $w(k) :=\mathrm{cov}(k)$. Maximizing the number of deleted rows is equivalent to finding a maximum weighted independent set (MWIS) of $G$.
 
-\subsection{Generic hardness}
-Weighted independent set is NP-hard on general graphs, and even the
-decision version (``is there an independent set of size $\ge
-\kappa$?'', parameterized by $\kappa$) is W[1]-complete — so no
-$f(\kappa)\cdot n^{O(1)}$ algorithm is expected regardless of how the
-parameter is chosen. This says nothing by itself about \emph{our}
-$G$, which is far from arbitrary; the question is whether $G$'s
-specific structure escapes this.
+\section{The method}
 
-\subsection{Per-shape cliques are not bounded by $a_{\max}$}
-Under the storage format actually implemented (\texttt{HashEntry}
-holds one $H_{\mathrm{offset}}$), at most one candidate may be
-accepted per shape, so all candidates targeting the same $I_c$
-mutually conflict — a clique. A treewidth lower bound is (clique
-size $-1$), and the clique size for one shape is not simply
-$a_{\max}$: for a fixed $a$, \texttt{enumerate\_candidates\_} can
-still emit several disjoint maximal runs, so a shape's total
-candidate count can scale with $a_{\max}\times|I_c|$ in the worst
-case. The single-slot storage restriction is therefore already
-enough to make the raw conflict graph impractical to decompose.
+\subsection{Overview}
 
-\subsection{Laminarity of ranges does not make $G$ a tree}
-\label{sec:laminar}
-Every $S_k$ and $T_k$ is (or extends to) an LCP-interval: $S_k$ is
-built from a maximal run with $\mathrm{LCP}\ge a_k+1$, and because
-prepending symbols preserves relative order, its image $T_k$ shares
-that same extended common prefix, hence is itself an LCP-interval.
-LCP-intervals are exactly the internal nodes of the suffix tree, and
-any two of them are either disjoint or nested — never partially
-overlapping (a standard suffix-tree fact: sharing a longer prefix is
-a strictly stronger, all-or-nothing condition than sharing a shorter
-one, so if two prefix-classes intersect at all, the deeper one is
-wholly contained in the shallower one). One might hope this makes
-$G$ itself tree-shaped. It does not, and it is worth seeing exactly
-why, since the gap is instructive.
+Finding a MWIS admits a polynomial time dynamic programming algorithm on trees, but is NP-hard on general graphs. It is easy to see that the conflict graphs of our instances are not trees: Since every word can have $\leq 1$ accepted candidate, multiple candidates belonging to the same word are already modeled as a clique. Solving the problem exactly is therefore unlikely unless the LCP-intervals give the graph some structure to be exploited.
 
-A candidate is not a single point in this hierarchy — $S_k$ and
-$T_k$ are \emph{disjoint}, hence incomparable, so a candidate is a
-cross-link between two unrelated branches of the tree. Laminarity
-constrains any two intervals that intersect \emph{each other}; it
-places no constraint across three or more independently-chosen
-cross-links. Concretely, nothing prevents three candidates
-$k_1,k_2,k_3$ in unrelated parts of the tree with $S_{k_1}\subseteq
-T_{k_2}$, $S_{k_2}\subseteq T_{k_3}$, $S_{k_3}\subseteq T_{k_1}$ —
-three independent containments chained into a genuine 3-cycle in
-$G$, with no pairwise relationship required between, say, $T_{k_1}$
-and $T_{k_2}$ themselves. So the raw candidate conflict graph can
-contain cycles that have nothing to do with the interval hierarchy
-being non-tree-shaped; laminarity of the \emph{ranges} does not
-transfer to tree-shapedness of the \emph{conflict graph over
-candidates}.
+The main idea of PFDP is to heuristically sparsify the candidate space, then exactly solve the problem on the remaining candidates using dynamic programming.
 
-\section{Restricting to one candidate per shape}
+\subsection{Prerequisite: MWIS on trees}
 
-\subsection{Definition}
-For each shape $c$ with a candidate of coverage $\ge 2$, keep only
-its \textbf{preferred} candidate — maximum coverage, ties broken by
-larger $a$ (exactly the notion already used to build the DepOrder
-preference DAG and the Tree-DP forest, \S2 of the walkthrough), with
-\emph{no further threshold}. This yields at most one candidate node
-per shape.
+The MWIS of a tree $G = (V, E)$ can be computed exactly with dynamic programming as follows. Let $r \in V$ be the root of $G$, and for any vertex $v \in V$ let $C(v) \subseteq V$ denote the children of $v$. Define $A[v]$ as the MWIS of the \emph{subtree rooted at v} where $v$ is fixed to be part of the independent set. Define $B[v]$ analogously but fix $v$ not to be part of the independent set. The MWIS is then $\max \{A[r], B[r]\}$. The recursion carries out as follows:
+\begin{align*}
+    A[v] &= w(v)+ \sum_{u \in C(v)}B[u] \\
+    B[v] &= 0 + \sum_{u \in C(v)}\max \left\{ A[u], B[u]\right\}
+\end{align*}
+(Intuitively, fixing $v$ to be part of the solution forces the children not to be part of the solution. Fixing $v$ not to be in the solution has no constraints on the children. Notice the summation term does not exist for leaves so they serve as base cases)
 
-\subsection{The clique disappears}
-Since each shape now has a single candidate (or none), there is
-nothing left to form a clique out of: the decision per shape is
-binary, ``accept my one preferred candidate or not,'' contributing a
-domain of size 2 rather than a clique of unbounded size. This is the
-standard fix for a ``choose-one-of-many'' clique: model it as one
-variable with a domain, not as many mutually-exclusive nodes.
+There are $2n$ subproblems to solve, and each subproblem compares sums up many cases as the number of neighbors of the associated vertex. This already bounds the running time at $\mathcal{O}(n^2)$, but notice that every non-root vertex only appears as a summand once. Thus the total number of additions is also bounded linearly and the total running time is $\mathcal{O}(n)$.
 
-\begin{fact}[Out-degree $\le 1$]
-\label{fact:outdeg}
-A candidate's source lies entirely inside exactly one other shape's
-interval.
-\end{fact}
-\begin{proof}
-$S_k$ has $\mathrm{LCP}\ge a_k+1\ge 2$ throughout, so every rank of
-$S_k$ shares its own first symbol (position $0$) with every other
-rank of $S_k$ — i.e.\ all of $S_k$ lies in a single $I_w$.
-\end{proof}
+\subsection{Sparsifying the graph}
 
-So, viewing ``shape $c$ conflicts with shape $w$'' as a directed edge
-$c\to w$ whenever $c$'s preferred candidate's source lies in $I_w$,
-every node has out-degree $\le 1$. As an undirected graph this is a
-\textbf{pseudoforest}: each connected component has at most as many
-edges as nodes, hence contains at most one cycle (a
-\emph{unicyclic} component), with trees hanging off it. Pseudoforests
-have treewidth $\le 2$.
+For some word $w$, define its candidates $K_w = \{ k: T_k \subseteq I_w\}$ as the candidates that propose deleting rows of $I_w$. We define the \emph{preferred} candidate $k_w \in K_w$ to be the one with the highest coverage (ties broken in favor of larger $a_k$)
+\footnote{
+    The preference rule is a heuristic aiming to delete the largest number of rows per word. Different rules may provide better results.
+}. 
+Let $U' \subseteq U$ be the universe restricted to preferred candidates, and consider the arising conflict graph $G'$.
 
-\subsection{Rank-awareness only sparsifies further}
-An edge $c\to w$ in the preference graph is necessary but not
-sufficient for a genuine conflict: $c$'s own preferred candidate
-covers a specific sub-run of $I_c$'s own ranks, and $w$'s preferred
-candidate (if $w=c$'s source) needs a specific sub-run of $I_w$'s
-ranks; these only actually collide if the required ranks overlap
-(the "GC \textbf{SKIP}" step of the walkthrough's Phase I is exactly
-an instance where they did collide). Checking real overlap can only
-\emph{delete} edges from the preference graph, never add new ones —
-a shape can never conflict with another shape it had no preference
-relationship with in the first place. So the true, rank-aware
-conflict graph is a subgraph of the preference graph, hence still a
-pseudoforest. The rank check makes the instance easier, never harder.
+There are no conflicts between candidates targeting the same word, because the graph has been restricted to a single candidate targeting each word. So the only conflicts on this graph are arising from source-target intersections. Consider directing the edges of the graph such that there is an edge $k \rightarrow k'$ if the source of $k$ intersects the target of $k'$. Under this orientation, every vertex has at most one outgoing edge: Any two candidates whose targets intersect with the source of $k$ must be targeting the same word (due to the disjointness of LCP intervals), but there can only be candidate targeting each word. The resulting graph is therefore a \emph{pseudoforest}: Every component with $t$ vertices has exactly $t$ edges.
 
-\section{An exact linear-time algorithm}
+\subsection{MWIS on pseudoforests}
 
-Because the true conflict graph is a pseudoforest, weighted maximum
-independent set is solvable exactly, in linear time, with no
-appeal to generic treewidth machinery.
+A pseudoforest consists of \emph{pseudotrees}, which are trees with an additional edge (that creates exactly one cycle). The MWIS algorithm for trees can be adapted for pseudoforests by fixing a cycle node and branching on its inclusion in the independent set. Specifically, let $P$ be a pseudoforest and $v \in V(P)$ be a cycle node, and let $N[v]$ denote the neighbors of $v$. There are two cases: \begin{itemize}
+    \item If $v$ is in the solution: $\mathrm{MWIS}(P) = w(v) + \mathrm{MWIS}(P - \left(\{v\} \cup N[v] \right))$
+    \item If $v$ is not in the solution: $\mathrm{MWIS}(P) = 0 + \mathrm{MWIS}(P - \{v\})$.
+\end{itemize}
+Notice that removing $v$ already destroys the cycle and leaves behind a forest, so the smaller subproblems of either case can be solved exactly in $\mathcal{O}(n)$ time. The overall running time is therefore $\mathcal{O}(n)$.
 
-\paragraph{Tree parts.} For a node $v$ with children $\mathrm{ch}(v)$
-(shapes whose preferred source is $v$), and a boolean
-$\mathit{src\_ok}$ recording whether $v$'s own preferred source is
-currently available to it, define
-\[
-\mathrm{DP}(v,\mathsf{true}) = \min\Big(
-\underbrace{\mathrm{isize}(v) + \!\!\sum_{w\in\mathrm{ch}(v)}\!\! \mathrm{DP}(w,\mathsf{true})}_{\text{KEEP}},\;\;
-\underbrace{\big(\mathrm{isize}(v)-\mathrm{cov}(v)\big) + \!\!\sum_{w\in\mathrm{ch}(v)}\!\! \mathrm{DP}(w,\mathsf{false})}_{\text{COMPRESS}}
-\Big),
-\]
-\[
-\mathrm{DP}(v,\mathsf{false}) = \mathrm{isize}(v) + \sum_{w\in\mathrm{ch}(v)} \mathrm{DP}(w,\mathsf{true}) \qquad
-(\text{COMPRESS forbidden: forced KEEP}).
-\]
-This is exactly the KEEP/COMPRESS recurrence already implemented for
-Tree-DP (\S{}\emph{KEEP versus COMPRESS} of the walkthrough) — nothing
-new is needed for the tree portions of the pseudoforest.
+\subsection{Leftover phase}
 
-\paragraph{Cyclic parts.} A component with one cycle
-$v_1\to v_2\to\cdots\to v_L\to v_1$ (each $v_i$'s preferred source is
-$v_{i+1}$, indices mod $L$) plus trees hanging off each $v_i$ cannot
-be handled by the tree recurrence alone, because ``is $v_i$'s source
-available'' depends circularly on whether $v_{i+1}$ is kept, which
-depends on whether $v_{i+2}$ is kept, \dots, back to $v_i$. This is
-solved by the standard fold-the-cycle trick: fix the decision for
-$v_1$ (KEEP or COMPRESS), which breaks the circular dependency and
-turns the rest of the cycle into a path; run the tree/path recurrence
-under that fixed assumption; take the better of the two fixings. This
-is $O(L)$ per cyclic component (each is small in practice — a mutual
-pair, as with CT/GC, is the typical case) and exact: no candidate
-information is discarded, unlike dropping an edge to force
-acyclicity.
+After one pass of the DP algorithm on the preferred candidates, some words end up with no accepted candidates because their preferred candidate was not part of the DP solution. Such words may have had other (non-preferred) candidates that do not conflict with the DP solution, but these candidates were eliminated in the sparsification phase and therefore were not considered yet. These candidates are accounted for with a singular greedy pass. After the DP solution is finalized, all candidates are revisited in decreasing order of coverage and added to the solution if they do not conflict with what is already in the solution.
 
-\paragraph{Complexity.} Every shape appears in exactly one component;
-tree parts are $O(1)$ amortized work per node, cyclic parts are
-$O(L)$ per component with $\sum L = O(\#\text{shapes})$. The whole
-pass is $O(N)$, matching Tree-DP's own complexity, with strictly more
-of the instance solved exactly (no filtering, no arbitrary
-edge-dropping) and no ad hoc thresholds.
+\subsection{IDEA: Iterative DP}
 
-\section{Worked check: does this match the running example?}
-
-On $T=(\mathtt{GCCTTTAAAG})^3$, $S=\texttt{\#.\#}$, the preference
-graph (no $\mathrm{cov}\ge 3$ filter, no $|I_c|>2$ filter) is exactly
-the mutual pair $\mathrm{CT}\leftrightarrow\mathrm{GC}$ with leaves
-$\mathrm{AG},\mathrm{TA}$ hanging off CT and $\mathrm{AA},\mathrm{TT}$
-hanging off GC — a single unicyclic component ($L=2$) with four
-tree leaves attached. Folding the 2-cycle by fixing CT's decision:
-
-\begin{center}
-\small
-\begin{tabular}{@{}p{4.4cm}p{5.3cm}p{4.6cm}@{}}
-\toprule
-fix & feasible? & total kept (CT,GC,leaves) \\
-\midrule
-CT KEEP, GC KEEP & yes & $6+5+0+0+0+0=11$ \\
-CT COMPRESS (via GC), GC KEEP & yes, but AG/TA lose CT as a source &
-  $4+5+5+6+0+0=25$ \\
-CT KEEP, GC COMPRESS (via CT) & yes, but AA/TT lose GC as a source &
-  $6+3+0+0+3+3=15$ \\
-CT COMPRESS, GC COMPRESS & \textbf{infeasible} &
-  each needs the other kept as its source \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-The minimum is $11$ (both kept), giving $|C|=11+3\text{ singletons}
-=14$ — identical to both DepOrder and Tree-DP. This is not a
-coincidence special to the algorithm; it is because, on this
-instance, keeping both hubs genuinely is the cost-minimizing choice
-by the numbers, so every method that correctly evaluates ``keep
-both'' as an option lands on it.
-
-\section{Comparison with Tree-DP}
-
-\begin{center}
-\small
-\begin{tabular}{@{}p{3.1cm}p{5.5cm}p{5.7cm}@{}}
-\toprule
- & \textbf{Tree-DP} (implemented) & \textbf{Pseudoforest DP} (this note) \\
-\midrule
-Candidate universe &
-  preferred candidate per shape, restricted to $|I_c|>2$ and
-  forest edges with $\mathrm{cov}\ge 3$ &
-  preferred candidate per shape, every shape with
-  $\mathrm{cov}\ge 2$ (the base validity threshold used everywhere
-  else) \\
-Graph shape &
-  \emph{forced} acyclic: an edge is dropped outright
-  (\texttt{reaches()} check) whenever adding it would close a
-  cycle, in \texttt{unordered\_map} iteration order &
-  pseudoforest \emph{as it naturally occurs}: cyclic components are
-  solved exactly by folding, never by discarding an edge \\
-Handling of a genuine mutual/cyclic preference &
-  one direction is silently dropped; which one depends on hash
-  iteration order, not on which choice is better &
-  both directions are weighed against each other explicitly (the
-  four-row table above), and the correct one is kept \\
-Special-casing &
-  roots need an extra check (``is the preferred source outside my
-  own subtree'') to patch exactly the case where a self-referential
-  edge was dropped &
-  no special case: the cycle-folding step handles this uniformly for
-  every node, root or not \\
-Nodes with only a weak ($\mathrm{cov}=2$) or small ($|I_c|\le 2$)
-preference &
-  never enter the DP; resolved later by the size-ordered leftover
-  greedy pass &
-  enter the DP like any other node; resolved exactly, subject to the
-  same pseudoforest structure \\
-Complexity &
-  $O(N)$ &
-  $O(N)$ \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-\subsection{When do they actually diverge?}
-They provably compute the \emph{same} answer whenever the preference
-graph, restricted to $\mathrm{cov}\ge 3$ edges among $|I_c|>2$
-shapes, happens to already be acyclic — which is exactly the case on
-the running example, since the only cyclic pair (CT, GC) has
-coverage $2$ on \emph{both} directions and is filtered out by
-Tree-DP's own threshold before the cycle-avoidance logic is even
-exercised. The two methods have not yet been distinguished by this
-instance; they happen to agree because the instance's one cycle is
-weak enough to be invisible to Tree-DP's filter.
-
-They would diverge on an instance where a genuine
-$\mathrm{cov}\ge 3$ cycle exists among the preferred candidates —
-e.g.\ three shapes $A,B,C$ each preferring the next
-($A\!\to\!B\!\to\!C\!\to\!A$, all coverage $\ge 3$) with different,
-possibly asymmetric leaf coverage hanging off each. Tree-DP would
-keep two of the three edges (whichever survive \texttt{reaches()} in
-whatever order \texttt{prefs} happens to iterate) and force the third
-node to KEEP outright without ever weighing it against the
-alternative, whereas the cycle-folding DP evaluates all $L$ ways of
-breaking a length-$L$ cycle and provably picks the best one. Tree-DP's
-answer in that case would be a valid but not necessarily optimal
-point in the same search space; whether it actually loses anything
-depends on which edge iteration order happens to drop, which is
-incidental to the algorithm rather than a designed choice.
-
-\section{Scope and what remains heuristic}
-
-Both methods are exact only for the \textbf{restricted} search space
-of ``one candidate per shape, and only its most-preferred one.'' Real
-compression sometimes benefits from a shape accepting a
-\emph{non}-preferred (lower individual coverage) candidate because it
-is more compatible with its neighbors — this is precisely what the
-shared Phase II unpin/retarget pass chases heuristically, in both
-Tree-DP and DepOrder, and is not addressed by either DP. Extending
-exactness to that larger candidate universe reintroduces the
-obstructions of \S3 (per-shape cliques of unbounded size, and
-conflict cycles unrelated to the interval hierarchy) and remains
-open. What this note establishes is that the \emph{first-order}
-approximation — one candidate per shape — was already exactly
-solvable all along, in the same asymptotic time Tree-DP spends
-approximating it, simply by folding rather than discarding the one
-place where the preference graph can loop back on itself.
+Instead of applying the DP once on preferred candidates and immediately applying the greedy pass on leftover candidates, we can apply the DP iteratively. After the first application, we fix the set of accepted candidates and extract a second set of preferences that do not conflict with the fixed solution. We can then apply DP on this second set and add the new solution to the fixed solution, and repeat this process until no more candidates can be extracted.
 
 \end{document}
