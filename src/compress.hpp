@@ -2450,6 +2450,52 @@ private:
         auto has_pref = [&](uint64_t n) { return prefs.count(n) != 0; };
         auto pref_src = [&](uint64_t n) { return prefs.at(n).src_name; };
 
+        // ---- rank-aware conflict check -------------------------------------
+        // A preference edge v -> w (v's source lies in I_w) is drawn once
+        // v's preferred candidate is picked; that only records *which
+        // interval* the source falls in. It does NOT mean every compress of
+        // w threatens v: w's own compress only drops its specific covered
+        // set T_{pref(w)} subset I_w, and v's source is the specific range
+        // S_{pref(v)} subset I_w. The two can easily be disjoint, in which
+        // case w compressing does not touch v's source at all. Two names
+        // sharing an interval is not itself a conflict -- only these two
+        // concrete rank ranges actually overlapping is. GCSA_PFDP_RANK_AWARE=0
+        // restores the old, coarser rule ("w compresses" alone blocks v,
+        // regardless of overlap), matching compress_tree_dp_'s behaviour.
+        const bool rank_aware = [] {
+            const char* e = std::getenv("GCSA_PFDP_RANK_AWARE");
+            return !e || std::atoi(e) != 0;
+        }();
+        std::unordered_map<uint64_t, bool> conflict_cache;
+        // Does v's own source range collide with v's source's own covered
+        // set, i.e. could v's source *actually* be clobbered if v's source
+        // compresses? False means v is safe to compress no matter what its
+        // source does.
+        auto ranges_conflict = [&](uint64_t v) -> bool {
+            if (!rank_aware) return true;   // legacy: always assume a conflict
+            auto cit = conflict_cache.find(v);
+            if (cit != conflict_cache.end()) return cit->second;
+            bool conflict = false;
+            auto pit = prefs.find(v);
+            if (pit != prefs.end()) {
+                auto sit = prefs.find(pit->second.src_name);
+                if (sit != prefs.end()) {
+                    // v's own source range vs its source's own covered set
+                    // (both fixed once preferences are computed, so this is
+                    // knowable statically -- no need to inspect the actual
+                    // accept-time removed_/pin_count_ arrays here).
+                    const Candidate& vc = pit->second.cand;
+                    const std::vector<int32_t>& covered = sit->second.cand.covered;
+                    auto lo = std::lower_bound(covered.begin(), covered.end(), vc.src_lo);
+                    conflict = (lo != covered.end() && *lo < vc.src_hi);
+                }
+                // else: v's source has no preference of its own, so it can
+                // never compress -- nothing to conflict with.
+            }
+            conflict_cache.emplace(v, conflict);
+            return conflict;
+        };
+
         // ---- pure graph decomposition: find every cycle up front ----------
         // (independent of the DP; identifies exactly which single incoming
         // edge per cycle node is "cycle-internal" so it can be excluded from
@@ -2534,7 +2580,8 @@ private:
             if (src_ok && has_pref(v)) {
                 can_comp = true;
                 long long cc = isize(v) - prefs.at(v).cand.coverage();
-                for (uint64_t w : ch) cc += solve(w, /*src_ok=*/false).cost;
+                for (uint64_t w : ch)
+                    cc += solve(w, /*src_ok=*/!ranges_conflict(w)).cost;
                 cost_comp = cc;
             }
 
@@ -2550,7 +2597,8 @@ private:
             Cell cell = solve(v, src_ok);
             if (cell.compress) {
                 chosen[v] = prefs.at(v).cand;
-                for (uint64_t w : children[v]) apply(w, /*src_ok=*/false);
+                for (uint64_t w : children[v])
+                    apply(w, /*src_ok=*/!ranges_conflict(w));
             } else {
                 for (uint64_t w : children[v]) apply(w, /*src_ok=*/true);
             }
@@ -2571,29 +2619,36 @@ private:
             {
                 bool avail = true;   // cyc[0] is available
                 for (int i = L - 1; i >= 1; --i) {
-                    Cell cell = solve(cyc[i], avail);
+                    bool src_ok_i = avail || !ranges_conflict(cyc[i]);
+                    Cell cell = solve(cyc[i], src_ok_i);
                     costA += cell.cost;
                     statusA[i] = cell.compress ? 0 : 1;
                     avail = (statusA[i] == 1);
                 }
             }
 
-            // Scenario B: cyc[0] forced COMPRESS -> cyc[1] forced KEEP (must
-            // be physically stored for cyc[0] to point at). Walk the rest of
-            // the cycle from cyc[L-1] with cyc[0] unavailable.
+            // Scenario B: cyc[0] forced COMPRESS. Walk the rest of the ring
+            // from cyc[L-1] down to cyc[1] with cyc[0] unavailable as a
+            // source. cyc[1] is special only in that it also sits on the
+            // *other* end of the fixed cyc[0]->cyc[1] edge: cyc[0]
+            // compressing bars cyc[1] from compressing only if their two
+            // concrete rank ranges actually collide (ranges_conflict(cyc[0])
+            // -- cyc[0]'s source range vs cyc[1]'s own covered set); when
+            // rank-aware and disjoint, cyc[1] is otherwise gated normally by
+            // its own source (cyc[2], or cyc[0] again when L==2, via the
+            // same `avail` chain the rest of the ring uses).
             long long costB = isize(cyc[0]) - prefs.at(cyc[0]).cand.coverage();
-            for (uint64_t w : children[cyc[0]]) costB += solve(w, false).cost;
-            {
-                long long cyc1_keep = isize(cyc[1]);
-                for (uint64_t w : children[cyc[1]]) cyc1_keep += solve(w, true).cost;
-                costB += cyc1_keep;
-            }
+            for (uint64_t w : children[cyc[0]])
+                costB += solve(w, /*src_ok=*/!ranges_conflict(w)).cost;
             std::vector<char> statusB(L, 1);
             statusB[0] = 0;
             {
-                bool avail = false;  // cyc[0] unavailable
-                for (int i = L - 1; i >= 2; --i) {
-                    Cell cell = solve(cyc[i], avail);
+                const bool cyc1_blocked_by_anchor = ranges_conflict(cyc[0]);
+                bool avail = false;  // cyc[0] compresses: unavailable to cyc[L-1]
+                for (int i = L - 1; i >= 1; --i) {
+                    bool src_ok_i = avail || !ranges_conflict(cyc[i]);
+                    if (i == 1 && cyc1_blocked_by_anchor) src_ok_i = false;
+                    Cell cell = solve(cyc[i], src_ok_i);
                     costB += cell.cost;
                     statusB[i] = cell.compress ? 0 : 1;
                     avail = (statusB[i] == 1);
@@ -2612,7 +2667,8 @@ private:
                 uint64_t v = cyc[i];
                 if (status[i] == 0) {
                     chosen[v] = prefs.at(v).cand;
-                    for (uint64_t w : children[v]) apply(w, /*src_ok=*/false);
+                    for (uint64_t w : children[v])
+                        apply(w, /*src_ok=*/!ranges_conflict(w));
                 } else {
                     for (uint64_t w : children[v]) apply(w, /*src_ok=*/true);
                 }
