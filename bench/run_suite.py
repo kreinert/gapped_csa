@@ -99,10 +99,11 @@ def gzip_ratio(path: Path) -> "tuple[int, int, float]":
 
 def resolve_path(name: str, by_name: dict, bin_dir: Path, data_dir: Path,
                   tmp_dir: Path, cache: dict, log) -> "Path | None":
-    """Resolve one dataset name to a local FASTA path, generating/checking
-    as its `kind` requires. Memoized in `cache` so a synthetic dataset that
-    other datasets reference via "@name" (the pangenome entries reference
-    "@ecoli_k12") is only resolved once per run."""
+    """Resolve one dataset name to a local FASTA path, generating/checking/
+    concatenating as its `kind` requires. Memoized in `cache` so a dataset
+    referenced via "@name" by others (e.g. "@ecoli_k12", used by both the
+    simulated pangenome sweep and the real-strain concat entry) is only
+    resolved once per run."""
     if name in cache:
         return cache[name]
     ds = by_name.get(name)
@@ -155,6 +156,26 @@ def resolve_path(name: str, by_name: dict, bin_dir: Path, data_dir: Path,
                     log(f"[skip] {name}: generator failed: {r.stderr.strip()}")
                 else:
                     path = out_path
+
+    elif ds["kind"] == "concat":
+        parts = []
+        ok = True
+        for ref in ds["refs"]:
+            ref_name = ref[1:] if isinstance(ref, str) and ref.startswith("@") else ref
+            p = resolve_path(ref_name, by_name, bin_dir, data_dir, tmp_dir, cache, log)
+            if p is None:
+                log(f"[skip] {name}: reference {ref} could not be resolved")
+                ok = False
+                break
+            parts.append(p)
+        if ok:
+            out_path = tmp_dir / f"{name}.fasta"
+            with open(out_path, "wb") as fout:
+                for p in parts:
+                    with open(p, "rb") as fin:
+                        fout.write(fin.read())
+                    fout.write(b"\n")  # guard against a missing trailing newline
+            path = out_path
 
     else:
         log(f"[skip] {name}: unknown kind {ds['kind']!r}")
@@ -282,7 +303,7 @@ def main():
                         writer.writerow(row)
                         fcsv.flush()
 
-            if by_name[ds["name"]]["kind"] == "synthetic" and not args.keep_synthetic:
+            if by_name[ds["name"]]["kind"] in ("synthetic", "concat") and not args.keep_synthetic:
                 path.unlink(missing_ok=True)
 
     print(f"wrote {out_csv}")

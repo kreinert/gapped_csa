@@ -4,14 +4,21 @@ datasets.py.
 
 Nothing this script writes is committed: everything lands under --data-dir
 (see config.py for how that's resolved -- gapped_csa/.gitignore also
-excludes *.fasta repo-wide as a second line of defense). Re-running is a
-no-op once a dataset is cached; use --force to re-download.
+excludes *.fasta repo-wide as a second line of defense).
+
+Re-running does NOT re-download once a dataset is cached, but it DOES
+re-verify: the cached file's sha256 is recomputed and checked against
+whatever's pinned in datasets.py, every time. That's the answer to "how do
+I check the hashes I just pinned are right" -- just run this again with no
+flags. Use --force to actually re-download instead of only re-hashing.
 
 Usage:
-  ./fetch_data.py                        # fetch/verify everything
+  ./fetch_data.py                        # verify everything already cached
+                                          # (fetch whatever isn't cached yet)
   ./fetch_data.py --only ecoli_k12       # just one
-  ./fetch_data.py --print-hash ecoli_k12 # fetch, then print the sha256 to
-                                          # pin in datasets.py
+  ./fetch_data.py --print-hash ecoli_k12 # fetch/verify, then print the
+                                          # sha256 to pin in datasets.py
+  ./fetch_data.py --force                # re-download + re-verify everything
 """
 import argparse
 import gzip
@@ -33,11 +40,39 @@ def sha256_of(path: Path) -> str:
     return h.hexdigest()
 
 
-def fetch_one(ds: dict, data_dir: Path, force: bool) -> Path:
+def _check_digest(name: str, out: Path, digest: str, expected, *, just_downloaded: bool) -> bool:
+    """Print a verdict for one file's hash and return whether it's OK to
+    trust (True = matches or nothing to check against; False = mismatch)."""
+    if expected is None:
+        print(f"  sha256={digest}")
+        print(f"  (not pinned yet -- copy this into datasets.py as this "
+              f"entry's sha256 so future runs verify it)")
+        return True
+    if digest == expected:
+        print(f"  sha256 OK ({digest[:12]}...)")
+        return True
+    if just_downloaded:
+        out.unlink()
+        raise SystemExit(
+            f"[error] {name}: checksum mismatch (got {digest}, "
+            f"expected {expected}). Deleted the download -- do not use it."
+        )
+    print(f"[MISMATCH] {name}: cached file at {out} does not match the "
+          f"pinned sha256\n  expected {expected}\n  got      {digest}")
+    print(f"  Not deleting a pre-existing cached file automatically -- this "
+          f"is as likely to be a copy/paste slip in datasets.py as a bad "
+          f"download. Compare by hand before trusting either. If the file "
+          f"really is bad, rerun with --force to re-download it.")
+    return False
+
+
+def fetch_one(ds: dict, data_dir: Path, force: bool) -> "tuple[Path, bool]":
     out = data_dir / f"{ds['name']}.fasta"
     if out.exists() and not force:
-        print(f"[skip] {ds['name']}: already cached at {out}")
-        return out
+        print(f"[cached] {ds['name']}: {out} -- re-hashing to verify")
+        digest = sha256_of(out)
+        ok = _check_digest(ds["name"], out, digest, ds.get("sha256"), just_downloaded=False)
+        return out, ok
 
     data_dir.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(".fasta.download")
@@ -57,20 +92,8 @@ def fetch_one(ds: dict, data_dir: Path, force: bool) -> Path:
         tmp.rename(out)
 
     digest = sha256_of(out)
-    expected = ds.get("sha256")
-    if expected is None:
-        print(f"  sha256={digest}")
-        print(f"  (not pinned yet -- copy this into datasets.py as this "
-              f"entry's sha256 so future fetches are verified)")
-    elif digest != expected:
-        out.unlink()
-        raise SystemExit(
-            f"[error] {ds['name']}: checksum mismatch (got {digest}, "
-            f"expected {expected}). Deleted the download -- do not use it."
-        )
-    else:
-        print(f"  sha256 OK ({digest[:12]}...)")
-    return out
+    ok = _check_digest(ds["name"], out, digest, ds.get("sha256"), just_downloaded=True)
+    return out, ok
 
 
 def main():
@@ -92,8 +115,10 @@ def main():
         ds = next((d for d in todo if d["name"] == args.print_hash), None)
         if ds is None:
             sys.exit(f"no 'fetched' dataset named {args.print_hash!r}")
-        out = fetch_one(ds, data_dir, force=False)
+        out, ok = fetch_one(ds, data_dir, force=False)
         print(sha256_of(out))
+        if not ok:
+            sys.exit(1)
         return
 
     if args.only:
@@ -106,8 +131,12 @@ def main():
         print("nothing to fetch (no 'fetched'-kind datasets matched)")
         return
 
-    for ds in todo:
-        fetch_one(ds, data_dir, args.force)
+    results = [fetch_one(ds, data_dir, args.force) for ds in todo]
+    failed = [ds["name"] for ds, (_, ok) in zip(todo, results) if not ok]
+    if failed:
+        print(f"\n[FAILED] {len(failed)} dataset(s) did not verify: {failed}")
+        sys.exit(1)
+    print(f"\nall {len(results)} dataset(s) verified OK")
 
 
 if __name__ == "__main__":
