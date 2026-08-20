@@ -65,11 +65,27 @@
 //               dependents' costs change; then Phase II unpin/retarget.
 //               (GCSA_DISABLE_PHASE2=1 runs the forest DP + accept + leftover
 //               alone, without Phase II, on any algorithm below.)
-//   PseudoforestDp – DP on the *whole* preference graph (out-degree<=1, no
-//               cov/size threshold): tree components use the same KEEP vs
-//               COMPRESS recurrence; unicyclic components (e.g. a mutual
-//               pair) are solved exactly by folding the cycle instead of
-//               dropping an edge to force acyclicity; then Phase II.
+//   PseudoforestDp – "extract preference, solve exactly" DP (see
+//               exact_pseudoforest_dp.pdf, "Sparsifying the graph"). Builds
+//               the preference pseudoforest (out-degree<=1, no cov/size
+//               threshold; a node's candidate only becomes a real
+//               dependency edge when its rank range actually conflicts with
+//               its source's own candidate -- see ConflictGraph::dep) once, over
+//               every unresolved interval; tree components use the same
+//               KEEP vs COMPRESS recurrence as TreeDp, unicyclic components
+//               are solved exactly by folding the cycle instead of dropping
+//               an edge to force acyclicity. Then one leftover greedy sweep
+//               (sees every candidate for a word, not just its single
+//               preferred one -- catches what the DP's sparsification
+//               can't) and Phase II. (The doc's "IDEA: Iterative DP" --
+//               repeating extract/solve to a fixed point before ever
+//               falling back to greedy -- was prototyped and shelved for
+//               now: on the cases tested, the leftover sweep's floor
+//               already matches the DP's own floor, so a second round is
+//               always empty. build_pseudoforest_graph_'s require_avail
+//               parameter and the round-oriented framing in the functions
+//               below are left in place for that experiment to resume
+//               later without rederiving them.)
 
 #pragma once
 
@@ -2388,127 +2404,180 @@ private:
         }
     }
 
-    // Pseudoforest DP: every interval with |I_c|>=2 and a preferred candidate
-    // of coverage>=2 gets exactly one outgoing "prefers" edge, to whichever
-    // shape holds its source (a candidate's source always lies entirely
-    // inside a single shape's interval, since LCP>=add+1>=2 forces every
-    // source rank to share its own first symbol). A graph with out-degree<=1
-    // per node is a pseudoforest: every connected component is either a tree
-    // (rooted at a node with no preference) or unicyclic (exactly one cycle,
-    // with trees hanging off each cycle node) -- never anything worse.
+    // ------------------------------------------------------------------
+    // PseudoforestDp building blocks
+    // ------------------------------------------------------------------
+    // The three pieces below implement one "extract preference, solve
+    // exactly" round (exact_pseudoforest_dp.pdf, "Sparsifying the graph" /
+    // "MWIS on pseudoforests"):
+    //   1. build_pseudoforest_graph_    -- extract the preference pseudoforest
+    //   2. solve_pseudoforest_dp_       -- solve it exactly (KEEP vs COMPRESS)
+    //   3. accept_pseudoforest_chosen_  -- materialize the DP's choices
+    // compress_pseudoforest_dp_ further below just calls these in a loop,
+    // each round over whatever intervals earlier rounds left unresolved --
+    // see "IDEA: Iterative DP" in the note.
+
+    // A single round's preference pseudoforest: every interval with
+    // |I_c|>2 that isn't already resolved gets, at most, one candidate it
+    // would use to compress (`cand` below) -- and, separately, at most one
+    // REAL dependency (`dep` below) on whichever interval that candidate's
+    // source actually collides with. These are deliberately not the same
+    // map: every node with a candidate gets an entry in `cand`, but only a
+    // node whose candidate's source range genuinely overlaps its source's
+    // own chosen candidate's covered set gets an entry in `dep` -- a node
+    // can have a candidate and no dependency at all. That's exactly what
+    // always happens for a self-reference (L1+L3 guarantee its source can
+    // never overlap its own covered set), but it's not special-cased: any
+    // node whose candidate doesn't actually conflict with anything ends up
+    // in `cand` only, self-reference or not.
     //
-    // Unlike TreeDp, no edge is ever dropped to force acyclicity. Tree
-    // components use the same KEEP/COMPRESS recurrence as TreeDp; unicyclic
-    // components are solved exactly by folding the cycle into two forced
-    // sub-cases (anchor node forced KEEP, or forced COMPRESS with its
-    // successor forced KEEP) and taking whichever is cheaper. Because
-    // cycles are solved rather than avoided, no cov>=3 or |I_c|>2 threshold
-    // is needed either -- every compressible interval participates.
-    void compress_pseudoforest_dp_(const std::vector<Interval>& intervals,
-                                   std::unordered_map<uint64_t, Candidate>& accepted) {
-        using Clock = std::chrono::steady_clock;
-        const bool timing = (std::getenv("GCSA_TIMING") != nullptr);
-        const bool trace = (std::getenv("GCSA_TRACE_PFDP") != nullptr);
-        auto t_all = Clock::now();
-        // See compress_tree_dp_'s m0/pct_kept for what this measures.
-        const size_t m0 = kept_count_;
-        auto pct_kept = [&](size_t kept) {
-            return 100.0 * (double)kept / (double)std::max<size_t>(1, m0);
-        };
-
+    // Only `dep` entries are real edges: they're the only things cycle
+    // detection chases and the only things registered in `children` below.
+    // A candidate's source always lies entirely inside a single interval,
+    // since LCP>=add+1>=2 forces every source rank to share its own first
+    // symbol (see "Sparsifying the graph"), so out-degree in `dep` is <=1
+    // per node -- that's what makes this a pseudoforest: every connected
+    // component of real dependencies is either a tree (rooted at a node
+    // with no dependency) or unicyclic (exactly one cycle, with trees
+    // hanging off each cycle node) -- never anything worse. No edge is ever
+    // dropped to force acyclicity (unlike TreeDp): unicyclic components are
+    // handled by folding the cycle instead (see solve_pseudoforest_dp_), so
+    // no cov/size threshold is needed either -- every still-unresolved
+    // interval participates.
+    //
+    // Splitting "has a candidate" from "has a real dependency" like this
+    // (instead of one record with a conflicts flag riding along on it)
+    // means there's no runtime "is this actually a conflict" check left to
+    // do once the graph is built: presence in `dep` *is* the conflict, and
+    // solve_pseudoforest_dp_ never needs to ask again.
+    struct ConflictGraph {
+        // Every interval in the instance, including already-resolved /
+        // |I|<=2 ones -- needed because those can still be valid *sources*
+        // even though they're never DP-decidable nodes this round.
         std::unordered_map<uint64_t, const Interval*> by_name;
-        for (const auto& iv : intervals) by_name[iv.name] = &iv;
+        // This round's DP-decidable intervals are exactly the keys of
+        // `cand` below -- a node only matters to the DP once it actually
+        // has something to compress via, so there's no separate "nodes"
+        // set: a node with no candidate can never be anyone's real
+        // dependency (dep is only ever keyed from `cand`) and can never
+        // itself become COMPRESS, so tracking it here would be inert.
+        std::unordered_map<uint64_t, Candidate> cand;       // node -> its one chosen candidate, if any
+        std::unordered_map<uint64_t, uint64_t> dep;         // node -> the node it has a REAL dependency on (conflicting)
+        std::unordered_map<uint64_t, std::vector<uint64_t>> children;  // src -> dependents (cycle-internal edge excluded)
+        std::vector<std::vector<uint64_t>> cycles;          // each cycle as an ordered node list
+        std::unordered_map<uint64_t, uint64_t> cycle_pred;  // cyc[i] -> cyc[i-1] (the excluded edge)
+    };
 
-        struct Pref { Candidate cand; uint64_t src_name; };
-        std::unordered_map<uint64_t, Pref> prefs;   // node -> its unique preference
-        std::unordered_map<uint64_t, std::vector<Candidate>> cand_cache;  // reused by Phase II
+    // Extract one round's preference pseudoforest. `intervals` is always the
+    // whole instance (interval bounds never change); `accepted` marks which
+    // names earlier rounds already resolved, so they're excluded from
+    // `cand` here -- they remain valid, fixed sources (see
+    // solve_pseudoforest_dp_) but are never reconsidered for compression.
+    // require_avail=false (round 0, nothing accepted yet) picks each node's
+    // globally-best candidate, exactly like the original single-pass
+    // algorithm; require_avail=true (every later round) picks the best
+    // candidate that is still available given what earlier rounds
+    // pinned/removed -- the "extract a second set of preferences that do
+    // not conflict with the fixed solution" step from the note.
+    // `cand_cache` accumulates every node's full (avail=false)
+    // coverage-sorted candidate list across rounds, for reuse by the
+    // leftover pass and Phase II: a name's avail=false list only depends on
+    // static SA/LCP structure, so it's computed once (whichever round first
+    // visits that name) and reused by every later round instead of
+    // re-enumerated.
+    ConflictGraph build_pseudoforest_graph_(
+            const std::vector<Interval>& intervals,
+            const std::unordered_map<uint64_t, Candidate>& accepted,
+            bool require_avail,
+            std::unordered_map<uint64_t, std::vector<Candidate>>& cand_cache,
+            bool rank_aware = true) const {
+        ConflictGraph graph;
+        graph.by_name.reserve(intervals.size() * 2);
+        for (const auto& iv : intervals) graph.by_name[iv.name] = &iv;
 
-        std::fprintf(stderr, "[pseudoforest-dp] preference graph build...\n");
         for (const auto& iv : intervals) {
-            if (iv.hi - iv.lo < 2) continue;
-            auto cands = enumerate_candidates_(iv.name, iv.lo, iv.hi, /*avail=*/false);
-            Candidate best = pick_best_(cands);
+            // |I|<=2 can never meet kMinCoverage (coverage is a subset of the
+            // interval's own rows, so coverage<=|I|; the default kMinCoverage=3
+            // makes |I|<=2 structurally unsatisfiable) -- same reasoning
+            // compress_tree_dp_ uses for its own |I|>2 filter. Skipping here
+            // avoids a wasted enumerate_candidates_ call and cand_cache entry
+            // for intervals that can never produce a usable candidate; it does
+            // not change which candidates get accepted.
+            if (iv.hi - iv.lo <= 2) continue;
+            if (accepted.count(iv.name)) continue;  // already resolved: fixed, not a DP node this round
+
+            auto cit = cand_cache.find(iv.name);
+            std::vector<Candidate> fresh;
+            if (cit == cand_cache.end()) {
+                fresh = enumerate_candidates_(iv.name, iv.lo, iv.hi, /*avail=*/false);
+                // Stable, not std::sort: pick_best_ (the original, unrefactored
+                // preference pick) scanned enumerate_candidates_'s output in its
+                // native order and kept the first candidate to strictly improve
+                // on (coverage, add); an unstable sort can reorder same-
+                // (coverage, add) candidates arbitrarily and silently pick a
+                // different -- if equally "good" by that metric -- source run,
+                // which can still cascade into a different DP outcome.
+                std::stable_sort(fresh.begin(), fresh.end(), [](const Candidate& a, const Candidate& b){
+                    if (a.coverage() != b.coverage()) return a.coverage() > b.coverage();
+                    return a.add > b.add;
+                });
+            }
+            const std::vector<Candidate>& sorted_cands = (cit != cand_cache.end()) ? cit->second : fresh;
+
+            Candidate best = best_from_sorted_cache_(sorted_cands, require_avail);
             if (best.coverage() >= 2) {
                 uint64_t src = name_of_rank_(best.src_lo);
-                if (src != iv.name && by_name.count(src))
-                    prefs.emplace(iv.name, Pref{best, src});
+                // Self-references (src == iv.name) are allowed here: nothing
+                // downstream needs to know a candidate is a self-reference
+                // as such -- it's just one instance of a node with no real
+                // dependency (see the dep pass below), handled by the same
+                // general rule as any other dependency-free candidate.
+                if (graph.by_name.count(src)) graph.cand.emplace(iv.name, std::move(best));
             }
-            std::sort(cands.begin(), cands.end(), [](const Candidate& a, const Candidate& b){
-                if (a.coverage() != b.coverage()) return a.coverage() > b.coverage();
-                return a.add > b.add;
-            });
-            cand_cache.emplace(iv.name, std::move(cands));
+            if (cit == cand_cache.end()) cand_cache.emplace(iv.name, std::move(fresh));
         }
 
-        std::unordered_set<uint64_t> all_nodes;
-        for (const auto& iv : intervals) if (iv.hi - iv.lo >= 2) all_nodes.insert(iv.name);
-
-        auto isize = [&](uint64_t n) -> int {
-            auto it = by_name.find(n);
-            return it == by_name.end() ? 0 : (it->second->hi - it->second->lo);
-        };
-        auto has_pref = [&](uint64_t n) { return prefs.count(n) != 0; };
-        auto pref_src = [&](uint64_t n) { return prefs.at(n).src_name; };
-
-        // ---- rank-aware conflict check -------------------------------------
-        // A preference edge v -> w (v's source lies in I_w) is drawn once
-        // v's preferred candidate is picked; that only records *which
-        // interval* the source falls in. It does NOT mean every compress of
-        // w threatens v: w's own compress only drops its specific covered
-        // set T_{pref(w)} subset I_w, and v's source is the specific range
-        // S_{pref(v)} subset I_w. The two can easily be disjoint, in which
-        // case w compressing does not touch v's source at all. Two names
-        // sharing an interval is not itself a conflict -- only these two
-        // concrete rank ranges actually overlapping is. GCSA_PFDP_RANK_AWARE=0
-        // restores the old, coarser rule ("w compresses" alone blocks v,
-        // regardless of overlap), matching compress_tree_dp_'s behaviour.
-        const bool rank_aware = [] {
-            const char* e = std::getenv("GCSA_PFDP_RANK_AWARE");
-            return !e || std::atoi(e) != 0;
-        }();
-        std::unordered_map<uint64_t, bool> conflict_cache;
-        // Does v's own source range collide with v's source's own covered
-        // set, i.e. could v's source *actually* be clobbered if v's source
-        // compresses? False means v is safe to compress no matter what its
-        // source does.
-        auto ranges_conflict = [&](uint64_t v) -> bool {
-            if (!rank_aware) return true;   // legacy: always assume a conflict
-            auto cit = conflict_cache.find(v);
-            if (cit != conflict_cache.end()) return cit->second;
-            bool conflict = false;
-            auto pit = prefs.find(v);
-            if (pit != prefs.end()) {
-                auto sit = prefs.find(pit->second.src_name);
-                if (sit != prefs.end()) {
-                    // v's own source range vs its source's own covered set
-                    // (both fixed once preferences are computed, so this is
-                    // knowable statically -- no need to inspect the actual
-                    // accept-time removed_/pin_count_ arrays here).
-                    const Candidate& vc = pit->second.cand;
-                    const std::vector<int32_t>& covered = sit->second.cand.covered;
-                    auto lo = std::lower_bound(covered.begin(), covered.end(), vc.src_lo);
-                    conflict = (lo != covered.end() && *lo < vc.src_hi);
-                }
-                // else: v's source has no preference of its own, so it can
-                // never compress -- nothing to conflict with.
-            }
-            conflict_cache.emplace(v, conflict);
-            return conflict;
-        };
+        // ---- which nodes have a REAL (rank-level conflict) dependency -----
+        // v has a real dependency on src = name_of_rank_(v's candidate's
+        // src_lo) only if src's own candidate would, upon compressing,
+        // actually delete rows that overlap v's specific source range --
+        // both v's and src's candidates are already fixed at this point, so
+        // this is knowable now, without running the DP. A node with a
+        // candidate but no entry in `dep` (self-references always
+        // included, by L1+L3) has nothing tying it to another node: it's
+        // solved as an independent root, its candidate existing only as
+        // something to compress via, never as a constraint.
+        for (auto& kv : graph.cand) {
+            uint64_t v = kv.first;
+            const Candidate& vc = kv.second;
+            uint64_t src = name_of_rank_(vc.src_lo);
+            if (!rank_aware) { graph.dep.emplace(v, src); continue; }  // legacy: every candidate is a real dependency
+            auto sit = graph.cand.find(src);
+            if (sit == graph.cand.end()) continue;  // src has no candidate of its own: can't compress, no dependency
+            const std::vector<int32_t>& covered = sit->second.covered;
+            auto lo = std::lower_bound(covered.begin(), covered.end(), vc.src_lo);
+            if (lo != covered.end() && *lo < vc.src_hi) graph.dep.emplace(v, src);
+        }
 
         // ---- pure graph decomposition: find every cycle up front ----------
         // (independent of the DP; identifies exactly which single incoming
         // edge per cycle node is "cycle-internal" so it can be excluded from
-        // the generic children[] map used by solve()/apply() below -- that
-        // edge is instead handled explicitly by fold_cycle's scenario walk,
-        // never both, which would double count it.)
+        // the generic children[] map used by solve_pseudoforest_dp_ below --
+        // that edge is instead handled explicitly by its fold_cycle scenario
+        // walk, never both, which would double count it. A cycle can only
+        // involve nodes with a real dependency in `dep`; every other name --
+        // including any node whose candidate turned out not to conflict --
+        // has no dep entry, so a chain through it always terminates instead
+        // of looping; it's just another independent root. Only nodes in
+        // `cand` can ever start or continue such a chain -- dep is keyed
+        // exclusively from `cand` -- so walking graph.cand's keys covers
+        // every possible cycle.)
         enum class Color : uint8_t { White, Gray, Black };
         std::unordered_map<uint64_t, Color> color;
-        for (uint64_t n : all_nodes) color[n] = Color::White;
-        std::vector<std::vector<uint64_t>> cycles;
-        std::unordered_map<uint64_t, uint64_t> cycle_pred;  // cyc[i] -> cyc[i-1] (to exclude)
+        for (auto& kv : graph.cand) color[kv.first] = Color::White;
 
-        for (uint64_t start : all_nodes) {
+        for (auto& kv : graph.cand) {
+            uint64_t start = kv.first;
             if (color[start] != Color::White) continue;
             std::vector<uint64_t> path;
             uint64_t v = start;
@@ -2519,48 +2588,99 @@ private:
                 if (color[v] == Color::Gray) { hit_cycle = true; cycle_entry = v; break; }
                 color[v] = Color::Gray;
                 path.push_back(v);
-                if (!has_pref(v)) break;   // tree root: end of chain
-                v = pref_src(v);
+                auto dit = graph.dep.find(v);
+                if (dit == graph.dep.end()) break;  // no real dependency: chain ends here
+                v = dit->second;
             }
             if (hit_cycle) {
                 auto it = std::find(path.begin(), path.end(), cycle_entry);
                 std::vector<uint64_t> cyc(it, path.end());
                 int L = (int)cyc.size();
                 for (int i = 0; i < L; ++i)
-                    cycle_pred[cyc[i]] = cyc[(i + L - 1) % L];
-                cycles.push_back(std::move(cyc));
+                    graph.cycle_pred[cyc[i]] = cyc[(i + L - 1) % L];
+                graph.cycles.push_back(std::move(cyc));
             }
             for (uint64_t u : path) color[u] = Color::Black;
         }
 
         // children[w] = dependents of w, EXCLUDING the one cycle-internal
-        // edge per cycle node (handled explicitly by fold_cycle instead).
-        std::unordered_map<uint64_t, std::vector<uint64_t>> children;
-        for (auto& kv : prefs) {
-            uint64_t v = kv.first, src = kv.second.src_name;
-            auto it = cycle_pred.find(src);
-            if (it != cycle_pred.end() && it->second == v) continue;
-            children[src].push_back(v);
+        // edge per cycle node (handled explicitly by fold_cycle instead). w
+        // itself may or may not have a candidate of its own (already
+        // accepted, |I|<=2, or -- legacy mode only -- below-threshold
+        // coverage) -- see solve_pseudoforest_dp_.
+        for (auto& kv : graph.dep) {
+            uint64_t v = kv.first, src = kv.second;
+            auto it = graph.cycle_pred.find(src);
+            if (it != graph.cycle_pred.end() && it->second == v) continue;
+            graph.children[src].push_back(v);
         }
 
-        if (trace) {
-            std::fprintf(stderr, "=== pseudoforest-dp preference graph ===\n");
-            for (uint64_t v : all_nodes) {
-                if (!has_pref(v)) continue;
+        return graph;
+    }
+
+    // GCSA_TRACE_PFDP dump of one round's graph.
+    void trace_pseudoforest_graph_(const ConflictGraph& graph, size_t round) const {
+        std::fprintf(stderr, "=== pseudoforest-dp preference graph (round %zu) ===\n", round);
+        for (auto& kv : graph.cand) {
+            auto dit = graph.dep.find(kv.first);
+            if (dit != graph.dep.end()) {
                 std::fprintf(stderr, "  %s -> %s (cov=%d)\n",
-                    name_to_string(G_.shape, v).c_str(),
-                    name_to_string(G_.shape, pref_src(v)).c_str(),
-                    prefs.at(v).cand.coverage());
-            }
-            std::fprintf(stderr, "cycles found: %zu\n", cycles.size());
-            for (auto& cyc : cycles) {
-                std::fprintf(stderr, "  [");
-                for (size_t i = 0; i < cyc.size(); ++i)
-                    std::fprintf(stderr, "%s%s", i ? "," : "",
-                                 name_to_string(G_.shape, cyc[i]).c_str());
-                std::fprintf(stderr, "]\n");
+                    name_to_string(G_.shape, kv.first).c_str(),
+                    name_to_string(G_.shape, dit->second).c_str(),
+                    kv.second.coverage());
+            } else {
+                std::fprintf(stderr, "  %s (no real dependency, cov=%d)\n",
+                    name_to_string(G_.shape, kv.first).c_str(),
+                    kv.second.coverage());
             }
         }
+        std::fprintf(stderr, "cycles found: %zu\n", graph.cycles.size());
+        for (auto& cyc : graph.cycles) {
+            std::fprintf(stderr, "  [");
+            for (size_t i = 0; i < cyc.size(); ++i)
+                std::fprintf(stderr, "%s%s", i ? "," : "",
+                             name_to_string(G_.shape, cyc[i]).c_str());
+            std::fprintf(stderr, "]\n");
+        }
+    }
+
+    // Exact MWIS ("KEEP vs COMPRESS" per node) on one preference pseudoforest
+    // (exact_pseudoforest_dp.pdf, "MWIS on pseudoforests"): tree components
+    // use the tree recurrence; each unicyclic component's cycle is folded
+    // into two forced scenarios (anchor kept vs anchor compressed) and the
+    // cheaper one wins. Any name with no entry in graph.cand (already
+    // accepted by an earlier round, |I|<=2, or -- legacy mode only --
+    // below-threshold coverage) is never DP-decidable, so the recurrence
+    // naturally treats it as permanently KEEP: it's never reconsidered,
+    // only ever used as a fixed, always-available source for this round's
+    // real nodes. Returns the node -> candidate map to accept.
+    //
+    // Every entry in graph.children/graph.cycles exists only because
+    // build_pseudoforest_graph_ found a real, rank-conflicting dependency
+    // (see ConflictGraph::dep) -- a node whose candidate didn't actually
+    // conflict with anything never got registered as anyone's dependent.
+    // So any child reached via children_of(), or any node walked as part of
+    // a cycle here, is unconditionally blocked (src_ok=false) whenever its
+    // dependency compresses: there's no "maybe it doesn't actually
+    // conflict" case left to check at solve time -- that used to be a
+    // rank-aware lookup here (ranges_conflict), but once the graph itself
+    // stopped registering non-conflicting candidates as dependencies at
+    // all, the check became tautologically true everywhere it was still
+    // invoked, so it's gone. `rank_aware` only affects how
+    // build_pseudoforest_graph_ populates `dep` in the first place.
+    std::unordered_map<uint64_t, Candidate> solve_pseudoforest_dp_(
+            const ConflictGraph& graph, bool rank_aware, bool trace) const {
+        (void)rank_aware;
+        auto isize = [&](uint64_t n) -> int {
+            auto it = graph.by_name.find(n);
+            return it == graph.by_name.end() ? 0 : (it->second->hi - it->second->lo);
+        };
+        auto has_pref = [&](uint64_t n) { return graph.cand.count(n) != 0; };
+        auto children_of = [&](uint64_t n) -> const std::vector<uint64_t>& {
+            static const std::vector<uint64_t> kEmpty;
+            auto it = graph.children.find(n);
+            return it == graph.children.end() ? kEmpty : it->second;
+        };
 
         // ---- KEEP / COMPRESS DP (identical recurrence to TreeDp) ----------
         struct Cell { long long cost; bool compress; };
@@ -2571,7 +2691,7 @@ private:
             auto it = memo.find(key);
             if (it != memo.end()) return it->second;
 
-            const auto& ch = children[v];
+            const auto& ch = children_of(v);
             long long cost_keep = isize(v);
             for (uint64_t w : ch) cost_keep += solve(w, /*src_ok=*/true).cost;
 
@@ -2579,9 +2699,9 @@ private:
             bool can_comp = false;
             if (src_ok && has_pref(v)) {
                 can_comp = true;
-                long long cc = isize(v) - prefs.at(v).cand.coverage();
+                long long cc = isize(v) - graph.cand.at(v).coverage();
                 for (uint64_t w : ch)
-                    cc += solve(w, /*src_ok=*/!ranges_conflict(w)).cost;
+                    cc += solve(w, /*src_ok=*/false).cost;  // w is only here because it really conflicts
                 cost_comp = cc;
             }
 
@@ -2596,16 +2716,15 @@ private:
         std::function<void(uint64_t, bool)> apply = [&](uint64_t v, bool src_ok) {
             Cell cell = solve(v, src_ok);
             if (cell.compress) {
-                chosen[v] = prefs.at(v).cand;
-                for (uint64_t w : children[v])
-                    apply(w, /*src_ok=*/!ranges_conflict(w));
+                chosen[v] = graph.cand.at(v);
+                for (uint64_t w : children_of(v)) apply(w, /*src_ok=*/false);
             } else {
-                for (uint64_t w : children[v]) apply(w, /*src_ok=*/true);
+                for (uint64_t w : children_of(v)) apply(w, /*src_ok=*/true);
             }
         };
 
         // Fold a unicyclic component's cycle cyc[0]->cyc[1]->...->cyc[L-1]->cyc[0]
-        // (cyc[i]'s preferred source is cyc[i+1 mod L]) into two forced
+        // (cyc[i]'s real dependency is cyc[i+1 mod L]) into two forced
         // sub-cases. cyc[0]'s own compress-ability requires walking all the
         // way around and back to itself -- a circular dependency broken by
         // fixing cyc[0]'s status externally instead of deriving it.
@@ -2614,13 +2733,12 @@ private:
 
             // Scenario A: cyc[0] forced KEEP (always valid on its own).
             long long costA = isize(cyc[0]);
-            for (uint64_t w : children[cyc[0]]) costA += solve(w, true).cost;
+            for (uint64_t w : children_of(cyc[0])) costA += solve(w, true).cost;
             std::vector<char> statusA(L, 1);
             {
                 bool avail = true;   // cyc[0] is available
                 for (int i = L - 1; i >= 1; --i) {
-                    bool src_ok_i = avail || !ranges_conflict(cyc[i]);
-                    Cell cell = solve(cyc[i], src_ok_i);
+                    Cell cell = solve(cyc[i], /*src_ok=*/avail);
                     costA += cell.cost;
                     statusA[i] = cell.compress ? 0 : 1;
                     avail = (statusA[i] == 1);
@@ -2629,25 +2747,20 @@ private:
 
             // Scenario B: cyc[0] forced COMPRESS. Walk the rest of the ring
             // from cyc[L-1] down to cyc[1] with cyc[0] unavailable as a
-            // source. cyc[1] is special only in that it also sits on the
-            // *other* end of the fixed cyc[0]->cyc[1] edge: cyc[0]
-            // compressing bars cyc[1] from compressing only if their two
-            // concrete rank ranges actually collide (ranges_conflict(cyc[0])
-            // -- cyc[0]'s source range vs cyc[1]'s own covered set); when
-            // rank-aware and disjoint, cyc[1] is otherwise gated normally by
-            // its own source (cyc[2], or cyc[0] again when L==2, via the
-            // same `avail` chain the rest of the ring uses).
-            long long costB = isize(cyc[0]) - prefs.at(cyc[0]).cand.coverage();
-            for (uint64_t w : children[cyc[0]])
-                costB += solve(w, /*src_ok=*/!ranges_conflict(w)).cost;
+            // source. Every cyc[i] here -- cyc[1] included, the other end of
+            // the fixed cyc[0]->cyc[1] dependency -- is only in this cycle
+            // at all because it's a real, conflicting dependency, so cyc[0]
+            // compressing unconditionally blocks cyc[1]; the rest of the
+            // ring is gated normally by its own dependency (cyc[2], or
+            // cyc[0] again when L==2) via the same `avail` chain.
+            long long costB = isize(cyc[0]) - graph.cand.at(cyc[0]).coverage();
+            for (uint64_t w : children_of(cyc[0])) costB += solve(w, /*src_ok=*/false).cost;
             std::vector<char> statusB(L, 1);
             statusB[0] = 0;
             {
-                const bool cyc1_blocked_by_anchor = ranges_conflict(cyc[0]);
                 bool avail = false;  // cyc[0] compresses: unavailable to cyc[L-1]
                 for (int i = L - 1; i >= 1; --i) {
-                    bool src_ok_i = avail || !ranges_conflict(cyc[i]);
-                    if (i == 1 && cyc1_blocked_by_anchor) src_ok_i = false;
+                    bool src_ok_i = (i == 1) ? false : avail;
                     Cell cell = solve(cyc[i], src_ok_i);
                     costB += cell.cost;
                     statusB[i] = cell.compress ? 0 : 1;
@@ -2666,32 +2779,54 @@ private:
             for (int i = 0; i < L; ++i) {
                 uint64_t v = cyc[i];
                 if (status[i] == 0) {
-                    chosen[v] = prefs.at(v).cand;
-                    for (uint64_t w : children[v])
-                        apply(w, /*src_ok=*/!ranges_conflict(w));
+                    chosen[v] = graph.cand.at(v);
+                    for (uint64_t w : children_of(v)) apply(w, /*src_ok=*/false);
                 } else {
-                    for (uint64_t w : children[v]) apply(w, /*src_ok=*/true);
+                    for (uint64_t w : children_of(v)) apply(w, /*src_ok=*/true);
                 }
             }
         };
 
-        std::fprintf(stderr, "[pseudoforest-dp] DP on components...\n");
-        size_t n_roots = 0;
-        for (uint64_t v : all_nodes) {
-            if (has_pref(v)) continue;
-            apply(v, /*src_ok=*/true);
-            ++n_roots;
-        }
-        for (auto& cyc : cycles) fold_cycle(cyc);
-        std::fprintf(stderr, "[pseudoforest-dp] DP done (roots=%zu cycles=%zu)\n",
-                     n_roots, cycles.size());
+        // Entry points: nodes the DP starts walking down from with
+        // src_ok=true. Two kinds -- a fixed source some node in this round
+        // depends on but that has no candidate of its own (already accepted
+        // by an earlier round, |I|<=2, or -- legacy mode only -- below-
+        // threshold coverage), and a node with a candidate but no real
+        // dependency (a genuine root). The first kind is permanently-KEEP
+        // as far as this round is concerned, and matters only because a
+        // still-unresolved node's best available candidate can perfectly
+        // well source from an interval that has no candidate of its own --
+        // without it, every node hanging off such a source would silently
+        // never get visited.
+        std::unordered_set<uint64_t> entry_points;
+        for (auto& kv : graph.children)
+            if (!has_pref(kv.first)) entry_points.insert(kv.first);
+        // A node with a candidate but no real dependency (self-references
+        // included, always dependency-free by L1+L3) was never registered
+        // as anyone's dependent -- it never made it into graph.children at
+        // all -- so it would otherwise never be visited by the top-down
+        // apply() walk below. It must be entered explicitly, same as any
+        // other root.
+        for (auto& kv : graph.cand)
+            if (!graph.dep.count(kv.first)) entry_points.insert(kv.first);
 
-        // Materialize. Every accepted candidate's source shape is, by DP
-        // construction, never itself compressed in the same solution (a
-        // compress choice is only ever taken under src_ok=true, i.e. when
-        // the source was already decided KEPT), so accept order across
-        // `chosen` cannot conflict -- no dependency ordering is required.
-        std::fprintf(stderr, "[pseudoforest-dp] accept chosen...\n");
+        for (uint64_t v : entry_points) apply(v, /*src_ok=*/true);
+        for (auto& cyc : graph.cycles) fold_cycle(cyc);
+
+        return chosen;
+    }
+
+    // Materialize one round's DP choices: accept each chosen candidate
+    // against the *current* removed_/pin_count_ state. By DP construction a
+    // compress choice is only ever taken under src_ok=true (source already
+    // decided KEPT/fixed), so accept order across `chosen` cannot conflict
+    // and no dependency ordering is required; the availability re-check
+    // below is defensive insurance, matching the other algorithms.
+    void accept_pseudoforest_chosen_(
+            const std::unordered_map<uint64_t, Candidate>& chosen,
+            const std::unordered_map<uint64_t, const Interval*>& by_name,
+            std::unordered_map<uint64_t, Candidate>& accepted,
+            bool trace) {
         for (auto& kv : chosen) {
             uint64_t v = kv.first;
             Candidate c = kv.second;
@@ -2699,7 +2834,9 @@ private:
             for (int32_t rr : c.covered)
                 if (removed_[rr] || pin_count_[rr] > 0) ok = false;
             if (!ok) {
-                const Interval* iv = by_name[v];
+                auto it = by_name.find(v);
+                if (it == by_name.end()) continue;
+                const Interval* iv = it->second;
                 c = best_candidate_(iv->name, iv->lo, iv->hi, /*avail=*/true);
             }
             if (c.coverage() >= 2) {
@@ -2712,15 +2849,26 @@ private:
                 accept_(c, accepted);
             }
         }
-        const size_t after_dp = kept_count_;
-        std::fprintf(stderr,
-            "[pseudoforest-dp] DP alone: |C| %zu -> %zu  (%.1f%% of original kept, -%zu)\n",
-            m0, after_dp, pct_kept(after_dp), m0 - after_dp);
+    }
 
-        // Leftover: should be empty by construction (every |I_c|>=2 interval
-        // is either a root or belongs to exactly one component above); kept
-        // only as defensive insurance, matching the other algorithms.
-        std::fprintf(stderr, "[pseudoforest-dp] leftover greedy...\n");
+    // Greedy fallback pass: for every still-unresolved interval, accept its
+    // best AVAILABLE candidate outright (best_candidate_ / enumerate_
+    // candidates_, not the preference graph). Unlike the pseudoforest DP,
+    // this sees an interval's *entire* candidate universe -- every add,
+    // every source range, self-referencing included -- not just the single
+    // highest-coverage candidate build_pseudoforest_graph_ extracted as
+    // "the" preference for that word. That sparsification (one candidate
+    // per word, needed to keep the graph a pseudoforest at all) is what
+    // this sweep exists to backstop: a word's second-best candidate can
+    // easily be the one that's actually still available after the DP's
+    // choices land, and no number of DP rounds over the single-preference
+    // graph will ever surface it; only this unrestricted, live-availability
+    // sweep does. Processed size-descending, same bias as the DP's own root
+    // order. Returns how many intervals it resolved, so the caller can tell
+    // whether a round made progress.
+    size_t run_pseudoforest_leftover_(const std::vector<Interval>& intervals,
+                                      std::unordered_map<uint64_t, Candidate>& accepted,
+                                      bool trace) {
         std::vector<const Interval*> leftover;
         for (const auto& iv : intervals) {
             if (iv.hi - iv.lo <= 1) continue;
@@ -2731,35 +2879,106 @@ private:
                   [](const Interval* a, const Interval* b) {
                       return (a->hi - a->lo) > (b->hi - b->lo);
                   });
+        size_t n = 0;
         for (const Interval* ivp : leftover) {
             Candidate c = best_candidate_(ivp->name, ivp->lo, ivp->hi, /*avail=*/true);
             if (c.coverage() < 2) continue;
+            if (trace) {
+                std::fprintf(stderr, "  LEFTOVER-ACCEPT %s <- %s add=%d cov=%d\n",
+                    name_to_string(G_.shape, ivp->name).c_str(),
+                    name_to_string(G_.shape, name_of_rank_(c.src_lo)).c_str(),
+                    c.add, c.coverage());
+            }
             accept_(c, accepted);
+            ++n;
         }
-        std::fprintf(stderr, "[pseudoforest-dp] leftover done\n");
+        return n;
+    }
+
+    // Single-fire "extract preference, solve exactly" (exact_pseudoforest_dp.pdf,
+    // "Sparsifying the graph"): one preference-graph extraction over every
+    // unresolved interval, one exact DP solve, one greedy leftover sweep to
+    // mop up whatever the DP's one-candidate-per-word sparsification
+    // couldn't see (self-links included -- see run_pseudoforest_leftover_),
+    // then Phase II. This mirrors the original single-pass algorithm
+    // exactly.
+    //
+    // The doc's "IDEA: Iterative DP" -- repeating extract/solve to a fixed
+    // point before ever falling back to greedy, refining candidates against
+    // whatever earlier rounds already accepted -- is deliberately not done
+    // here for now. It was prototyped and worked, but on every case tested
+    // a second round was always empty: the leftover sweep's floor matches
+    // the DP's own floor, so anything the DP could possibly extract in a
+    // later round, leftover would already have taken in this one. Revisit
+    // once real-data experiments motivate it; build_pseudoforest_graph_'s
+    // require_avail parameter and its round-oriented framing are left in
+    // place so that experiment doesn't need to be rederived.
+    void compress_pseudoforest_dp_(const std::vector<Interval>& intervals,
+                                   std::unordered_map<uint64_t, Candidate>& accepted) {
+        using Clock = std::chrono::steady_clock;
+        const bool timing = (std::getenv("GCSA_TIMING") != nullptr);
+        const bool trace = (std::getenv("GCSA_TRACE_PFDP") != nullptr);
+        const bool rank_aware = [] {
+            const char* e = std::getenv("GCSA_PFDP_RANK_AWARE");
+            return !e || std::atoi(e) != 0;
+        }();
+        auto t_all = Clock::now();
+        // See compress_tree_dp_'s m0/pct_kept for what this measures.
+        const size_t m0 = kept_count_;
+        auto pct_kept = [&](size_t kept) {
+            return 100.0 * (double)kept / (double)std::max<size_t>(1, m0);
+        };
+
+        std::unordered_map<uint64_t, std::vector<Candidate>> cand_cache;  // reused by Phase II
+
+        gcsa_log("[pseudoforest-dp] preference graph build...\n");
+        ConflictGraph graph = build_pseudoforest_graph_(intervals, accepted,
+                                                    /*require_avail=*/false, cand_cache,
+                                                    rank_aware);
+        if (trace) trace_pseudoforest_graph_(graph, 0);
+
+        size_t n_chosen = 0;
+        if (!graph.cand.empty()) {
+            gcsa_log("[pseudoforest-dp] DP on %zu nodes...\n", graph.cand.size());
+            auto chosen = solve_pseudoforest_dp_(graph, rank_aware, trace);
+            gcsa_log("[pseudoforest-dp] DP done (cand=%zu cycles=%zu chosen=%zu)\n",
+                     graph.cand.size(), graph.cycles.size(), chosen.size());
+            n_chosen = chosen.size();
+            if (n_chosen) accept_pseudoforest_chosen_(chosen, graph.by_name, accepted, trace);
+        } else {
+            gcsa_log("[pseudoforest-dp] no preferences to extract\n");
+        }
+        const size_t after_dp = kept_count_;
+        gcsa_log(
+            "[pseudoforest-dp] DP alone: |C| %zu -> %zu  (%.1f%% of original kept, -%zu)\n",
+            m0, after_dp, pct_kept(after_dp), m0 - after_dp);
+
+        gcsa_log("[pseudoforest-dp] leftover greedy...\n");
+        size_t n_leftover = run_pseudoforest_leftover_(intervals, accepted, trace);
         const size_t after_leftover = kept_count_;
-        std::fprintf(stderr,
+        gcsa_log(
             "[pseudoforest-dp] leftover:  |C| %zu -> %zu  (%.1f%% of original kept, -%zu)\n",
             after_dp, after_leftover, pct_kept(after_leftover), after_dp - after_leftover);
 
         // Phase II: same unpin/retarget fixed point as DepOrder/TreeDp.
         run_phase2_(intervals, accepted, "pseudoforest-dp", trace, timing, &cand_cache);
         const size_t after_phase2 = kept_count_;
-        std::fprintf(stderr,
+        gcsa_log(
             "[pseudoforest-dp] phase II:  |C| %zu -> %zu  (%.1f%% of original kept, -%zu)\n",
             after_leftover, after_phase2, pct_kept(after_phase2),
             after_leftover - after_phase2);
-        std::fprintf(stderr,
+        gcsa_log(
             "[pseudoforest-dp] success: original |C|=%zu -- DP alone=%.1f%%, "
             "+leftover=%.1f%%, +phase II=%.1f%% (of original kept)\n",
             m0, pct_kept(after_dp), pct_kept(after_leftover), pct_kept(after_phase2));
 
         if (timing) {
             double ms = std::chrono::duration<double, std::milli>(Clock::now() - t_all).count();
-            std::fprintf(stderr,
-                "[timing] pseudoforest-dp total: %.1fms  roots=%zu cycles=%zu "
-                "nodes=%zu accepted=%zu kept=%zu\n",
-                ms, n_roots, cycles.size(), all_nodes.size(), accepted.size(), kept_count_);
+            gcsa_log(
+                "[timing] pseudoforest-dp total: %.1fms cycles=%zu "
+                "chosen=%zu leftover=%zu accepted=%zu kept=%zu\n",
+                ms, graph.cycles.size(), n_chosen, n_leftover,
+                accepted.size(), kept_count_);
         }
     }
 
