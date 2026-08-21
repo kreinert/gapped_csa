@@ -27,13 +27,13 @@ resolves to and which of those four sources it came from.
 
 ```bash
 cd bench
-./run_suite.py --dry-run                        # see the full plan first
-./fetch_data.py                                 # download real-genome inputs
-                                                # (URLs are pre-filled in
-                                                # datasets.py; pin each sha256
-                                                # after the first fetch with
-                                                # --print-hash NAME)
-./run_suite.py                                  # everything -> results/suite.csv
+./run_suite.py --dry-run                     # see the full plan first
+./fetch_data.py                               # download real-genome inputs
+                                               # (URLs are pre-filled in
+                                               # datasets.py; pin each sha256
+                                               # after the first fetch with
+                                               # --print-hash NAME)
+./run_suite.py                                # everything -> results/suite.csv
 ```
 
 Useful flags:
@@ -74,4 +74,5 @@ New synthetic families need a generator binary built the same way
 glue several already-resolved datasets into one FASTA (e.g. multiple real
 genomes for a real, non-simulated pangenome) use `kind="concat"` with a
 `refs` list of `"@name"` references instead -- see `pangenome_ecoli_real_n3`
-for an example.
+/ `_n8` / `_n16` (prefixes of `REAL_ECOLI_STRAIN_POOL`, 16 real E. coli
+strains deep) for an example.

@@ -38,6 +38,18 @@ deliberately not decided here -- see config.py. Nothing in this file (or
 anywhere else tracked by git) should hardcode a real filesystem path.
 """
 
+# Ordered pool of 16 real strains for the n=8/n=16 real-strain pangenome
+# sweep below, each entry taking a prefix of this list. Order is hand-picked
+# so the n=8 prefix alone already spans lab/commensal, EHEC, UPEC/ExPEC,
+# EAEC and ETEC pathotypes rather than front-loading near-duplicates -- see
+# the pathotype notes on each dataset in category C below.
+REAL_ECOLI_STRAIN_POOL = [
+    "@ecoli_k12", "@ecoli_sakai", "@ecoli_cft073", "@ecoli_hs",
+    "@ecoli_042", "@ecoli_edl933", "@ecoli_e24377a", "@ecoli_uti89",
+    "@ecoli_umn026", "@ecoli_apec_o1", "@ecoli_iai1", "@ecoli_536",
+    "@ecoli_55989", "@ecoli_s88", "@ecoli_ed1a", "@ecoli_iai39",
+]
+
 DATASETS = [
     # --- A. random --------------------------------------------------------
     dict(name="random_1e5", category="random", kind="synthetic",
@@ -93,6 +105,81 @@ DATASETS = [
               "GCF_014262945.1_ASM1426294v1/GCF_014262945.1_ASM1426294v1_genomic.fna.gz"),
          sha256="0aa2c239f4ec0f7bfd2dc3c6cef1ec15969c80be0393aefd1b0289c143240978"),
 
+    # 13 more real strains (verified live, Aug 2026, same way as the three
+    # above) so the real-strain pangenome sweep below can go up to n=8/n=16
+    # without ever resequencing the same isolate twice. Pathotypes are as
+    # reported in Rasko et al. 2008 J. Bacteriol (EDL933/HS/E24377A/UTI89/
+    # 536/042/APEC O1) and Touchon et al. 2009 PLoS Genet (IAI1/ED1a/S88/
+    # UMN026/IAI39/55989) -- both are classic, widely-used E. coli diversity
+    # panels, not an arbitrary grab of whatever NCBI returned first.
+    dict(name="ecoli_hs", category="real_genome", kind="fetched",
+         source="NCBI RefSeq GCF_000017765.1 (ASM1776v1), commensal strain HS",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/017/765/"
+              "GCF_000017765.1_ASM1776v1/GCF_000017765.1_ASM1776v1_genomic.fna.gz"),
+         sha256="d427a238a5a5a32e4cb504ab8e11169c9c2486b56905d311fe8e698e4b492b8a"),
+    dict(name="ecoli_042", category="real_genome", kind="fetched",
+         source="NCBI RefSeq GCF_000027125.1 (ASM2712v1), EAEC strain 042",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/027/125/"
+              "GCF_000027125.1_ASM2712v1/GCF_000027125.1_ASM2712v1_genomic.fna.gz"),
+         sha256="6b449c0f341ccc448d1de7ba2e61d449cf66d0c336257e4caa673d46131498c5"),
+    dict(name="ecoli_edl933", category="real_genome", kind="fetched",
+         source=("NCBI RefSeq GCF_000006665.1 (ASM666v1), EHEC O157:H7 str. "
+                 "EDL933 -- a second, independently isolated O157:H7 lineage "
+                 "alongside ecoli_sakai above"),
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/006/665/"
+              "GCF_000006665.1_ASM666v1/GCF_000006665.1_ASM666v1_genomic.fna.gz"),
+         sha256="84ae40b897e1c7651612a3f62c8d5050e604608d8e573d07c193f9c37462af23"),
+    dict(name="ecoli_e24377a", category="real_genome", kind="fetched",
+         source="NCBI RefSeq GCF_000017745.1 (ASM1774v1), ETEC strain E24377A",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/017/745/"
+              "GCF_000017745.1_ASM1774v1/GCF_000017745.1_ASM1774v1_genomic.fna.gz"),
+         sha256="919e37f0a296bac5d8e4b221cdc0f4514df725cca4db53d170b72a6afabfd15e"),
+    dict(name="ecoli_uti89", category="real_genome", kind="fetched",
+         source="NCBI RefSeq GCF_000013265.1 (ASM1326v1), UPEC/ExPEC strain UTI89",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/013/265/"
+              "GCF_000013265.1_ASM1326v1/GCF_000013265.1_ASM1326v1_genomic.fna.gz"),
+         sha256="81c3f1807af638bce3f95c15a8d87ee24184b02777d52fb05634e00b55429124"),
+    dict(name="ecoli_umn026", category="real_genome", kind="fetched",
+         source="NCBI RefSeq GCF_000026325.1 (ASM2632v2), ExPEC strain UMN026",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/026/325/"
+              "GCF_000026325.1_ASM2632v2/GCF_000026325.1_ASM2632v2_genomic.fna.gz"),
+         sha256="d40e06f1490c5777c379ad925caa6361e8588e9c65535437d46ca44b3bebb46b"),
+    dict(name="ecoli_apec_o1", category="real_genome", kind="fetched",
+         source="NCBI RefSeq GCF_000014845.1 (ASM1484v1), avian-pathogenic ExPEC strain APEC O1",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/014/845/"
+              "GCF_000014845.1_ASM1484v1/GCF_000014845.1_ASM1484v1_genomic.fna.gz"),
+         sha256="f0ab95865593beb469d9423c75a5ba49bb5f3f142f61c5d0820b9980a41903f2"),
+    dict(name="ecoli_536", category="real_genome", kind="fetched",
+         source="NCBI RefSeq GCF_000013305.1 (ASM1330v1), UPEC/ExPEC strain 536",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/013/305/"
+              "GCF_000013305.1_ASM1330v1/GCF_000013305.1_ASM1330v1_genomic.fna.gz"),
+         sha256="68319392e5ea6cb477d6a4908298e936c8f8f0d1cff85054d956c17891589534"),
+    dict(name="ecoli_iai1", category="real_genome", kind="fetched",
+         source="NCBI RefSeq GCF_000026265.1 (ASM2626v1), commensal strain IAI1",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/026/265/"
+              "GCF_000026265.1_ASM2626v1/GCF_000026265.1_ASM2626v1_genomic.fna.gz"),
+         sha256="c65a68318dc65b95141d6bdb0f7457d6b3c561ae7e8271407bc215317074a5ae"),
+    dict(name="ecoli_55989", category="real_genome", kind="fetched",
+         source="NCBI RefSeq GCF_000026245.1 (ASM2624v1), EAEC strain 55989",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/026/245/"
+              "GCF_000026245.1_ASM2624v1/GCF_000026245.1_ASM2624v1_genomic.fna.gz"),
+         sha256="bd737a35a5e4b8d731d43d5708270f60381ba226acc63ca58a1cca83ec2c371a"),
+    dict(name="ecoli_s88", category="real_genome", kind="fetched",
+         source="NCBI RefSeq GCF_000026285.1 (ASM2628v2), ExPEC strain S88 (meningitis-associated)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/026/285/"
+              "GCF_000026285.1_ASM2628v2/GCF_000026285.1_ASM2628v2_genomic.fna.gz"),
+         sha256="335dd2635bcb9cc98b29a2058f060201ee065cc49c2c877fa9b5134e4694f1f8"),
+    dict(name="ecoli_ed1a", category="real_genome", kind="fetched",
+         source="NCBI RefSeq GCF_000026305.1 (ASM2630v1), commensal strain ED1a",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/026/305/"
+              "GCF_000026305.1_ASM2630v1/GCF_000026305.1_ASM2630v1_genomic.fna.gz"),
+         sha256="cab7fda0166436e7426dbe5f4341b07b15b517a9f7cc7fc8d9bc782c47d3b29e"),
+    dict(name="ecoli_iai39", category="real_genome", kind="fetched",
+         source="NCBI RefSeq GCF_000026345.1 (ASM2634v1), ExPEC strain IAI39",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/026/345/"
+              "GCF_000026345.1_ASM2634v1/GCF_000026345.1_ASM2634v1_genomic.fna.gz"),
+         sha256="a8384b63f8071022f01ebe2cd9ff331a04117564a8f0f04aeceba2aa4b554261"),
+
     # --- D. curated frequent-k-mer regions ----------------------------------
     # Already exist somewhere outside this repo; point --data-dir (see
     # config.py) at wherever they live to use them as-is, no fetch/generate
@@ -114,12 +201,19 @@ DATASETS = [
       for n in (1, 2, 4, 8)],
 
     # Real-strain counterpart (secondary/stretch goal per the design doc):
-    # three genuinely distinct, independently-sequenced E. coli genomes
+    # genuinely distinct, independently-sequenced E. coli genomes
     # concatenated, rather than one reference plus simulated point mutations.
     # kind="concat" just cats the resolved FASTAs of `refs` together --
     # no divergence knob, no seed, because there's nothing to simulate.
     dict(name="pangenome_ecoli_real_n3", category="pangenome", kind="concat",
          refs=["@ecoli_k12", "@ecoli_sakai", "@ecoli_cft073"]),
+
+    # n=8 and n=16 prefixes of REAL_ECOLI_STRAIN_POOL above -- the real-data
+    # counterpart of the simulated pangenome_ecoli_n{1,2,4,8} sweep, now that
+    # 16 distinct real strains are available to draw from.
+    *[dict(name=f"pangenome_ecoli_real_n{n}", category="pangenome", kind="concat",
+           refs=REAL_ECOLI_STRAIN_POOL[:n])
+      for n in (8, 16)],
 ]
 
 # Shapes to sweep per dataset. Trimmed down from the weight-30 family in
