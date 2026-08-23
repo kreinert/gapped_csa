@@ -312,7 +312,10 @@ public:
         auto t0 = Clock::now();
         G_ = build_gapped_sa(shape, std::move(text));
         auto t1 = Clock::now();
+        regular_mode_ = false;
         span_ = shape.span;
+        add_stride_ = span_;
+        base_depth_ = 1;
         max_add_ = std::max(1, max_add);
         algo_ = algo;
         phase2_iters_ = std::max(0, phase2_iters);
@@ -327,6 +330,42 @@ public:
                 ms(t0, t1), algo_name(algo_), ms(t1, t2), G_.m());
         }
     }
+
+    // Regular (ungapped) suffix array mode: no LexText is built, k-mer
+    // occurrences are grouped by LCP >= k (character-level) instead of
+    // LCP >= 1 (symbol-level). Functionally equivalent to build(Shape::parse
+    // (string(k,'#')), ...) -- same positions_of/locate results -- but via a
+    // cheaper construction path (see build_plain_sa in gapped_sa.hpp).
+    void build(int k, std::string text,
+               int max_add = 8, CompressAlgo algo = CompressAlgo::Greedy,
+               int phase2_iters = 0) {
+        using Clock = std::chrono::steady_clock;
+        const bool timing = (std::getenv("GCSA_TIMING") != nullptr);
+        auto t0 = Clock::now();
+        G_ = build_plain_sa(k, std::move(text));
+        auto t1 = Clock::now();
+        regular_mode_ = true;
+        span_ = k;          // window width in characters, used by locate()
+        add_stride_ = 1;    // one unit of `add` = one character
+        base_depth_ = k;    // full k-mer match = k characters, not 1 symbol
+        max_add_ = std::max(1, max_add);
+        algo_ = algo;
+        phase2_iters_ = std::max(0, phase2_iters);
+        compress_();
+        auto t2 = Clock::now();
+        if (timing) {
+            auto ms = [](Clock::time_point a, Clock::time_point b) {
+                return std::chrono::duration<double, std::milli>(b - a).count();
+            };
+            gcsa_log(
+                "[timing] plain_sa=%.1fms  compress(%s)=%.1fms  m=%zu intervals~kmers later\n",
+                ms(t0, t1), algo_name(algo_), ms(t1, t2), G_.m());
+        }
+    }
+
+    bool regular_mode() const { return regular_mode_; }
+    int add_stride() const { return add_stride_; }
+    uint64_t name_of_rank(int32_t r) const { return name_of_rank_(r); }
 
     CompressAlgo algo() const { return algo_; }
     const GappedSA& gsa() const { return G_; }
@@ -343,7 +382,7 @@ public:
         const HashEntry& e = it->second;
         if (e.has_offset)
             for (uint32_t t = 0; t < e.off_num; ++t)
-                out.push_back(C_[e.off_pos + t] + (int64_t)e.off_add * span_);
+                out.push_back(C_[e.off_pos + t] + (int64_t)e.off_add * add_stride_);
         if (e.has_rest)
             for (uint32_t t = 0; t < e.rest_num; ++t)
                 out.push_back(C_[e.rest_pos + t]);
@@ -394,7 +433,10 @@ public:
     DiffProblem collect_diff_problem(const Shape& shape, std::string text,
                                      int max_add = 8) {
         G_ = build_gapped_sa(shape, std::move(text));
+        regular_mode_ = false;
         span_ = shape.span;
+        add_stride_ = span_;
+        base_depth_ = 1;
         max_add_ = std::max(1, max_add);
         const size_t m = G_.m();
         rank_of_.assign(m, 0);
@@ -411,9 +453,13 @@ public:
         DiffProblem P;
         P.m = m;
         for (size_t r = 0; r < m; ) {
-            uint64_t name = G_.first_symbol((int32_t)r);
+            uint64_t name = name_of_rank_((int32_t)r);
             size_t r2 = r + 1;
-            while (r2 < m && G_.first_symbol((int32_t)r2) == name) ++r2;
+            if (regular_mode_) {
+                while (r2 < m && G_.lcp[r2] >= base_depth_) ++r2;
+            } else {
+                while (r2 < m && G_.first_symbol((int32_t)r2) == name) ++r2;
+            }
             P.intervals.push_back({name, (int32_t)r, (int32_t)r2});
             r = r2;
         }
@@ -467,6 +513,19 @@ private:
     CompressAlgo algo_ = CompressAlgo::Greedy;
     int phase2_iters_ = 0;  // 0 = unspecified; see run_phase2_ for precedence
 
+    // Regular (ungapped) SA mode: no LexText, no mod-residue grouping.
+    //   add_stride_ : characters shifted per unit of `add` (= shape.span in
+    //                 LexText mode, since each lextext symbol packs
+    //                 shape.span characters; = 1 in regular mode, since each
+    //                 symbol is a single character).
+    //   base_depth_ : symbols/characters required for a full name match
+    //                 (= 1 in LexText mode -- DisLex's whole point is that
+    //                 depth-1 already means "same gapped k-mer"; = k in
+    //                 regular mode, where depth is measured in characters).
+    bool regular_mode_ = false;
+    int add_stride_ = 1;
+    int base_depth_ = 1;
+
     std::vector<int64_t> C_;
     std::vector<int64_t> rank_to_C_;
     std::unordered_map<uint64_t, HashEntry> table_;
@@ -493,17 +552,19 @@ private:
         int64_t x = G_.sa[r];
         int64_t y = x - add;
         if (y < 0) return -1;
-        if (G_.lex2orig[y] != G_.lex2orig[x] - (int64_t)add * span_) return -1;
+        if (G_.lex2orig[y] != G_.lex2orig[x] - (int64_t)add * add_stride_) return -1;
         return y;
     }
 
     // Inverse of pred_lexpos_: lextext position add symbols after sa[r], if the
-    // original-text shift is exactly +add*span (same residue class / window).
+    // original-text shift is exactly +add*add_stride_ (same residue class /
+    // window in LexText mode; always true in regular mode, where every
+    // position is its own "window").
     int64_t succ_lexpos_(int32_t r, int add) const {
         int64_t x = G_.sa[r];
         int64_t y = x + add;
         if (y >= (int64_t)G_.m()) return -1;
-        if (G_.lex2orig[y] != G_.lex2orig[x] + (int64_t)add * span_) return -1;
+        if (G_.lex2orig[y] != G_.lex2orig[x] + (int64_t)add * add_stride_) return -1;
         return y;
     }
 
@@ -555,7 +616,7 @@ private:
                 size_t j = i + 1;
                 while (j < pr.size()
                        && pr[j].first == pr[j-1].first + 1
-                       && G_.lcp[pr[j].first] >= add + 1) ++j;
+                       && G_.lcp[pr[j].first] >= add + base_depth_) ++j;
                 const int32_t s_lo = pr[i].first, s_hi = pr[j-1].first + 1;
                 if (s_hi <= lo || s_lo >= hi)
                     emit_run_(name, lo, hi, add, pr, i, j, cov_floor,
@@ -650,10 +711,10 @@ private:
             int32_t a = 0;
             while (a < m) {
                 if (tgt[(size_t)a] < 0) { ++a; continue; }
-                const uint64_t name = G_.first_symbol(tgt[(size_t)a]);
+                const uint64_t name = name_of_rank_(tgt[(size_t)a]);
                 int32_t b = a + 1;
                 while (b < m && tgt[(size_t)b] >= 0
-                       && G_.first_symbol(tgt[(size_t)b]) == name) ++b;
+                       && name_of_rank_(tgt[(size_t)b]) == name) ++b;
                 if (b - a >= kMinCoverage) {
                     for (int32_t t = a; t < b; ++t) src_of[(size_t)tgt[(size_t)t]] = t;
                     const Interval& iv = by_name[name];
@@ -725,8 +786,15 @@ private:
         return Candidate{};
     }
 
-    // First-symbol name of an SA rank.
-    uint64_t name_of_rank_(int32_t r) const { return G_.first_symbol(r); }
+    // The k-mer / gapped-k-mer name occupying SA rank r. In LexText mode this
+    // is a cheap array lookup (the name was precomputed into G_.lex). In
+    // regular mode G_.lex holds raw characters, not names, so the name is
+    // recomputed on demand from the text -- called only once per interval
+    // (not once per rank), so this stays cheap in aggregate.
+    uint64_t name_of_rank_(int32_t r) const {
+        return regular_mode_ ? name_at(G_.shape, G_.text, (size_t)G_.orig_pos(r))
+                              : G_.first_symbol(r);
+    }
 
     // ---- accept / revoke helpers ------------------------------------------
     void accept_(Candidate& c, std::unordered_map<uint64_t, Candidate>& accepted) {
@@ -2999,9 +3067,13 @@ private:
 
         std::vector<Interval> intervals;
         for (size_t r = 0; r < m; ) {
-            uint64_t name = G_.first_symbol((int32_t)r);
+            uint64_t name = name_of_rank_((int32_t)r);
             size_t r2 = r + 1;
-            while (r2 < m && G_.first_symbol((int32_t)r2) == name) ++r2;
+            if (regular_mode_) {
+                while (r2 < m && G_.lcp[r2] >= base_depth_) ++r2;
+            } else {
+                while (r2 < m && G_.first_symbol((int32_t)r2) == name) ++r2;
+            }
             intervals.push_back({name, (int32_t)r, (int32_t)r2});
             r = r2;
         }

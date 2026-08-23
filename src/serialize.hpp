@@ -126,7 +126,10 @@ struct SerializedIndex {
 
 inline SerializedIndex serialize_index(const CompressedIndex& idx) {
     SerializedIndex S;
-    S.span = idx.gsa().shape.span;
+    // Not shape.span: that's the k-mer/window width, which diverges from the
+    // add-shift stride in regular (ungapped) mode (window=k, stride=1). Pull
+    // the stride straight from the index so both modes decode correctly.
+    S.span = idx.add_stride();
 
     const std::vector<int64_t>& C = idx.compressed_positions();
     S.C_count = C.size();

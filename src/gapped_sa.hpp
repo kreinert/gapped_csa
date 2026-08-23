@@ -54,6 +54,83 @@ struct GappedSA {
     uint64_t first_symbol(int32_t rank) const { return lex[sa[rank]]; }
 };
 
+// Kasai's algorithm: LCP array (in units of `lex` symbols) for a suffix array
+// `sa` of the integer string `lex`. lcp[r] = shared-prefix length (in `lex`
+// symbols) between the suffixes at sa[r-1] and sa[r]; lcp[0] = 0. Shared by
+// both build_gapped_sa (symbol space = gapped k-mer names) and build_plain_sa
+// (symbol space = raw characters) -- the algorithm itself doesn't care what
+// the symbols mean.
+inline std::vector<int32_t> kasai_lcp(const std::vector<uint64_t>& lex,
+                                       const std::vector<int32_t>& sa) {
+    const size_t m = lex.size();
+    std::vector<int32_t> rank(m);
+    for (size_t r = 0; r < m; ++r) rank[sa[r]] = (int32_t)r;
+    std::vector<int32_t> lcp(m, 0);
+    int h = 0;
+    for (size_t i = 0; i < m; ++i) {
+        if (rank[i] > 0) {
+            size_t j = sa[rank[i] - 1];
+            while (i + h < m && j + h < m && lex[i + h] == lex[j + h]) ++h;
+            lcp[rank[i]] = h;
+            if (h > 0) --h;
+        } else {
+            h = 0;
+        }
+    }
+    return lcp;
+}
+
+// Plain (ungapped) suffix array of the raw text, built directly over the
+// small {$,A,C,G,T} alphabet -- no per-position k-mer name computation, no
+// mod-residue grouping, no alphabet remap. `k` only affects G.shape (used for
+// naming k-mers of that width downstream, e.g. interval identity in
+// compress.hpp); the SA/LCP themselves don't depend on k at all. This isolates
+// the cost of DisLex's per-position name computation + big-alphabet sort from
+// suffix-sorting itself: for a contiguous shape "######" (span==weight==k),
+// build_gapped_sa produces the same total suffix order as this function.
+inline GappedSA build_plain_sa(int k, std::string text) {
+    using Clock = std::chrono::steady_clock;
+    const bool timing = (std::getenv("GCSA_TIMING") != nullptr);
+    auto ms = [](Clock::time_point a, Clock::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+
+    GappedSA G;
+    G.shape = Shape::parse(std::string((size_t)k, '#'));
+    G.text  = std::move(text);
+    G.n     = G.text.size();
+
+    // 1) Map characters directly to a small dense alphabet: $ = 0 (unique
+    //    sentinel at position n), A/C/G/T = 1..4. No name_at() calls.
+    auto t0 = Clock::now();
+    const size_t m = G.n + 1;
+    G.lex.resize(m);
+    G.lex2orig.resize(m);
+    for (size_t i = 0; i < m; ++i) {
+        G.lex[i] = (i < G.n) ? (uint64_t)(base_value(G.text[i]) + 1) : 0;
+        G.lex2orig[i] = (int64_t)i;   // identity: no mod-grouping in plain mode
+    }
+    G.alphabet_size = SIGMA + 1;
+    auto t1 = Clock::now();
+
+    // 2) Suffix-sort the small-alphabet character string directly with SA-IS.
+    std::vector<int32_t> chars(m);
+    for (size_t i = 0; i < m; ++i) chars[i] = (int32_t)G.lex[i];
+    G.sa = sais_int(chars, G.alphabet_size);
+    auto t2 = Clock::now();
+
+    // 3) Kasai LCP in character space.
+    G.lcp = kasai_lcp(G.lex, G.sa);
+    auto t3 = Clock::now();
+
+    if (timing) {
+        std::fprintf(stderr,
+            "[timing] plain charmap=%.1fms  SA-IS=%.1fms  LCP=%.1fms  m=%zu sigma=%d\n",
+            ms(t0, t1), ms(t1, t2), ms(t2, t3), m, G.alphabet_size);
+    }
+    return G;
+}
+
 inline GappedSA build_gapped_sa(const Shape& shape, std::string text) {
     using Clock = std::chrono::steady_clock;
     const bool timing = (std::getenv("GCSA_TIMING") != nullptr);
@@ -98,20 +175,7 @@ inline GappedSA build_gapped_sa(const Shape& shape, std::string text) {
     auto t3 = Clock::now();
 
     // 4) Kasai LCP in symbol space.
-    std::vector<int32_t> rank(m);
-    for (size_t r = 0; r < m; ++r) rank[G.sa[r]] = (int32_t)r;
-    G.lcp.assign(m, 0);
-    int h = 0;
-    for (size_t i = 0; i < m; ++i) {
-        if (rank[i] > 0) {
-            size_t j = G.sa[rank[i] - 1];
-            while (i + h < m && j + h < m && G.lex[i + h] == G.lex[j + h]) ++h;
-            G.lcp[rank[i]] = h;
-            if (h > 0) --h;
-        } else {
-            h = 0;
-        }
-    }
+    G.lcp = kasai_lcp(G.lex, G.sa);
     auto t4 = Clock::now();
     if (timing) {
         std::fprintf(stderr,

@@ -83,17 +83,19 @@ static void print_sa_tables(const CompressedIndex& idx, int max_suffix_syms = 14
     const GappedSA& G = idx.gsa();
     const Shape& sh = G.shape;
 
-    std::cout << "\n=== Full gapped suffix array (shape " << sh.pattern << ") ===\n";
+    std::cout << "\n=== Full " << (idx.regular_mode() ? "plain" : "gapped")
+              << " suffix array (shape " << sh.pattern << ") ===\n";
     std::cout << std::right
               << std::setw(4) << "Rk" << " | " << std::setw(6) << "lexSA" << " | "
               << std::setw(5) << "orig" << " | " << std::setw(6) << "code" << " | "
               << std::setw(6) << "kmer" << " | " << std::setw(4) << "lcp" << " | suffix(codes)\n";
     for (size_t r = 0; r < G.m(); ++r) {
         int32_t lexpos = G.sa[r];
+        uint64_t nm = idx.name_of_rank((int32_t)r);
         std::cout << std::setw(4) << r << " | " << std::setw(6) << lexpos << " | "
                   << std::setw(5) << G.orig_pos((int32_t)r) << " | "
-                  << std::setw(6) << G.first_symbol((int32_t)r) << " | "
-                  << std::setw(6) << name_to_string(sh, G.first_symbol((int32_t)r)) << " | "
+                  << std::setw(6) << nm << " | "
+                  << std::setw(6) << name_to_string(sh, nm) << " | "
                   << std::setw(4) << G.lcp[r] << " | ";
         for (int k = 0; k < max_suffix_syms && lexpos + k < (int)G.m(); ++k)
             std::cout << G.lex[lexpos + k] << ' ';
@@ -111,7 +113,7 @@ static void print_sa_tables(const CompressedIndex& idx, int max_suffix_syms = 14
         if (kept) std::cout << std::setw(7) << idx.rank_c_index((int32_t)r);
         else      std::cout << std::setw(7) << "x";
         std::cout << " | " << std::setw(5) << G.orig_pos((int32_t)r) << " | "
-                  << std::setw(6) << name_to_string(sh, G.first_symbol((int32_t)r)) << " | "
+                  << std::setw(6) << name_to_string(sh, idx.name_of_rank((int32_t)r)) << " | "
                   << std::setw(4) << G.lcp[r] << " | "
                   << (kept ? "C[" + std::to_string(idx.rank_c_index((int32_t)r)) + "] = "
                              + std::to_string(G.orig_pos((int32_t)r))
@@ -151,7 +153,15 @@ static void print_usage(const char* argv0) {
         << "  " << argv0 << " -g <fasta> -s <shape> -r <reads.fasta>   # locate reads\n"
         << "\nOptions:\n"
         << "  -g <fasta>          genome FASTA (default: the note's example text)\n"
-        << "  -s <shape>          gapped shape, e.g. \"#.#\" (default: #.#)\n"
+        << "  -s <shape>          gapped shape, e.g. \"#.#\" (default: #.#); or a bare\n"
+        << "                      positive integer k (e.g. \"6\") for a REGULAR\n"
+        << "                      (ungapped) suffix array compressed to support k-mer\n"
+        << "                      lookup: no LexText is built, compression intervals\n"
+        << "                      are LCP>=k (characters) instead of LCP>=1 (symbols).\n"
+        << "                      Same positions_of()/locate() results as the\n"
+        << "                      equivalent contiguous shape (k '#'s), different\n"
+        << "                      (cheaper) construction path.\n"
+        << "  --shape=<value>     long-form alias for -s\n"
         << "  -q <query>          query string to locate\n"
         << "  -r <reads.fasta>    locate every read in a FASTA\n"
         << "  --algo <name>       greedy|dep-order|tree-dp|tree-dp3|tree-dp4"
@@ -188,6 +198,7 @@ int main(int argc, char** argv) {
         auto need = [&](const char* n){ if (++i>=argc){ std::cerr<<"missing value for "<<n<<"\n"; std::exit(1);} return std::string(argv[i]); };
         if      (k == "-g") genome_path = need("-g");
         else if (k == "-s") shape_str   = need("-s");
+        else if (k.rfind("--shape=", 0) == 0) shape_str = k.substr(8);
         else if (k == "-q") query       = need("-q");
         else if (k == "-r") reads_path  = need("-r");
         else if (k == "--table") want_table = true;
@@ -243,9 +254,31 @@ int main(int argc, char** argv) {
         text = load_dna(genome_path);
     }
 
-    Shape sh = Shape::parse(shape_str);
-    std::cout << "shape=" << shape_str << " span=" << sh.span << " weight=" << sh.weight
-              << " n=" << text.size() << "  algo=" << algo_name(algo) << "\n";
+    // A bare positive integer for -s/--shape means "regular (ungapped) suffix
+    // array, compressed to support k-mer lookup" instead of a #/. pattern: no
+    // LexText is built, and compression intervals are LCP>=k instead of
+    // LCP>=1 (see build(int, ...) in compress.hpp / build_plain_sa in
+    // gapped_sa.hpp). The Shape below is only used for naming/self-test here
+    // -- it's the same contiguous shape build(int,...) uses internally, so
+    // it's consistent with the index by construction.
+    bool regular = !shape_str.empty() &&
+        shape_str.find_first_not_of("0123456789") == std::string::npos;
+    int regular_k = 0;
+    if (regular) {
+        regular_k = std::stoi(shape_str);
+        if (regular_k < 1) {
+            std::cerr << "-s/--shape: k must be >= 1\n";
+            return 1;
+        }
+    }
+    Shape sh = regular ? Shape::parse(std::string((size_t)regular_k, '#'))
+                        : Shape::parse(shape_str);
+    if (regular)
+        std::cout << "mode=regular (no LexText) k=" << regular_k
+                  << " n=" << text.size() << "  algo=" << algo_name(algo) << "\n";
+    else
+        std::cout << "shape=" << shape_str << " span=" << sh.span << " weight=" << sh.weight
+                  << " n=" << text.size() << "  algo=" << algo_name(algo) << "\n";
 
     // Resolve the min-coverage floor before building: it gates candidate
     // enumeration inside idx.build(), so it must be set first. Precedence:
@@ -279,7 +312,8 @@ int main(int argc, char** argv) {
     }
 
     CompressedIndex idx;
-    idx.build(sh, text, max_add, algo, phase2_iters);
+    if (regular) idx.build(regular_k, text, max_add, algo, phase2_iters);
+    else         idx.build(sh, text, max_add, algo, phase2_iters);
 
     std::cout << "distinct k-mers      : " << idx.num_kmers() << "\n";
     std::cout << "SA entries (m)       : " << idx.total_positions() << "\n";
