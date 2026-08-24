@@ -45,7 +45,9 @@ def sha256_of(path: Path, retries: int = 4, base_delay: float = 0.5) -> str:
     (EBUSY and friends -- typical of a network/shared mount that's mid-sync
     or briefly locked by another process right after a write). Raises the
     last OSError if it's still unreadable after `retries` attempts."""
-    last_err = None
+    if retries < 1:
+        raise ValueError("retries must be >= 1")
+    last_err: "OSError | None" = None
     for attempt in range(retries):
         try:
             h = hashlib.sha256()
@@ -62,6 +64,7 @@ def sha256_of(path: Path, retries: int = 4, base_delay: float = 0.5) -> str:
                       f"yet ({reason}, errno={e.errno}) -- retrying in {delay:.1f}s",
                       file=sys.stderr)
                 time.sleep(delay)
+    assert last_err is not None  # retries >= 1 guarantees the loop set this
     raise last_err
 
 
