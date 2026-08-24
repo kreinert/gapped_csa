@@ -22,6 +22,14 @@ Usage:
   ./run_suite.py --only-dataset repeat_50pct_x50_y200
   ./run_suite.py --dry-run                        # show the plan, run nothing
   ./run_suite.py --resume                         # skip rows already in --out
+  ./run_suite.py --log-dir logs                    # keep every ./gcsa
+                                                    # invocation's full
+                                                    # stdout+stderr for
+                                                    # inspection (see --out's
+                                                    # log_path column)
+  ./run_suite.py --disable-phase2                  # GCSA_DISABLE_PHASE2=1 for
+                                                    # every run (Phase I /
+                                                    # leftover only)
 """
 import argparse
 import csv
@@ -38,11 +46,23 @@ from datasets import ALGOS, DATASETS, MAX_ADDS, SHAPES, SKIP_SELFTEST_ABOVE_BYTE
 
 CSV_FIELDS = [
     "dataset", "category", "path", "raw_bytes", "gzip_bytes", "gzip_ratio",
-    "shape", "span", "weight", "algo", "max_add",
+    "shape", "span", "weight", "algo", "max_add", "phase2",
     "distinct_kmers", "m", "C", "keep_pct",
     "bytes_total", "full_sa_bytes", "size_pct",
-    "self_test", "roundtrip", "wall_ms", "status",
+    "self_test", "roundtrip", "wall_ms", "status", "log_path",
 ]
+
+# Characters a shape string may legitimately contain (see main.cpp) --
+# used only to sanity-check before dropping a shape straight into a log
+# filename; SHAPES in datasets.py never produces anything outside this.
+_SHAPE_FILENAME_SAFE = re.compile(r"^[#.]+$")
+
+
+def log_filename(dataset: str, shape: str, algo: str, max_add: int,
+                  disable_phase2: bool) -> str:
+    shape_part = shape if _SHAPE_FILENAME_SAFE.match(shape) else re.sub(r"[^\w.-]", "_", shape)
+    suffix = "__nophase2" if disable_phase2 else ""
+    return f"{dataset}__{shape_part}__{algo}__ma{max_add}{suffix}.log"
 
 GCSA_RE = {
     "span": re.compile(r"\bspan=(\d+)"),
@@ -190,8 +210,33 @@ def already_done(out_csv: Path) -> set:
     done = set()
     with open(out_csv, newline="") as f:
         for row in csv.DictReader(f):
-            done.add((row["dataset"], row["shape"], row["algo"], row["max_add"]))
+            # row.get("phase2", "on"): a CSV written before --disable-phase2
+            # existed has no "phase2" column at all -- treat every row in it
+            # as a phase2-on run, which is what it actually was.
+            done.add((row["dataset"], row["shape"], row["algo"], row["max_add"],
+                       row.get("phase2") or "on"))
     return done
+
+
+def check_resumable_schema(out_csv: Path) -> None:
+    """--resume appends to an existing CSV with a plain csv.DictWriter, which
+    does not re-check the header -- if --out's on-disk header doesn't match
+    CSV_FIELDS (e.g. an older suite.csv from before --log-dir/--disable-phase2
+    added columns), appending would silently misalign columns. Fail loudly
+    instead and say what to do."""
+    if not out_csv.exists():
+        return
+    with open(out_csv, newline="") as f:
+        header = next(csv.reader(f), None)
+    if header is not None and header != CSV_FIELDS:
+        sys.exit(
+            f"[error] --resume target {out_csv} has an older column layout "
+            f"than this version of run_suite.py expects.\n"
+            f"  on disk : {header}\n"
+            f"  expected: {CSV_FIELDS}\n"
+            f"Point --out at a new file for this run, or rerun without "
+            f"--resume to regenerate it from scratch."
+        )
 
 
 def main():
@@ -212,8 +257,20 @@ def main():
     ap.add_argument("--keep-synthetic", action="store_true",
                      help="don't delete generated synthetic FASTAs from --tmp-dir afterward")
     ap.add_argument("--resume", action="store_true",
-                     help="skip (dataset, shape, algo, max_add) rows already in --out")
+                     help="skip (dataset, shape, algo, max_add, phase2) rows already in --out")
     ap.add_argument("--dry-run", action="store_true", help="print the plan, run nothing")
+    ap.add_argument("--log-dir", default=None,
+                     help="write each ./gcsa invocation's full stdout+stderr here, one "
+                          "file per (dataset, shape, algo, max_add) -- see log_filename() "
+                          "for the naming scheme. Off by default (nothing extra is kept "
+                          "beyond the parsed CSV row and, on failure, a 200-char stderr "
+                          "snippet in the 'status' column).")
+    ap.add_argument("--disable-phase2", action="store_true",
+                     help="set GCSA_DISABLE_PHASE2=1 for every ./gcsa invocation (Phase I "
+                          "/ leftover-DP output only, no Phase II local-search pass). "
+                          "Recorded in the 'phase2' CSV column so phase2-on and "
+                          "phase2-off rows for the same (dataset, shape, algo, max_add) "
+                          "can coexist in one --out without colliding.")
     args = ap.parse_args()
 
     bin_dir = config.resolve("BIN_DIR", args.bin_dir)
@@ -222,6 +279,9 @@ def main():
     out_csv = Path(args.out)
     tmp_dir.mkdir(parents=True, exist_ok=True)
     out_csv.parent.mkdir(parents=True, exist_ok=True)
+    log_dir = Path(args.log_dir) if args.log_dir else None
+    if log_dir is not None:
+        log_dir.mkdir(parents=True, exist_ok=True)
 
     by_name = {d["name"]: d for d in DATASETS}
     datasets = DATASETS
@@ -235,8 +295,11 @@ def main():
     def log(msg):
         print(msg, file=sys.stderr)
 
+    phase2_label = "off" if args.disable_phase2 else "on"
     log(f"bin-dir={bin_dir}  data-dir={data_dir}  tmp-dir={tmp_dir}  "
         f"(run 'python3 config.py' to see where each came from)")
+    log(f"phase2={phase2_label}"
+        + (f"  log-dir={log_dir}" if log_dir is not None else "  log-dir=(disabled)"))
 
     if args.dry_run:
         print(f"{len(datasets)} datasets x {len(args.shapes)} shapes x "
@@ -246,6 +309,8 @@ def main():
             print(f"  {d['name']:<28} category={d['category']:<12} kind={d['kind']}")
         return
 
+    if args.resume:
+        check_resumable_schema(out_csv)
     skip_done = already_done(out_csv) if args.resume else set()
     write_header = not (args.resume and out_csv.exists())
     resolved_cache = {}
@@ -269,17 +334,20 @@ def main():
             for shape in args.shapes:
                 for algo in args.algos:
                     for max_add in args.max_adds:
-                        key = (ds["name"], shape, algo, str(max_add))
+                        key = (ds["name"], shape, algo, str(max_add), phase2_label)
                         if key in skip_done:
                             continue
 
                         row = dict(dataset=ds["name"], category=ds["category"],
                                    path=str(path), raw_bytes=raw, gzip_bytes=gz,
                                    gzip_ratio=round(ratio, 4), shape=shape, algo=algo,
-                                   max_add=max_add, status="ok")
+                                   max_add=max_add, phase2=phase2_label, status="ok",
+                                   log_path="")
                         env = dict(os.environ)
                         if skip_selftest:
                             env["GCSA_SKIP_SELFTEST"] = "1"
+                        if args.disable_phase2:
+                            env["GCSA_DISABLE_PHASE2"] = "1"
 
                         cmd = [str(bin_dir / "gcsa"), "-g", str(path), "-s", shape,
                                "--algo", algo, "--max-add", str(max_add)]
@@ -299,6 +367,23 @@ def main():
                                 log(f"  [FAIL] {ds['name']} {shape} {algo} ma={max_add}: "
                                     f"self_test={row.get('self_test')} "
                                     f"roundtrip={row.get('roundtrip')}")
+
+                        if log_dir is not None:
+                            log_path = log_dir / log_filename(
+                                ds["name"], shape, algo, max_add, args.disable_phase2)
+                            env_note = " ".join(
+                                f"{k}={v}" for k in ("GCSA_SKIP_SELFTEST", "GCSA_DISABLE_PHASE2")
+                                if (v := env.get(k)) is not None
+                            ) or "(none)"
+                            log_path.write_text(
+                                f"$ {' '.join(cmd)}\n"
+                                f"env overrides: {env_note}\n"
+                                f"exit_code: {r.returncode}\n"
+                                f"wall_ms: {row['wall_ms']}\n"
+                                f"\n=== stdout ===\n{r.stdout}"
+                                f"\n=== stderr ===\n{r.stderr}"
+                            )
+                            row["log_path"] = str(log_path)
 
                         writer.writerow(row)
                         fcsv.flush()

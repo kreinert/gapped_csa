@@ -44,23 +44,39 @@ Useful flags:
   `datasets.py` for a quick pass (the full default matrix is 4 algorithms x
   2 max_adds x 4 shapes x every dataset -- real-genome-scale inputs are slow
   enough that you'll usually want a narrower `--shapes`/`--algos` first).
-- `--resume` -- skip `(dataset, shape, algo, max_add)` rows already present
-  in `--out`, so an interrupted run (or one you're extending with a new
-  dataset) doesn't redo everything.
+- `--resume` -- skip `(dataset, shape, algo, max_add, phase2)` rows already
+  present in `--out`, so an interrupted run (or one you're extending with a
+  new dataset) doesn't redo everything. Appending to a `--out` written by an
+  older run_suite.py (different columns) fails loudly rather than silently
+  misaligning the CSV -- point `--out` at a new file in that case.
 - `--keep-synthetic` -- don't delete generated FASTAs from `--tmp-dir`
   afterward, if you want to inspect one.
+- `--log-dir DIR` -- keep every `./gcsa` invocation's full stdout+stderr as
+  `DIR/<dataset>__<shape>__<algo>__ma<max_add>[__nophase2].log` (command,
+  env overrides, exit code, wall time, then the raw output). Off by default
+  -- without it you only get the parsed CSV row plus, on failure, a 200-char
+  stderr snippet in `status`. Written on both success and failure, so this
+  is the first place to look when a run errors or fails `self_test`/
+  `roundtrip`; the row's own `log_path` column points straight at its file.
+- `--disable-phase2` -- set `GCSA_DISABLE_PHASE2=1` for every invocation
+  (Phase I / leftover-DP output only, no Phase II local-search pass).
+  Recorded in the `phase2` CSV column (`on`/`off`), so a phase2-on and a
+  phase2-off run of the same `(dataset, shape, algo, max_add)` can sit in
+  the same `--out` without one being mistaken for a rerun of the other.
 
 Frequent k-mer datasets (and all other datasets with `kind = provided`) are
 expected to already exist in `--data-dir`.
 
 ## Output
 
-One row per `(dataset, shape, algorithm, max_add)` in `results/suite.csv`
-(gitignored -- results are a run artifact, not source). Columns: the
-dataset's `gzip_ratio` (input-compressibility baseline) alongside `keep_pct`
-/ `size_pct` (index-compressibility, from `./gcsa`'s own report) and
-`wall_ms`, `self_test`, `roundtrip`. Load it with pandas/whatever and plot
-`gzip_ratio` vs `size_pct` per the design doc's main chart.
+One row per `(dataset, shape, algorithm, max_add, phase2)` in
+`results/suite.csv` (gitignored -- results are a run artifact, not source).
+Columns: the dataset's `gzip_ratio` (input-compressibility baseline)
+alongside `keep_pct`/`size_pct` (index-compressibility, from `./gcsa`'s own
+report), `wall_ms`, `self_test`, `roundtrip`, whether Phase II ran
+(`phase2`), and `log_path` (empty unless `--log-dir` was given). Load it
+with pandas/whatever and plot `gzip_ratio` vs `size_pct` per the design
+doc's main chart.
 
 ## Extending
 

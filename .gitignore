@@ -36,6 +36,9 @@ external/
 
 # benchmark suite output (run artifact, not source -- see bench/README.md)
 /bench/results/
+/bench/logs/
+# (the blanket *.log rule above already covers any log dir/name you pick
+# with --log-dir; this entry just documents the conventional one)
 
 # per-machine paths for the benchmark suite -- never commit a real
 # filesystem path; see bench/config.local.py.example
