@@ -63,6 +63,45 @@ Useful flags:
   Recorded in the `phase2` CSV column (`on`/`off`), so a phase2-on and a
   phase2-off run of the same `(dataset, shape, algo, max_add)` can sit in
   the same `--out` without one being mistaken for a rerun of the other.
+- `--env KEY=VALUE [KEY=VALUE ...]` -- any other environment variable for
+  every `./gcsa` invocation, e.g. `--env GCSA_PHASE2_MAX_ITERS=50
+  GCSA_QUIET=1` (see `compress.hpp` for the full `GCSA_PHASE2_*` /
+  `GCSA_QUIET` knob list). Applied after, and so overrides, the automatic
+  `GCSA_SKIP_SELFTEST`. Not its own CSV column (arbitrary keys don't fit a
+  fixed schema) -- pair it with `--log-dir` if you want a per-row record of
+  exactly what was set. One gotcha: `./gcsa` checks `GCSA_DISABLE_PHASE2`
+  for *presence*, not value, so `--env GCSA_DISABLE_PHASE2=0` does NOT
+  re-enable Phase II if `--disable-phase2` was also passed -- for that one
+  variable, just omit `--disable-phase2` instead of trying to override it.
+- `--jobs N` -- run up to N `./gcsa` invocations concurrently (within the
+  shape x algo x max_add matrix for one dataset at a time; resolving/
+  cleaning up each dataset's FASTA itself stays sequential). Match N to the
+  CPUs actually available to this process -- on a shared or scheduled
+  machine that's usually less than the box's total core count, e.g.
+  `$SLURM_CPUS_PER_TASK` under SLURM, not `nproc`. Default 1 (sequential,
+  same behavior as before this flag existed). Output is identical to a
+  sequential run either way (same rows, same `--log-dir` files, same
+  `--resume` behavior) -- only the wall-clock time and row order change.
+- `--shard I/N` -- process only the datasets at index i where `i % N == I`
+  (0-based I), e.g. `--shard 0/4` .. `--shard 3/4` to split one run across
+  four independent cluster array tasks. Splits by dataset, not by row, so
+  every `(shape, algo, max_add)` combination for a given dataset lands in
+  the same shard. Filters *after* `--only-category`/`--only-dataset`, over
+  whatever's left. Each shard needs its own `--out` so parallel jobs don't
+  clobber each other's file -- if you don't pass `--out` explicitly while
+  using `--shard`, one is picked for you (`results/suite.shard<I>of<N>.csv`).
+  Combine `--shard` with `--jobs` for a two-level cluster setup (N array
+  tasks, each running up to `--jobs` invocations at once) -- for example, a
+  SLURM array job:
+  ```bash
+  ./run_suite.py --shard $SLURM_ARRAY_TASK_ID/$SLURM_ARRAY_TASK_COUNT \
+                  --jobs $SLURM_CPUS_PER_TASK
+  ```
+  Afterward, merge the per-shard CSVs (they all share the same header):
+  ```bash
+  head -1 results/suite.shard0of4.csv > results/suite.csv
+  tail -n +2 -q results/suite.shard*of4.csv >> results/suite.csv
+  ```
 
 Frequent k-mer datasets (and all other datasets with `kind = provided`) are
 expected to already exist in `--data-dir`.

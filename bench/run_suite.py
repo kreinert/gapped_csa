@@ -42,8 +42,34 @@ Usage:
                                                     # presence-checked, not
                                                     # value-checked, so --env
                                                     # can't force it back off.
+
+Two ways to run this concurrently on a cluster -- combine them freely:
+
+  ./run_suite.py --jobs 8                          # up to 8 ./gcsa processes
+                                                    # at once within this one
+                                                    # run_suite.py process
+                                                    # (match to your allocated
+                                                    # CPUs -- each ./gcsa is
+                                                    # its own OS process, so
+                                                    # this multiplies real CPU
+                                                    # usage, not just
+                                                    # wall-clock).
+  ./run_suite.py --shard 0/4 --out results/s0.csv  # this is shard 0 of 4 --
+  ./run_suite.py --shard 1/4 --out results/s1.csv  # run the other 3 as
+  ...                                               # separate cluster
+                                                    # jobs/array tasks, then
+                                                    # concatenate the CSVs
+                                                    # (see README). Splits by
+                                                    # dataset (not by row) so
+                                                    # each dataset's fetch/
+                                                    # generate + gzip cost is
+                                                    # paid once total, not
+                                                    # once per shard.
+  # a SLURM array job putting both together:
+  #   --shard $SLURM_ARRAY_TASK_ID/$SLURM_ARRAY_TASK_COUNT --jobs $SLURM_CPUS_PER_TASK
 """
 import argparse
+import concurrent.futures
 import csv
 import gzip
 import os
@@ -251,6 +277,68 @@ def check_resumable_schema(out_csv: Path) -> None:
         )
 
 
+def run_experiment(bin_dir, path, ds, raw, gz, ratio, shape, algo, max_add,
+                    phase2_label, skip_selftest, disable_phase2, extra_env,
+                    log_dir):
+    """Run one (shape, algo, max_add) experiment for an already-resolved
+    dataset and return (row, log_path, log_text, fail_msg) -- pure aside
+    from the ./gcsa subprocess call itself, so it's safe to run concurrently
+    across a ThreadPoolExecutor. The caller does all file writing (the CSV
+    row, the log file) on a single thread; this function never touches a
+    file handle shared with anything else."""
+    row = dict(dataset=ds["name"], category=ds["category"],
+               path=str(path), raw_bytes=raw, gzip_bytes=gz,
+               gzip_ratio=round(ratio, 4), shape=shape, algo=algo,
+               max_add=max_add, phase2=phase2_label, status="ok",
+               log_path="")
+    # Precedence: inherited shell env, then the automatic size-based skip,
+    # then --disable-phase2, then --env -- each step can override the one
+    # before it, so --env is the final word if it names the same var.
+    overrides = {}
+    if skip_selftest:
+        overrides["GCSA_SKIP_SELFTEST"] = "1"
+    if disable_phase2:
+        overrides["GCSA_DISABLE_PHASE2"] = "1"
+    overrides.update(extra_env)
+    env = dict(os.environ)
+    env.update(overrides)
+
+    cmd = [str(bin_dir / "gcsa"), "-g", str(path), "-s", shape,
+           "--algo", algo, "--max-add", str(max_add)]
+    t0 = time.perf_counter()
+    r = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    row["wall_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+
+    fail_msg = None
+    if r.returncode != 0:
+        row["status"] = f"error: {r.stderr.strip()[:200]}"
+        fail_msg = f"  [FAIL] {ds['name']} {shape} {algo} ma={max_add}: {row['status']}"
+    else:
+        row.update(parse_gcsa_stdout(r.stdout))
+        bad = row.get("self_test") == "FAIL" or row.get("roundtrip") == "FAIL"
+        if bad:
+            row["status"] = "correctness_fail"
+            fail_msg = (f"  [FAIL] {ds['name']} {shape} {algo} ma={max_add}: "
+                        f"self_test={row.get('self_test')} "
+                        f"roundtrip={row.get('roundtrip')}")
+
+    log_path, log_text = None, None
+    if log_dir is not None:
+        log_path = log_dir / log_filename(ds["name"], shape, algo, max_add, disable_phase2)
+        env_note = " ".join(f"{k}={v}" for k, v in overrides.items()) or "(none)"
+        log_text = (
+            f"$ {' '.join(cmd)}\n"
+            f"env overrides: {env_note}\n"
+            f"exit_code: {r.returncode}\n"
+            f"wall_ms: {row['wall_ms']}\n"
+            f"\n=== stdout ===\n{r.stdout}"
+            f"\n=== stderr ===\n{r.stderr}"
+        )
+        row["log_path"] = str(log_path)
+
+    return row, log_path, log_text, fail_msg
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -260,7 +348,10 @@ def main():
                      help="fetched/provided FASTAs (default: see config.py)")
     ap.add_argument("--tmp-dir", default=None,
                      help="synthetic-input scratch dir (default: see config.py)")
-    ap.add_argument("--out", default="results/suite.csv")
+    ap.add_argument("--out", default=None,
+                     help="default: results/suite.csv, or results/suite.shard<I>of<N>.csv "
+                          "if --shard is given without an explicit --out (so parallel "
+                          "shards don't silently share a file by accident).")
     ap.add_argument("--only-category", nargs="*")
     ap.add_argument("--only-dataset", nargs="*")
     ap.add_argument("--shapes", nargs="*", default=SHAPES)
@@ -298,6 +389,25 @@ def main():
                           "override --disable-phase2 back off (see that flag's help). Not "
                           "a CSV column (arbitrary keys don't fit a fixed schema); use "
                           "--log-dir to keep a per-row record of exactly what was set.")
+    ap.add_argument("--jobs", type=int, default=1, metavar="N",
+                     help="run up to N ./gcsa invocations concurrently (across the shape "
+                          "x algo x max_add matrix for one dataset at a time -- dataset "
+                          "resolution/cleanup itself stays sequential). Match this to the "
+                          "CPUs available to this process/job: each ./gcsa invocation is "
+                          "its own OS process, so this multiplies real CPU usage rather "
+                          "than just hiding I/O wait. Default 1 (sequential, unchanged "
+                          "from before this flag existed).")
+    ap.add_argument("--shard", default=None, metavar="I/N",
+                     help="process only the datasets at index i where i %% N == I (0-based "
+                          "I, e.g. --shard 0/4 .. --shard 3/4 for four cluster array "
+                          "tasks). Splits by dataset, not by row, so each dataset's "
+                          "fetch/generate + gzip cost is paid once total, not once per "
+                          "shard -- combine with --jobs for finer-grained parallelism "
+                          "within one shard. Filters AFTER --only-category/--only-dataset, "
+                          "over whatever's left. Each shard needs its own --out (see "
+                          "--out's default); concatenate the resulting CSVs afterward "
+                          "(same header on every shard, so `head -1 s0.csv > merged.csv "
+                          "&& tail -n +2 -q s*.csv >> merged.csv` works) -- see README.")
     args = ap.parse_args()
 
     extra_env = {}
@@ -309,10 +419,28 @@ def main():
             sys.exit(f"[error] --env entry has an empty key: {kv!r}")
         extra_env[k] = v
 
+    if args.jobs < 1:
+        sys.exit(f"[error] --jobs must be >= 1, got {args.jobs}")
+
+    shard_i, shard_n = None, None
+    if args.shard is not None:
+        try:
+            i_str, n_str = args.shard.split("/")
+            shard_i, shard_n = int(i_str), int(n_str)
+        except ValueError:
+            sys.exit(f"[error] --shard must look like I/N (e.g. 0/4), got {args.shard!r}")
+        if shard_n < 1 or not (0 <= shard_i < shard_n):
+            sys.exit(f"[error] --shard {args.shard!r}: need 0 <= I < N with N >= 1")
+
+    out_path_str = args.out
+    if out_path_str is None:
+        out_path_str = (f"results/suite.shard{shard_i}of{shard_n}.csv"
+                         if args.shard is not None else "results/suite.csv")
+
     bin_dir = config.resolve("BIN_DIR", args.bin_dir)
     data_dir = config.resolve("DATA_DIR", args.data_dir)
     tmp_dir = config.resolve("TMP_DIR", args.tmp_dir)
-    out_csv = Path(args.out)
+    out_csv = Path(out_path_str)
     tmp_dir.mkdir(parents=True, exist_ok=True)
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     log_dir = Path(args.log_dir) if args.log_dir else None
@@ -327,15 +455,19 @@ def main():
     if args.only_dataset:
         names = set(args.only_dataset)
         datasets = [d for d in datasets if d["name"] in names]
+    if args.shard is not None:
+        datasets = [d for idx, d in enumerate(datasets) if idx % shard_n == shard_i]
 
     def log(msg):
         print(msg, file=sys.stderr)
 
     phase2_label = "off" if args.disable_phase2 else "on"
-    log(f"bin-dir={bin_dir}  data-dir={data_dir}  tmp-dir={tmp_dir}  "
+    log(f"bin-dir={bin_dir}  data-dir={data_dir}  tmp-dir={tmp_dir}  out={out_csv}  "
         f"(run 'python3 config.py' to see where each came from)")
     log(f"phase2={phase2_label}"
-        + (f"  log-dir={log_dir}" if log_dir is not None else "  log-dir=(disabled)"))
+        + (f"  log-dir={log_dir}" if log_dir is not None else "  log-dir=(disabled)")
+        + f"  jobs={args.jobs}"
+        + (f"  shard={shard_i}/{shard_n} ({len(datasets)} dataset(s))" if args.shard is not None else ""))
     if extra_env:
         log("extra env: " + " ".join(f"{k}={v}" for k, v in extra_env.items())
             + "  (also GCSA_SKIP_SELFTEST=1 automatically on inputs over "
@@ -371,68 +503,43 @@ def main():
             log(f"[ok] {ds['name']}: {path}  {raw} bytes, gzip_ratio={ratio:.3f}")
             skip_selftest = raw > SKIP_SELFTEST_ABOVE_BYTES
 
-            for shape in args.shapes:
-                for algo in args.algos:
-                    for max_add in args.max_adds:
-                        key = (ds["name"], shape, algo, str(max_add), phase2_label)
-                        if key in skip_done:
-                            continue
+            todo_jobs = [
+                (shape, algo, max_add)
+                for shape in args.shapes
+                for algo in args.algos
+                for max_add in args.max_adds
+                if (ds["name"], shape, algo, str(max_add), phase2_label) not in skip_done
+            ]
 
-                        row = dict(dataset=ds["name"], category=ds["category"],
-                                   path=str(path), raw_bytes=raw, gzip_bytes=gz,
-                                   gzip_ratio=round(ratio, 4), shape=shape, algo=algo,
-                                   max_add=max_add, phase2=phase2_label, status="ok",
-                                   log_path="")
-                        # Precedence: inherited shell env, then the automatic
-                        # size-based skip, then --disable-phase2, then --env
-                        # -- each step can override the one before it, so
-                        # --env is the final word if it names the same var.
-                        overrides = {}
-                        if skip_selftest:
-                            overrides["GCSA_SKIP_SELFTEST"] = "1"
-                        if args.disable_phase2:
-                            overrides["GCSA_DISABLE_PHASE2"] = "1"
-                        overrides.update(extra_env)
-                        env = dict(os.environ)
-                        env.update(overrides)
+            def emit(result):
+                row, log_path, log_text, fail_msg = result
+                if fail_msg:
+                    log(fail_msg)
+                if log_path is not None:
+                    log_path.write_text(log_text)
+                writer.writerow(row)
+                fcsv.flush()
 
-                        cmd = [str(bin_dir / "gcsa"), "-g", str(path), "-s", shape,
-                               "--algo", algo, "--max-add", str(max_add)]
-                        t0 = time.perf_counter()
-                        r = subprocess.run(cmd, capture_output=True, text=True, env=env)
-                        row["wall_ms"] = round((time.perf_counter() - t0) * 1000, 1)
-
-                        if r.returncode != 0:
-                            row["status"] = f"error: {r.stderr.strip()[:200]}"
-                            log(f"  [FAIL] {ds['name']} {shape} {algo} ma={max_add}: "
-                                f"{row['status']}")
-                        else:
-                            row.update(parse_gcsa_stdout(r.stdout))
-                            bad = row.get("self_test") == "FAIL" or row.get("roundtrip") == "FAIL"
-                            if bad:
-                                row["status"] = "correctness_fail"
-                                log(f"  [FAIL] {ds['name']} {shape} {algo} ma={max_add}: "
-                                    f"self_test={row.get('self_test')} "
-                                    f"roundtrip={row.get('roundtrip')}")
-
-                        if log_dir is not None:
-                            log_path = log_dir / log_filename(
-                                ds["name"], shape, algo, max_add, args.disable_phase2)
-                            env_note = " ".join(
-                                f"{k}={v}" for k, v in overrides.items()
-                            ) or "(none)"
-                            log_path.write_text(
-                                f"$ {' '.join(cmd)}\n"
-                                f"env overrides: {env_note}\n"
-                                f"exit_code: {r.returncode}\n"
-                                f"wall_ms: {row['wall_ms']}\n"
-                                f"\n=== stdout ===\n{r.stdout}"
-                                f"\n=== stderr ===\n{r.stderr}"
-                            )
-                            row["log_path"] = str(log_path)
-
-                        writer.writerow(row)
-                        fcsv.flush()
+            if args.jobs <= 1:
+                # Sequential -- identical behavior to before --jobs existed.
+                for shape, algo, max_add in todo_jobs:
+                    emit(run_experiment(bin_dir, path, ds, raw, gz, ratio, shape, algo,
+                                         max_add, phase2_label, skip_selftest,
+                                         args.disable_phase2, extra_env, log_dir))
+            else:
+                # Concurrent subprocess dispatch; all file writes (CSV row,
+                # log file) still happen only here on the main thread, in
+                # completion order -- no locking needed since nothing else
+                # ever touches fcsv/log files.
+                with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
+                    futures = [
+                        pool.submit(run_experiment, bin_dir, path, ds, raw, gz, ratio,
+                                    shape, algo, max_add, phase2_label, skip_selftest,
+                                    args.disable_phase2, extra_env, log_dir)
+                        for shape, algo, max_add in todo_jobs
+                    ]
+                    for fut in concurrent.futures.as_completed(futures):
+                        emit(fut.result())
 
             if by_name[ds["name"]]["kind"] in ("synthetic", "concat") and not args.keep_synthetic:
                 path.unlink(missing_ok=True)
