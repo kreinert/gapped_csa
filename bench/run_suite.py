@@ -30,6 +30,18 @@ Usage:
   ./run_suite.py --disable-phase2                  # GCSA_DISABLE_PHASE2=1 for
                                                     # every run (Phase I /
                                                     # leftover only)
+  ./run_suite.py --env GCSA_PHASE2_MAX_ITERS=50 GCSA_QUIET=1
+                                                    # arbitrary extra env vars
+                                                    # for every ./gcsa call --
+                                                    # see compress.hpp for the
+                                                    # full GCSA_PHASE2_* knob
+                                                    # list. See --env's and
+                                                    # --disable-phase2's --help
+                                                    # for a real gotcha:
+                                                    # GCSA_DISABLE_PHASE2 is
+                                                    # presence-checked, not
+                                                    # value-checked, so --env
+                                                    # can't force it back off.
 """
 import argparse
 import csv
@@ -270,8 +282,32 @@ def main():
                           "/ leftover-DP output only, no Phase II local-search pass). "
                           "Recorded in the 'phase2' CSV column so phase2-on and "
                           "phase2-off rows for the same (dataset, shape, algo, max_add) "
-                          "can coexist in one --out without colliding.")
+                          "can coexist in one --out without colliding. This is the flag "
+                          "to use for that specific variable -- setting it instead via "
+                          "'--env GCSA_DISABLE_PHASE2=1' has the same effect on ./gcsa but "
+                          "will NOT be reflected in the 'phase2' column or the log filename. "
+                          "Note ./gcsa checks this var for *presence*, not value (see "
+                          "compress.hpp) -- GCSA_DISABLE_PHASE2=0 still disables Phase II, "
+                          "so --env can't be used to force it back on; just omit this flag.")
+    ap.add_argument("--env", nargs="*", default=[], metavar="KEY=VALUE",
+                     help="extra environment variables for every ./gcsa invocation, e.g. "
+                          "--env GCSA_PHASE2_MAX_ITERS=50 GCSA_QUIET=1 (see compress.hpp "
+                          "for the full GCSA_PHASE2_* / GCSA_QUIET knob list). Applied "
+                          "after, and so overrides, the automatic GCSA_SKIP_SELFTEST if "
+                          "you name that same variable -- but NOT a reliable way to "
+                          "override --disable-phase2 back off (see that flag's help). Not "
+                          "a CSV column (arbitrary keys don't fit a fixed schema); use "
+                          "--log-dir to keep a per-row record of exactly what was set.")
     args = ap.parse_args()
+
+    extra_env = {}
+    for kv in args.env:
+        if "=" not in kv:
+            sys.exit(f"[error] --env entries must look like KEY=VALUE, got {kv!r}")
+        k, _, v = kv.partition("=")
+        if not k:
+            sys.exit(f"[error] --env entry has an empty key: {kv!r}")
+        extra_env[k] = v
 
     bin_dir = config.resolve("BIN_DIR", args.bin_dir)
     data_dir = config.resolve("DATA_DIR", args.data_dir)
@@ -300,6 +336,10 @@ def main():
         f"(run 'python3 config.py' to see where each came from)")
     log(f"phase2={phase2_label}"
         + (f"  log-dir={log_dir}" if log_dir is not None else "  log-dir=(disabled)"))
+    if extra_env:
+        log("extra env: " + " ".join(f"{k}={v}" for k, v in extra_env.items())
+            + "  (also GCSA_SKIP_SELFTEST=1 automatically on inputs over "
+              f"{SKIP_SELFTEST_ABOVE_BYTES} bytes, unless overridden above)")
 
     if args.dry_run:
         print(f"{len(datasets)} datasets x {len(args.shapes)} shapes x "
@@ -343,11 +383,18 @@ def main():
                                    gzip_ratio=round(ratio, 4), shape=shape, algo=algo,
                                    max_add=max_add, phase2=phase2_label, status="ok",
                                    log_path="")
-                        env = dict(os.environ)
+                        # Precedence: inherited shell env, then the automatic
+                        # size-based skip, then --disable-phase2, then --env
+                        # -- each step can override the one before it, so
+                        # --env is the final word if it names the same var.
+                        overrides = {}
                         if skip_selftest:
-                            env["GCSA_SKIP_SELFTEST"] = "1"
+                            overrides["GCSA_SKIP_SELFTEST"] = "1"
                         if args.disable_phase2:
-                            env["GCSA_DISABLE_PHASE2"] = "1"
+                            overrides["GCSA_DISABLE_PHASE2"] = "1"
+                        overrides.update(extra_env)
+                        env = dict(os.environ)
+                        env.update(overrides)
 
                         cmd = [str(bin_dir / "gcsa"), "-g", str(path), "-s", shape,
                                "--algo", algo, "--max-add", str(max_add)]
@@ -372,8 +419,7 @@ def main():
                             log_path = log_dir / log_filename(
                                 ds["name"], shape, algo, max_add, args.disable_phase2)
                             env_note = " ".join(
-                                f"{k}={v}" for k in ("GCSA_SKIP_SELFTEST", "GCSA_DISABLE_PHASE2")
-                                if (v := env.get(k)) is not None
+                                f"{k}={v}" for k, v in overrides.items()
                             ) or "(none)"
                             log_path.write_text(
                                 f"$ {' '.join(cmd)}\n"
