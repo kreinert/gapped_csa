@@ -194,8 +194,10 @@ constexpr int kPhase2DefaultIters = 100;
 constexpr size_t kPhase2AutoFastM = 1000000;
 
 // Max candidates retained per interval in the shared Phase II / leftover cache.
-// Preference pick runs on the full enum first; the cache only needs coverage-
-// descending heads for try_accept. Override with GCSA_CAND_CACHE_CAP.
+// Enumeration itself is capped to this (see emit_run_'s admission gate) using
+// the same (coverage, add) ordering pick_best_ ranks by, so the true best
+// candidate is always retained regardless of the cap -- it can never be
+// beaten by anything still admitted. Override with GCSA_CAND_CACHE_CAP.
 constexpr int kCandCacheDefaultCap = 64;
 
 // Cluster size the LNS Phase II falls back to when a cluster's exact solve
@@ -602,6 +604,12 @@ private:
         const int add_hi = (only_add >= 1) ? only_add : max_add_;
         const int cov_floor = std::max(kMinCoverage, min_cov);
         const bool intra = gcsa_intra_links();
+        // `out` is built and kept sorted coverage-desc, capped at `cap` --
+        // emit_run_ skips materializing (and emit_intra_runs_'s scan skips
+        // growing) any candidate that can't beat the current worst kept one,
+        // instead of building every viable candidate and trimming after the
+        // fact. See emit_run_ for why the cap check sits after availability.
+        const int cap = gcsa_env_int("GCSA_CAND_CACHE_CAP", kCandCacheDefaultCap);
         for (int add = add_lo; add <= add_hi; ++add) {
             std::vector<std::pair<int32_t,int32_t>> pr;
             pr.reserve(hi - lo);
@@ -620,10 +628,10 @@ private:
                 const int32_t s_lo = pr[i].first, s_hi = pr[j-1].first + 1;
                 if (s_hi <= lo || s_lo >= hi)
                     emit_run_(name, lo, hi, add, pr, i, j, cov_floor,
-                              require_avail, out);
+                              require_avail, cap, out);
                 else if (intra)
                     emit_intra_runs_(name, lo, hi, add, pr, i, j, cov_floor,
-                                     require_avail, out);
+                                     require_avail, cap, out);
                 i = j;
             }
         }
@@ -631,12 +639,27 @@ private:
     }
 
     // Turn the source sub-run pr[i..j) into a candidate for I_c = [lo,hi).
+    // `out` is kept sorted coverage-desc (ties by add-desc) and capped at
+    // `cap` entries -- the shared cache's cap (kCandCacheDefaultCap /
+    // GCSA_CAND_CACHE_CAP), enforced here rather than by a separate trim
+    // pass, so a candidate that can't make the cut is never materialized.
+    // The cap check is a pure comparison against the current out.back(); it
+    // never mutates `out` itself (only a confirmed insert below does), so
+    // its position relative to the availability filter doesn't affect
+    // correctness either way. It's placed first here -- an O(1) check --
+    // to short-circuit before the O(window length) availability scan
+    // whenever a window can't possibly beat the current worst kept one.
     void emit_run_(uint64_t name, int32_t lo, int32_t hi, int add,
                    const std::vector<std::pair<int32_t,int32_t>>& pr,
                    size_t i, size_t j, int cov_floor, bool require_avail,
-                   std::vector<Candidate>& out) const {
+                   int cap, std::vector<Candidate>& out) const {
         const int cov = (int)(j - i);
         if (cov < cov_floor) return;
+        if ((int)out.size() >= cap) {
+            const Candidate& worst = out.back();
+            if (cov < worst.coverage() || (cov == worst.coverage() && add <= worst.add))
+                return;
+        }
         const int32_t s_lo = pr[i].first, s_hi = pr[j-1].first + 1;
         if (require_avail) {
             if (!run_kept_(s_lo, s_hi)) return;
@@ -650,7 +673,13 @@ private:
         c.add = add; c.src_lo = s_lo; c.src_hi = s_hi;
         c.covered.reserve((size_t)cov);
         for (size_t t = i; t < j; ++t) c.covered.push_back(pr[t].second);
-        out.push_back(std::move(c));
+        auto pos = std::upper_bound(out.begin(), out.end(), c,
+            [](const Candidate& a, const Candidate& b) {
+                if (a.coverage() != b.coverage()) return a.coverage() > b.coverage();
+                return a.add > b.add;
+            });
+        out.insert(pos, std::move(c));
+        if ((int)out.size() > cap) out.pop_back();
     }
 
     // A source run reaching into I_c is still decodable as long as it holds
@@ -661,7 +690,7 @@ private:
     void emit_intra_runs_(uint64_t name, int32_t lo, int32_t hi, int add,
                           const std::vector<std::pair<int32_t,int32_t>>& pr,
                           size_t i, size_t j, int cov_floor, bool require_avail,
-                          std::vector<Candidate>& out) const {
+                          int cap, std::vector<Candidate>& out) const {
         const int32_t len = (int32_t)(j - i);
         const int32_t s0 = pr[i].first;
         // forbid[b] = smallest window start that still traps a pair ending at b.
@@ -679,7 +708,7 @@ private:
             // p is non-decreasing, so no emitted window contains another.
             if (q == len || forbid[(size_t)q] > p)
                 emit_run_(name, lo, hi, add, pr, i + (size_t)p, i + (size_t)q,
-                          cov_floor, require_avail, out);
+                          cov_floor, require_avail, cap, out);
         }
     }
 
