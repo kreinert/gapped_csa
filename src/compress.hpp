@@ -1533,7 +1533,29 @@ private:
         size_t phase2_dirty_marks = 0;
         double ms_enum = 0, ms_try = 0;
 
+        // Locked for the whole call, not just the cache lookup: the
+        // per-generation parallel evaluate pass below calls this
+        // concurrently (gcsa_parallel_for(dirty.size(), ...) -> get_cands),
+        // and unordered_map modification -- the insert on a miss -- is a
+        // data race across threads even for distinct keys; only individual
+        // element *references* are guaranteed stable across later
+        // inserts/rehashes, concurrent modification of the container itself
+        // is not. Returning a reference (not a copy) matters: callers keep
+        // raw pointers into the returned vector's elements past this call
+        // (see "proposed[idx] = {oi, &c}" in the parallel pass below, read
+        // back in the sequential decide loop after this generation's
+        // parallel pass has fully returned) -- those pointers are only
+        // valid because they point into cand_cache's own long-lived
+        // storage, not a temporary. Misses are expected to be rare by the
+        // time Phase II's generation loop runs (cand_cache is pre-warmed
+        // either by the one-time pass above or, for pseudoforest-dp, by the
+        // caller's own parallel candidate-graph build), so serializing the
+        // miss path too -- rather than dropping the lock around
+        // enumerate_candidates_ -- is an acceptable, correctness-first
+        // tradeoff.
+        std::mutex cand_mu;
         auto get_cands = [&](const Interval& iv) -> const std::vector<Candidate>& {
+            std::lock_guard<std::mutex> lock(cand_mu);
             auto it = cand_cache.find(iv.name);
             if (it != cand_cache.end()) {
                 ++phase2_cache_hits;
@@ -1868,6 +1890,11 @@ private:
         using Clock = std::chrono::steady_clock;
         const bool timing = (std::getenv("GCSA_TIMING") != nullptr);
         auto t0 = Clock::now();
+        // See compress_tree_dp_'s m0/pct_kept for what this measures.
+        const size_t m0 = kept_count_;
+        auto pct_kept = [&](size_t kept) {
+            return 100.0 * (double)kept / (double)std::max<size_t>(1, m0);
+        };
         gcsa_log("[greedy] size-order accept...\n");
         std::vector<const Interval*> order;
         for (const auto& iv : intervals) if (iv.hi - iv.lo > 1) order.push_back(&iv);
@@ -1910,6 +1937,11 @@ private:
             accept_(c, accepted);
         }
         gcsa_log("[greedy] size-order accept done\n");
+        const size_t after = kept_count_;
+        gcsa_log("[greedy] size-order accept: |C| %zu -> %zu  (%.1f%% of original kept, -%zu)\n",
+                 m0, after, pct_kept(after), m0 - after);
+        gcsa_log("[greedy] success: original |C|=%zu -- size-order accept=%.1f%% (of original kept)\n",
+                 m0, pct_kept(after));
         if (timing) {
             double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
             gcsa_log("[timing] greedy: %.1fms  (#I>1=%zu accepted=%zu)\n",
@@ -1922,6 +1954,11 @@ private:
         using Clock = std::chrono::steady_clock;
         const bool timing = (std::getenv("GCSA_TIMING") != nullptr);
         auto t_all = Clock::now();
+        // See compress_tree_dp_'s m0/pct_kept for what this measures.
+        const size_t m0 = kept_count_;
+        auto pct_kept = [&](size_t kept) {
+            return 100.0 * (double)kept / (double)std::max<size_t>(1, m0);
+        };
         // Preferred candidate per interval (ignore availability — global best).
         struct Pref { const Interval* iv; Candidate cand; uint64_t src_name; };
         std::vector<Pref> prefs;
@@ -2074,10 +2111,21 @@ private:
             size_t kept = 0; for (auto x : removed_) if (!x) ++kept;
             gcsa_log("after Phase I: kept=%zu accepted=%zu\n", kept, accepted.size());
         }
+        const size_t after_phase1 = kept_count_;
+        gcsa_log("[dep-order] Phase I:   |C| %zu -> %zu  (%.1f%% of original kept, -%zu)\n",
+                 m0, after_phase1, pct_kept(after_phase1), m0 - after_phase1);
 
         double phase1_ms = std::chrono::duration<double, std::milli>(t3 - t0).count();
         run_phase2_(intervals, accepted, "dep-order", trace, timing, &cand_cache, phase1_ms);
         auto t4 = Clock::now();
+        const size_t after_phase2 = kept_count_;
+        gcsa_log("[dep-order] phase II:  |C| %zu -> %zu  (%.1f%% of original kept, -%zu)\n",
+                 after_phase1, after_phase2, pct_kept(after_phase2),
+                 after_phase1 - after_phase2);
+        gcsa_log(
+            "[dep-order] success: original |C|=%zu -- Phase I=%.1f%%, "
+            "+phase II=%.1f%% (of original kept)\n",
+            m0, pct_kept(after_phase1), pct_kept(after_phase2));
         if (timing) {
             auto ms = [](Clock::time_point a, Clock::time_point b) {
                 return std::chrono::duration<double, std::milli>(b - a).count();
@@ -2587,12 +2635,34 @@ private:
             const std::unordered_map<uint64_t, Candidate>& accepted,
             bool require_avail,
             std::unordered_map<uint64_t, std::vector<Candidate>>& cand_cache,
-            bool rank_aware = true) const {
+            bool rank_aware = true,
+            // Set (if non-null) right after the per-interval candidate-scoring
+            // loop below, before the dependency/cycle-detection pass -- lets
+            // callers split "cand" (independent per interval, parallelized via
+            // GCSA_THREADS like DepOrder/TreeDp's preference enum) from
+            // "graph" (the dependency-map + cycle-detection walk, inherently
+            // sequential) for GCSA_TIMING, without this function owning a
+            // `timing` flag itself.
+            std::chrono::steady_clock::time_point* t_cand_end = nullptr) const {
         ConflictGraph graph;
         graph.by_name.reserve(intervals.size() * 2);
         for (const auto& iv : intervals) graph.by_name[iv.name] = &iv;
 
-        for (const auto& iv : intervals) {
+        // Independent per interval -- same shape as DepOrder/TreeDp's
+        // parallelized preference enum, now parallelized the same way via
+        // GCSA_THREADS. cand_cache may already hold iv.name's entry from an
+        // earlier round (see the class comment above build_pseudoforest_
+        // graph_): unlike DepOrder/TreeDp's enumeration, which only ever runs
+        // once per build against an empty cache, this function is called once
+        // per pseudoforest-dp round, so a later round can hit a prior round's
+        // cache. Both the lookup and the eventual insert touch that same
+        // shared map, so both are locked -- an unlocked find() racing an
+        // emplace() (from this or another interval) is a data race even
+        // though every interval's own key is unique, because emplace can
+        // trigger a rehash that invalidates every other thread's read.
+        std::mutex cand_mu;
+        gcsa_parallel_for(intervals.size(), [&](size_t i) {
+            const Interval& iv = intervals[i];
             // |I|<=2 can never meet kMinCoverage (coverage is a subset of the
             // interval's own rows, so coverage<=|I|; the default kMinCoverage=3
             // makes |I|<=2 structurally unsatisfiable) -- same reasoning
@@ -2600,12 +2670,20 @@ private:
             // avoids a wasted enumerate_candidates_ call and cand_cache entry
             // for intervals that can never produce a usable candidate; it does
             // not change which candidates get accepted.
-            if (iv.hi - iv.lo <= 2) continue;
-            if (accepted.count(iv.name)) continue;  // already resolved: fixed, not a DP node this round
+            if (iv.hi - iv.lo <= 2) return;
+            if (accepted.count(iv.name)) return;  // already resolved: fixed, not a DP node this round
 
-            auto cit = cand_cache.find(iv.name);
             std::vector<Candidate> fresh;
-            if (cit == cand_cache.end()) {
+            bool cached = false;
+            {
+                std::lock_guard<std::mutex> lock(cand_mu);
+                auto cit = cand_cache.find(iv.name);
+                if (cit != cand_cache.end()) {
+                    fresh = cit->second;  // copy out: can't keep a ref past the unlock
+                    cached = true;
+                }
+            }
+            if (!cached) {
                 fresh = enumerate_candidates_(iv.name, iv.lo, iv.hi, /*avail=*/false);
                 // Stable, not std::sort: pick_best_ (the original, unrefactored
                 // preference pick) scanned enumerate_candidates_'s output in its
@@ -2619,9 +2697,10 @@ private:
                     return a.add > b.add;
                 });
             }
-            const std::vector<Candidate>& sorted_cands = (cit != cand_cache.end()) ? cit->second : fresh;
 
-            Candidate best = best_from_sorted_cache_(sorted_cands, require_avail);
+            Candidate best = best_from_sorted_cache_(fresh, require_avail);
+
+            std::lock_guard<std::mutex> lock(cand_mu);
             if (best.coverage() >= 2) {
                 uint64_t src = name_of_rank_(best.src_lo);
                 // Self-references (src == iv.name) are allowed here: nothing
@@ -2631,8 +2710,9 @@ private:
                 // general rule as any other dependency-free candidate.
                 if (graph.by_name.count(src)) graph.cand.emplace(iv.name, std::move(best));
             }
-            if (cit == cand_cache.end()) cand_cache.emplace(iv.name, std::move(fresh));
-        }
+            if (!cached) cand_cache.emplace(iv.name, std::move(fresh));
+        });
+        if (t_cand_end) *t_cand_end = std::chrono::steady_clock::now();
 
         // ---- which nodes have a REAL (rank-level conflict) dependency -----
         // v has a real dependency on src = name_of_rank_(v's candidate's
@@ -3019,7 +3099,9 @@ private:
             const char* e = std::getenv("GCSA_PFDP_RANK_AWARE");
             return !e || std::atoi(e) != 0;
         }();
+        const char* label = algo_name(algo_);
         auto t_all = Clock::now();
+        const int nthreads = gcsa_num_threads();
         // See compress_tree_dp_'s m0/pct_kept for what this measures.
         const size_t m0 = kept_count_;
         auto pct_kept = [&](size_t kept) {
@@ -3028,54 +3110,89 @@ private:
 
         std::unordered_map<uint64_t, std::vector<Candidate>> cand_cache;  // reused by Phase II
 
-        gcsa_log("[pseudoforest-dp] preference graph build...\n");
+        // "cand" = the per-interval candidate-scoring loop inside
+        // build_pseudoforest_graph_ (independent per interval, parallelized
+        // via GCSA_THREADS the same way as DepOrder/TreeDp's preference
+        // enum). "graph" = the dependency-map + cycle-detection walk that
+        // follows it, which mutates shared state as it traverses and so is
+        // inherently sequential -- see build_pseudoforest_graph_'s comments.
+        gcsa_log("[%s] preference graph build...\n", label);
+        auto t_graph0 = Clock::now();
+        Clock::time_point t_cand_end = t_graph0;
         ConflictGraph graph = build_pseudoforest_graph_(intervals, accepted,
                                                     /*require_avail=*/false, cand_cache,
-                                                    rank_aware);
+                                                    rank_aware, &t_cand_end);
+        auto t_graph1 = Clock::now();
         if (trace) trace_pseudoforest_graph_(graph, 0);
 
         size_t n_chosen = 0;
+        std::unordered_map<uint64_t, Candidate> chosen;
+        auto t_dp0 = Clock::now();
         if (!graph.cand.empty()) {
-            gcsa_log("[pseudoforest-dp] DP on %zu nodes...\n", graph.cand.size());
-            auto chosen = solve_pseudoforest_dp_(graph, rank_aware, trace);
-            gcsa_log("[pseudoforest-dp] DP done (cand=%zu cycles=%zu chosen=%zu)\n",
-                     graph.cand.size(), graph.cycles.size(), chosen.size());
+            gcsa_log("[%s] DP on %zu nodes...\n", label, graph.cand.size());
+            chosen = solve_pseudoforest_dp_(graph, rank_aware, trace);
+            gcsa_log("[%s] DP done (cand=%zu cycles=%zu chosen=%zu)\n",
+                     label, graph.cand.size(), graph.cycles.size(), chosen.size());
             n_chosen = chosen.size();
-            if (n_chosen) accept_pseudoforest_chosen_(chosen, graph.by_name, accepted, trace);
         } else {
-            gcsa_log("[pseudoforest-dp] no preferences to extract\n");
+            gcsa_log("[%s] no preferences to extract\n", label);
         }
+        auto t_dp1 = Clock::now();
+
+        auto t_acc0 = Clock::now();
+        if (n_chosen) accept_pseudoforest_chosen_(chosen, graph.by_name, accepted, trace);
+        auto t_acc1 = Clock::now();
         const size_t after_dp = kept_count_;
         gcsa_log(
-            "[pseudoforest-dp] DP alone: |C| %zu -> %zu  (%.1f%% of original kept, -%zu)\n",
-            m0, after_dp, pct_kept(after_dp), m0 - after_dp);
+            "[%s] DP alone: |C| %zu -> %zu  (%.1f%% of original kept, -%zu)\n",
+            label, m0, after_dp, pct_kept(after_dp), m0 - after_dp);
 
-        gcsa_log("[pseudoforest-dp] leftover greedy...\n");
+        gcsa_log("[%s] leftover greedy...\n", label);
+        auto t_left0 = Clock::now();
         size_t n_leftover = run_pseudoforest_leftover_(intervals, accepted, trace);
+        auto t_left1 = Clock::now();
         const size_t after_leftover = kept_count_;
         gcsa_log(
-            "[pseudoforest-dp] leftover:  |C| %zu -> %zu  (%.1f%% of original kept, -%zu)\n",
-            after_dp, after_leftover, pct_kept(after_leftover), after_dp - after_leftover);
+            "[%s] leftover:  |C| %zu -> %zu  (%.1f%% of original kept, -%zu)\n",
+            label, after_dp, after_leftover, pct_kept(after_leftover), after_dp - after_leftover);
 
-        // Phase II: same unpin/retarget fixed point as DepOrder/TreeDp.
-        run_phase2_(intervals, accepted, "pseudoforest-dp", trace, timing, &cand_cache);
+        // Phase II: same unpin/retarget fixed point as DepOrder/TreeDp. Pass
+        // the real Phase I wall time (graph build through leftover), the same
+        // way TreeDp does -- previously this call left phase1_ms at its 0.0
+        // default, which (via run_phase2_'s time-budget calc) starved Phase II
+        // to a flat 50ms floor (GCSA_PHASE2_MIN_MS) on any large-m run
+        // regardless of how long Phase I actually took.
+        auto t_p2_0 = Clock::now();
+        double phase1_ms = std::chrono::duration<double, std::milli>(t_left1 - t_graph0).count();
+        run_phase2_(intervals, accepted, label, trace, timing, &cand_cache, phase1_ms);
+        auto t_p2_1 = Clock::now();
         const size_t after_phase2 = kept_count_;
         gcsa_log(
-            "[pseudoforest-dp] phase II:  |C| %zu -> %zu  (%.1f%% of original kept, -%zu)\n",
-            after_leftover, after_phase2, pct_kept(after_phase2),
+            "[%s] phase II:  |C| %zu -> %zu  (%.1f%% of original kept, -%zu)\n",
+            label, after_leftover, after_phase2, pct_kept(after_phase2),
             after_leftover - after_phase2);
         gcsa_log(
-            "[pseudoforest-dp] success: original |C|=%zu -- DP alone=%.1f%%, "
+            "[%s] success: original |C|=%zu -- DP alone=%.1f%%, "
             "+leftover=%.1f%%, +phase II=%.1f%% (of original kept)\n",
-            m0, pct_kept(after_dp), pct_kept(after_leftover), pct_kept(after_phase2));
+            label, m0, pct_kept(after_dp), pct_kept(after_leftover), pct_kept(after_phase2));
 
         if (timing) {
-            double ms = std::chrono::duration<double, std::milli>(Clock::now() - t_all).count();
+            auto ms = [](Clock::time_point a, Clock::time_point b) {
+                return std::chrono::duration<double, std::milli>(b - a).count();
+            };
+            const double phase2_total = ms(t_p2_0, t_p2_1);
             gcsa_log(
-                "[timing] pseudoforest-dp total: %.1fms cycles=%zu "
-                "chosen=%zu leftover=%zu accepted=%zu kept=%zu\n",
-                ms, graph.cycles.size(), n_chosen, n_leftover,
-                accepted.size(), kept_count_);
+                "[timing] %s cand=%.1fms graph=%.1fms dp=%.1fms accept=%.1fms "
+                "leftover=%.1fms phase2=%.1fms total=%.1fms "
+                "phase2/phase1=%.2f\n"
+                "         dp_nodes=%zu cycles=%zu chosen=%zu n_leftover=%zu "
+                "accepted=%zu kept=%zu threads=%d\n",
+                label, ms(t_graph0, t_cand_end), ms(t_cand_end, t_graph1),
+                ms(t_dp0, t_dp1), ms(t_acc0, t_acc1), ms(t_left0, t_left1),
+                phase2_total, ms(t_all, Clock::now()),
+                phase2_total / std::max(1.0, phase1_ms),
+                graph.cand.size(), graph.cycles.size(), n_chosen, n_leftover,
+                accepted.size(), kept_count_, nthreads);
         }
     }
 
@@ -3128,9 +3245,22 @@ private:
     }
 
     // Build C (kept positions in rank order) and the two-entries-per-name hash
-    // table from an accepted link set.
+    // table from an accepted link set. Shared by every algorithm (compress_()
+    // calls this once, after whichever compress_<algo>_ ran) -- neither this
+    // function nor any compress_<algo>_'s own [timing] line covered it before;
+    // its cost only ever showed up folded into CompressedIndex::build's outer
+    // "compress(<algo>)=" total. Two passes:
+    //   1. compact:  C_ in rank order. Sequential by construction -- a kept
+    //      rank's C_ index depends on how many earlier ranks also survived.
+    //   2. table:    one HashEntry per interval (k-mer). Independent per
+    //      interval once rank_to_C_ exists from pass 1 -- a parallelization
+    //      candidate, not parallelized yet.
     void finalize_(const std::vector<Interval>& intervals,
                    const std::unordered_map<uint64_t, Candidate>& accepted) {
+        using Clock = std::chrono::steady_clock;
+        const bool timing = (std::getenv("GCSA_TIMING") != nullptr);
+        auto t0 = Clock::now();
+
         const size_t m = G_.m();
         rank_to_C_.assign(m, -1);
         C_.reserve(m);
@@ -3140,6 +3270,8 @@ private:
                 C_.push_back(G_.orig_pos((int32_t)r));
             }
         }
+        auto t1 = Clock::now();
+
         for (const auto& iv : intervals) {
             HashEntry e;
             auto it = accepted.find(iv.name);
@@ -3158,6 +3290,18 @@ private:
             }
             if (cnt > 0) { e.has_rest = true; e.rest_pos = (uint64_t)first; e.rest_num = cnt; }
             table_.emplace(iv.name, e);
+        }
+        auto t2 = Clock::now();
+
+        if (timing) {
+            auto ms = [](Clock::time_point a, Clock::time_point b) {
+                return std::chrono::duration<double, std::milli>(b - a).count();
+            };
+            gcsa_log(
+                "[timing] %s finalize: compact=%.1fms table=%.1fms total=%.1fms "
+                "m=%zu intervals=%zu kept=%zu\n",
+                algo_name(algo_), ms(t0, t1), ms(t1, t2), ms(t0, t2),
+                m, intervals.size(), C_.size());
         }
     }
 };
