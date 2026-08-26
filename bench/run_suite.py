@@ -286,11 +286,12 @@ def run_experiment(bin_dir, path, ds, raw, gz, ratio, shape, algo, max_add,
     across a ThreadPoolExecutor. The caller does all file writing (the CSV
     row, the log file) on a single thread; this function never touches a
     file handle shared with anything else."""
-    row = dict(dataset=ds["name"], category=ds["category"],
-               path=str(path), raw_bytes=raw, gzip_bytes=gz,
-               gzip_ratio=round(ratio, 4), shape=shape, algo=algo,
-               max_add=max_add, phase2=phase2_label, status="ok",
-               log_path="")
+    row: "dict[str, str | int | float]" = dict(
+        dataset=ds["name"], category=ds["category"],
+        path=str(path), raw_bytes=raw, gzip_bytes=gz,
+        gzip_ratio=round(ratio, 4), shape=shape, algo=algo,
+        max_add=max_add, phase2=phase2_label, status="ok",
+        log_path="")
     # Precedence: inherited shell env, then the automatic size-based skip,
     # then --disable-phase2, then --env -- each step can override the one
     # before it, so --env is the final word if it names the same var.
@@ -456,6 +457,7 @@ def main():
         names = set(args.only_dataset)
         datasets = [d for d in datasets if d["name"] in names]
     if args.shard is not None:
+        assert shard_i is not None and shard_n is not None  # set together, above
         datasets = [d for idx, d in enumerate(datasets) if idx % shard_n == shard_i]
 
     def log(msg):
