@@ -82,6 +82,10 @@ GCSA_PHASE2_MAX_ITERS=2 ./gcsa -g genome.fasta -s "#####" --algo tree-dp
 ./ilp_baseline "GCCTTTAAAGGCCTTTAAAGGCCTTTAAAG" "#.#" --universe legacy
 # Drop intra-interval links from the heuristics' candidate sets (pre-unification):
 GCSA_INTRA_LINKS=0 ./gcsa --algo greedy
+# Let the heuristics' own candidate search merge source runs across an LCP dip
+# (not just numeric adjacency, which is what correctness actually needs; off
+# by default -- see "Link universe" below):
+GCSA_CROSS_LCP=1 ./gcsa -g genome.fasta -s "#####" --algo pseudoforest-dp
 ```
 
 Shapes use `#` (care) and `.` (don't care), e.g. `#.#`, `##.##`, `#..#..#`.
@@ -234,6 +238,25 @@ compression on a 180 kb repetitive input: `####.####` → **40% of the full SA**
   `lcp >= add+1` maximal-run rule is a pruning heuristic, not a correctness
   requirement. `GCSA_INTRA_LINKS=0` restores the old "source entirely outside
   `I_c`" rule for the heuristics.
+  `enumerate_candidates_` (the heuristics' search, as opposed to
+  `enumerate_all_links_`/`collect_diff_problem`'s exact universe above) still
+  applies that `lcp >= add+1` rule by default when grouping consecutive source
+  ranks into one run, even though it's not required — every rank the grouping
+  loop considers already has a verified-valid successor (`pred_lexpos_`/
+  `succ_lexpos_` are exact inverses), so a low-LCP run between two otherwise
+  fine, rank-adjacent sources can fragment one real link into pieces too small
+  to individually clear `kMinCoverage`. `GCSA_CROSS_LCP=1` drops that clause
+  (numeric adjacency alone decides grouping). Never changes correctness
+  (self-test/round-trip pass either way — it only ever adds valid candidates
+  to the search) and measured strictly better `|C|` on real genomic inputs
+  across every algorithm, but is not a strict win in general: on a repeat-
+  heavy synthetic input, Greedy/DepOrder got slightly *worse* (bigger merged
+  runs make `emit_run_`'s all-or-nothing availability check more fragile —
+  one already-pinned/removed rank anywhere in a larger window blocks the
+  whole candidate, where a smaller LCP-bounded window would have left a
+  neighboring piece usable) while the DP-based algorithms still improved.
+  Off by default pending a sweep across `bench/`'s tunable-repetitiveness and
+  pangenome categories, where this trade-off should actually get decided.
 - **ILP baseline (exact |C| on small instances)**: `make ilp_baseline` builds
   `./ilp_baseline`, which enumerates the **full link universe** above
   (`kMinCoverage=3`, `--max-add` default 8), writes a CPLEX `.lp`, and solves

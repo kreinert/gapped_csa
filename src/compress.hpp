@@ -50,10 +50,13 @@
 // runs whose internal lcp is below add+1.
 //
 // enumerate_candidates_ is the heuristics' target-centric view of this
-// universe.  It emits only maximal runs with lcp >= add+1 (the note's
-// lcp-interval argument), which keeps the per-interval candidate list short;
-// GCSA_INTRA_LINKS=0 additionally restores the historical "source outside I_c"
-// rule.  enumerate_all_links_ emits the whole universe and is what
+// universe.  By default it emits only maximal runs with lcp >= add+1 (the
+// note's lcp-interval argument, a sufficient-but-not-necessary pruning rule --
+// see gcsa_cross_lcp()), which keeps the per-interval candidate list short;
+// GCSA_CROSS_LCP=1 drops that extra requirement (numeric adjacency alone,
+// which correctness actually needs, is enough to keep a run merged) and
+// GCSA_INTRA_LINKS=0 restores the historical "source outside I_c" rule.
+// enumerate_all_links_ emits the whole universe and is what
 // collect_diff_problem hands to the ILP baseline, so the ILP optimum is a true
 // lower bound for every algorithm below.
 //
@@ -211,6 +214,41 @@ inline bool gcsa_intra_links() {
     static const bool v = [] {
         const char* e = std::getenv("GCSA_INTRA_LINKS");
         return !e || std::atoi(e) != 0;
+    }();
+    return v;
+}
+
+// Off by default (preserves current behavior): enumerate_candidates_'s source-
+// run grouping normally also requires G_.lcp[...] >= add+base_depth_ between
+// consecutive source ranks, on top of the numeric-adjacency requirement that
+// alone is what correctness needs (see "Link universe" above -- L1-L5 never
+// reference the source ranks' own shared LCP; pred_lexpos_/succ_lexpos_ are
+// exact inverses, so every element the grouping loop even considers already
+// has a verified-valid successor before the LCP check runs). The LCP clause
+// mirrors the note's original LCP-interval argument (a sufficient condition,
+// convenient to compute from the LCP array directly) but can fragment a
+// single valid run into pieces too small to individually clear kMinCoverage
+// when the source ranks' own prefixes happen to diverge despite each still
+// mapping to the right target. GCSA_CROSS_LCP=1 drops that clause, so a run
+// only needs numeric adjacency to stay merged -- this widens the *search*,
+// never relaxes what's accepted (every extra candidate found is still fully
+// L1-L5 valid), so self-test / round-trip correctness is unaffected either
+// way. Measured effect (see compress.hpp's git history / the session that
+// added this flag): strictly more compression on real genomic data across
+// every algorithm tested, but NOT a strict win in general -- on a repeat-
+// heavy synthetic input, Greedy and DepOrder got slightly *worse* (bigger
+// merged source runs make emit_run_'s all-or-nothing availability check more
+// fragile: one already-pinned/removed rank anywhere in a larger window now
+// blocks the whole candidate, where a smaller LCP-bounded window would have
+// left a neighboring piece usable), while the DP-based algorithms (TreeDp
+// family, PseudoforestDp) came out ahead even there, presumably because
+// Phase II's fuller unpin/retarget can route around it. Left off by default
+// pending a proper sweep across bench/'s tunable-repetitiveness and pangenome
+// categories, where this trade-off actually matters.
+inline bool gcsa_cross_lcp() {
+    static const bool v = [] {
+        const char* e = std::getenv("GCSA_CROSS_LCP");
+        return e && std::atoi(e) != 0;
     }();
     return v;
 }
@@ -508,6 +546,104 @@ public:
         return true;
     }
 
+    // Diagnostic bounds on |C| -- NOT part of the compressed index itself,
+    // just a report. Reuses the gapped SA already built by build() (no
+    // rebuild, unlike collect_diff_problem()). Two numbers:
+    //
+    //   floor_positions -- positions whose k-mer occurs < kMinCoverage times.
+    //     Provably un-compressible by *any* algorithm, heuristic or exact:
+    //     (L3) `covered` is a subset of the word's own interval I_c, and (L4)
+    //     needs |covered| >= kMinCoverage, so |I_c| < kMinCoverage means no
+    //     candidate for that word can ever exist, full stop. This is the
+    //     algorithm-independent floor.
+    //
+    //   sum_best_coverage -- Sigma, over eligible words, of
+    //     best_candidate_(word, avail=false).coverage() -- i.e. the exact
+    //     same enumerate_candidates_ call every algorithm below uses for its
+    //     own Phase-I preference (pseudoforest-dp/tree-dp/dep-order/greedy
+    //     all call this, at this same require_avail=false, before any
+    //     conflict is resolved). (L5) caps every word at one H_offset, so no
+    //     feasible solution built from THIS candidate search can ever delete
+    //     more from a word than its own best candidate's coverage; summing
+    //     those per-word caps relaxes only the *cross-word* conflicts (two
+    //     words wanting overlapping source/covered ranges), which is exactly
+    //     what every algorithm's Phase II then goes and resolves.
+    //   i.e.  floor_positions <= m - sum_best_coverage <= any real run's stored_positions().
+    //
+    //   This is deliberately NOT the same quantity as the (removed) full-
+    //   link-universe bound this function used to compute. That version used
+    //   enumerate_all_links_ -- the ILP baseline's candidate universe, a
+    //   strict superset of what any heuristic here can ever see -- so it
+    //   bounded the true theoretical optimum, independent of which algorithm
+    //   or candidate search produced it. It cost O(L^2) per maximal same-add
+    //   run of length L, which is why --bound was opt-in in the first place. This
+    //   version bounds something narrower but arguably more useful day to
+    //   day: not "what's theoretically possible for the compression scheme,"
+    //   but "what's the ceiling THIS run's actual candidate search could
+    //   ever have reached, if Phase II resolved every conflict perfectly."
+    //   Because it goes through the real enumerate_candidates_, it
+    //   automatically reflects this run's GCSA_CROSS_LCP / GCSA_INTRA_LINKS /
+    //   --min-coverage settings, and it's cheap: no O(L^2) sub-run
+    //   enumeration, just one already-fast per-interval search (~35ms over
+    //   15k eligible words on ecoli_cft073, vs. ~10s for the old universe).
+    //   If you want the true, algorithm-agnostic theoretical ceiling instead,
+    //   collect_diff_problem()'s "full" universe (what ilp_baseline uses) is
+    //   still the reference for that -- it's just no longer what --bound
+    //   reports by default.
+    struct BoundReport {
+        size_t m = 0;
+        bool cross_lcp = false;             // this run's GCSA_CROSS_LCP setting
+        bool intra_links = true;            // this run's GCSA_INTRA_LINKS setting
+        size_t eligible_words = 0;          // words with |I_c| >= kMinCoverage
+        size_t eligible_positions = 0;      // Sigma |I_c| over those words
+        size_t words_with_candidate = 0;    // ... of which have >=1 valid link
+        size_t floor_positions = 0;         // m - eligible_positions
+        size_t sum_best_coverage = 0;       // Sigma best_candidate_(...).coverage()
+        size_t lower_bound_C = 0;           // m - sum_best_coverage
+    };
+
+    BoundReport compute_bound_report() const {
+        const size_t m = G_.m();
+        std::vector<Interval> intervals;
+        intervals.reserve(m / 4 + 1);
+        for (size_t r = 0; r < m; ) {
+            uint64_t name = name_of_rank_((int32_t)r);
+            size_t r2 = r + 1;
+            if (regular_mode_) {
+                while (r2 < m && G_.lcp[r2] >= base_depth_) ++r2;
+            } else {
+                while (r2 < m && G_.first_symbol((int32_t)r2) == name) ++r2;
+            }
+            intervals.push_back({name, (int32_t)r, (int32_t)r2});
+            r = r2;
+        }
+
+        BoundReport R;
+        R.m = m;
+        R.cross_lcp = gcsa_cross_lcp();
+        R.intra_links = gcsa_intra_links();
+        long long sum_best = 0;
+        for (const auto& iv : intervals) {
+            const int isize = iv.hi - iv.lo;
+            if (isize >= kMinCoverage) {
+                R.eligible_words++;
+                R.eligible_positions += (size_t)isize;
+                // Same call (name, lo, hi, require_avail=false) every
+                // algorithm's own preference/DAG-edge computation makes --
+                // see e.g. compress_pseudoforest_dp_'s forest-build step.
+                int cov = best_candidate_(iv.name, iv.lo, iv.hi, /*require_avail=*/false).coverage();
+                if (cov > 0) {
+                    R.words_with_candidate++;
+                    sum_best += cov;
+                }
+            }
+        }
+        R.floor_positions = m - R.eligible_positions;
+        R.sum_best_coverage = (size_t)sum_best;
+        R.lower_bound_C = m - (size_t)sum_best;
+        return R;
+    }
+
 private:
     GappedSA G_;
     int span_ = 1;
@@ -604,6 +740,7 @@ private:
         const int add_hi = (only_add >= 1) ? only_add : max_add_;
         const int cov_floor = std::max(kMinCoverage, min_cov);
         const bool intra = gcsa_intra_links();
+        const bool cross_lcp = gcsa_cross_lcp();
         // `out` is built and kept sorted coverage-desc, capped at `cap` --
         // emit_run_ skips materializing (and emit_intra_runs_'s scan skips
         // growing) any candidate that can't beat the current worst kept one,
@@ -622,9 +759,12 @@ private:
             size_t i = 0;
             while (i < pr.size()) {
                 size_t j = i + 1;
+                // GCSA_CROSS_LCP=1: numeric adjacency alone is what L1-L5
+                // require (see gcsa_cross_lcp() above); the lcp clause is an
+                // extra, non-required restriction kept as the default.
                 while (j < pr.size()
                        && pr[j].first == pr[j-1].first + 1
-                       && G_.lcp[pr[j].first] >= add + base_depth_) ++j;
+                       && (cross_lcp || G_.lcp[pr[j].first] >= add + base_depth_)) ++j;
                 const int32_t s_lo = pr[i].first, s_hi = pr[j-1].first + 1;
                 if (s_hi <= lo || s_lo >= hi)
                     emit_run_(name, lo, hi, add, pr, i, j, cov_floor,

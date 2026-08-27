@@ -182,12 +182,20 @@ static void print_usage(const char* argv0) {
         << "                      GCSA_MIN_COVERAGE > default.\n"
         << "  --table             print the hash table\n"
         << "  --sa                print the full gapped suffix array\n"
+        << "  --bound             print lower bounds on |C| (structural floor + a\n"
+        << "                      per-word best-candidate-ignoring-conflicts bound built\n"
+        << "                      from THIS run's own enumerate_candidates_ search --\n"
+        << "                      i.e. what this exact algorithm/settings combo could\n"
+        << "                      reach if Phase II resolved every conflict perfectly;\n"
+        << "                      see CompressedIndex::compute_bound_report in\n"
+        << "                      compress.hpp). Cheap (no O(L^2) sub-run enumeration);\n"
+        << "                      still opt-in since it's not part of the index build.\n"
         << "  -h, --help          this message\n";
 }
 
 int main(int argc, char** argv) {
     std::string genome_path, shape_str = "#.#", query, reads_path;
-    bool want_table = false, want_sa = false;
+    bool want_table = false, want_sa = false, want_bound = false;
     int max_add = 8;
     int phase2_iters = 0;  // 0 = unset: GCSA_PHASE2_MAX_ITERS, else the default
     CompressAlgo algo = CompressAlgo::Greedy;
@@ -203,6 +211,7 @@ int main(int argc, char** argv) {
         else if (k == "-r") reads_path  = need("-r");
         else if (k == "--table") want_table = true;
         else if (k == "--sa") want_sa = true;
+        else if (k == "--bound") want_bound = true;
         else if (k == "--max-add") max_add = std::stoi(need("--max-add"));
         else if (k == "--phase2-iters") {
             phase2_iters = std::stoi(need("--phase2-iters"));
@@ -321,6 +330,41 @@ int main(int argc, char** argv) {
               << "  (" << std::fixed << std::setprecision(1)
               << 100.0 * idx.stored_positions() / std::max<size_t>(1, idx.total_positions())
               << "% of full SA)\n";
+
+    // --bound: lower bounds on |C|, computed off the already-built gapped SA
+    // (no rebuild). See CompressedIndex::compute_bound_report in compress.hpp
+    // for the derivation of both numbers. The second one is deliberately
+    // algorithm-consistent: it's built from this exact run's enumerate_candidates_
+    // search (same GCSA_CROSS_LCP / GCSA_INTRA_LINKS / --min-coverage this
+    // build used), not the ILP baseline's full link universe -- see the
+    // comment on compute_bound_report for why, and for how to get the other
+    // (algorithm-agnostic, more expensive) number if you want it instead.
+    if (want_bound) {
+        using Clock = std::chrono::steady_clock;
+        const bool timing = (std::getenv("GCSA_TIMING") != nullptr);
+        auto t0 = Clock::now();
+        CompressedIndex::BoundReport B = idx.compute_bound_report();
+        auto t1 = Clock::now();
+        const size_t m = std::max<size_t>(1, idx.total_positions());
+        std::cout << "bound: floor(structural, |I_c|<" << kMinCoverage << ")=" << B.floor_positions
+                  << "  (" << std::fixed << std::setprecision(3)
+                  << 100.0 * B.floor_positions / m << "% of m)\n";
+        std::cout << "       reachable(best-candidate-per-word via enumerate_candidates_,"
+                     " ignoring conflicts, cross_lcp=" << (B.cross_lcp ? 1 : 0)
+                  << " intra_links=" << (B.intra_links ? 1 : 0) << ")=" << B.lower_bound_C
+                  << "  (" << std::fixed << std::setprecision(3)
+                  << 100.0 * B.lower_bound_C / m << "% of m)"
+                  << "  [floor <= this <= |C| from any run with these same settings]\n";
+        std::cout << "       eligible words (|I_c|>=" << kMinCoverage << "): " << B.eligible_words
+                  << "  positions=" << B.eligible_positions
+                  << "  words_with_no_candidate=" << (B.eligible_words - B.words_with_candidate)
+                  << "  sum_best_coverage=" << B.sum_best_coverage << "\n";
+        if (timing) {
+            std::cout << "[timing] bound="
+                      << std::chrono::duration<double, std::milli>(t1 - t0).count()
+                      << "ms\n";
+        }
+    }
 
     // Brute-force self-test + round-trip walk every text position. On large N
     // that dominates wall time / RAM; GCSA_SKIP_SELFTEST=1 keeps compress+timing.
