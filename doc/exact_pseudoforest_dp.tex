@@ -25,24 +25,30 @@
 
 \subsection{The objective}
 
-Fix the suffix array $I$ of the text, and let $m = |I|$ denote the number of rows in $I$. For a word $w$, let $I_w = [\ell _w, r_w)$ denote the maximal LCP-interval in $I$ such that every suffix in $I_w$ starts with $w$. At a high level, we would like to prune $I$ by finding contiguous rows whose positions in the text can be recreated by adding a constant offset to the positions of a different contiguous window (in which case the former row range can be deleted and replaced with a constant-size hash entry denoting "this row range is deleted; fetch the positions of this other range and add this offset instead").
+Fix the suffix array $I$ of the text, and let $m = |I|$ denote the number of rows in $I$. For a word $w$, let $I_w = [\ell _w, r_w)$ denote the maximal LCP-interval in $I$ such that every suffix in $I_w$ starts with $w$. For some suffix $s$, let $\mathrm{pos}(s)$ denote the actual position of $s$ in the text. For some positive integer $a$, if $[\ell , r]$ is a row range of $I$ with LCP-depth $a + 1$ where the $a +1$-th character is $c$, then a subset of the positions in $I_c$ can be reconstructed in order by adding a shift of $a$ to the positions in $[\ell, r]$. At a high level, we would like to prune $I$ by finding rows whose positions in the text can be recreated by adding a constant offset to the positions of a contiguous window (in which case the former subset of rows can be deleted and replaced with a constant-size hash entry denoting "these rows are deleted; fetch the positions of this other range and add this offset").
 
-Towards this goal, a \textbf{candidate} is a triple $k = (T_k , S_k, a_k)$: a contiguous target interval $T_k \subseteq I_w$ of some word $w$, a contiguous source interval $S_k \subseteq I_{w'}$ of another word $w'$, and a shift $a_k \in [a_{max}]$ such that the $a_k$-th suffix of the suffices in $S_{w'}$ reconstruct the suffices in $T_w$ in order. In terms of compression, accepting a candidate $k$ reduces $m$ by deleting the rows $T_k$ and instead reconstructing their positions via adding a shift $a_k$ to every position in $S_k$. Let $U$ denote the universe of all candidates, and $\mathrm{cov}(k)=|T_k|$ denote the number of rows that are to be deleted when a candidate $k$ is accepted. Under a subset of accepted candidates $X \subseteq U$, the resulting size of $I$ becomes
+Towards this goal, a \textbf{candidate} is a triple $k = (T_k , S_k, a_k)$: a target subset of rows $T_k \subseteq I_w$ of some word $w$, a contiguous source interval $S_k \subseteq I$, and a shift $a_k \in [a_{max}]$ such that the $a_k$-th suffix of the suffices in $S_k$ reconstruct the suffices in $T_w$ in order. In terms of compression, accepting a candidate $k$ deletes rows $T_k$ and reconstructs their positions via adding a shift $a_k$ to every position stored in $S_k$. Let $U$ denote the universe of all candidates, and $\mathrm{cov}(k)=|T_k|$ denote the number of rows that are to be deleted when a candidate $k$ is accepted. Under a subset of accepted candidates $X \subseteq U$, the resulting size of $I$ becomes
 \[
     m - \sum_{k \in X} \mathrm{cov}(k)
 \]
-
-Assuming that the space usage of our $k$-mer lookup structure increases monotonically with the number of remaining rows \footnote{
-    This assumption is not completely accurate: Since every accepted candidate increases the number of hash table entries, accepting many small-coverage candidates can cause the HT index to take up extra space that outweigh the space savings of the accepted candidates.
+Assuming that the space usage of our $k$-mer lookup structure increases monotonically with the number of remaining rows
+\footnote{
+    This assumption is not completely accurate: Since every accepted candidate increases the number of hash table entries, accepting many small-coverage candidates can cause the hash table index to take up extra space in a way that outweighs the space savings of the accepted candidates.
 }
 , the objective is to find a subset of consistent candidates that minimize the above expression.
 
 \subsection{The constraints}
 
-Accepted candidates are subject to the following constraints:
+A candidate is valid if it satisfies the following conditions:
 \begin{itemize}
-    \item \textbf{One reference per word}: After the suffix array is compressed, constant-time lookup of words is achieved with a hash table that stores the \emph{real} and the \emph{referenced} occurrences of a word. Every word can have at most one entry of each kind. Therefore, candidates $k$ and $k'$ cannot be accepted simultaneously if $T_k, T_{k'} \subseteq I_w$ for some $w$.
-    \item \textbf{Source-integrity}: If a row range $T_k$ has been deleted to reference another range $S_k$, the source range $S_k$ cannot be deleted. Therefore, candidates $k$ and $k'$ cannot be accepted simultaneously if $S_k \cap T_{k'} \neq \emptyset$.
+    \item \textbf{Source contiguity:} After the suffix array is compressed, constant-time lookup of words is achieved with a hash table that stores the \emph{real} and the \emph{referenced} occurrences of a word. References are stored as a 3-tuple $(p, n, a)$, indicating to read the positions fron $n$ consecutive rows starting from row $p$ and to add a shift $a$ to each of them. This structure cannot specify to "skip" specific rows, so all $n$ rows must be part of the source ranks. In other words, $S_k$ must be contiguous (for $i \in S_k: i = \min(S_k) \text{ or } i-1 \in S_k$).
+    \item \textbf{Target containment:} A target subset must be contained within the LCP-interval of a word (formally $\exists w : T_k \subseteq I_w)$ so that the referenced occurrences of that word can be updated to recover the deleted row range if the candidate is accepted.
+\end{itemize}
+
+Additionally, accepted candidates are subject to the following constraints: 
+\begin{itemize}
+    \item \textbf{One reference per word:}  Every word can have at most one hash table entry storing its referenced occurrences. Therefore, candidates $k$ and $k'$ cannot be accepted simultaneously if $T_k, T_{k'} \subseteq I_w$ for some $w$.
+    \item \textbf{Source integrity:} If a row range $T_k$ has been deleted to reference another range $S_k$, the source range $S_k$ cannot be deleted. Therefore, candidates $k$ and $k'$ cannot be accepted simultaneously if $S_k \cap T_{k'} \neq \emptyset$ (notice that this already rules out self-referencing candidates, specifically $k$ such that $S_k \cap T_k \neq \emptyset$).
 \end{itemize}
 
 \subsection{Maximum weighted independent set}
@@ -55,7 +61,7 @@ Consider a graph $G$ where the vertices are the candidates and two candidates ar
 
 Finding a MWIS admits a polynomial time dynamic programming algorithm on trees, but is NP-hard on general graphs. It is easy to see that the conflict graphs of our instances are not trees: Since every word can have $\leq 1$ accepted candidate, multiple candidates belonging to the same word are already modeled as a clique. Solving the problem exactly is therefore unlikely unless the LCP-intervals give the graph some structure to be exploited.
 
-The main idea of PFDP is to heuristically sparsify the candidate space, then exactly solve the problem on the remaining candidates using dynamic programming.
+The main idea of \texttt{pseudoforest-dp} is to heuristically sparsify the candidate space, then exactly solve the problem on the remaining candidates using dynamic programming.
 
 \subsection{Prerequisite: MWIS on trees}
 
@@ -66,7 +72,7 @@ The MWIS of a tree $G = (V, E)$ can be computed exactly with dynamic programming
 \end{align*}
 (Intuitively, fixing $v$ to be part of the solution forces the children not to be part of the solution. Fixing $v$ not to be in the solution has no constraints on the children. Notice the summation term does not exist for leaves so they serve as base cases)
 
-There are $2n$ subproblems to solve, and each subproblem compares sums up many cases as the number of neighbors of the associated vertex. This already bounds the running time at $\mathcal{O}(n^2)$, but notice that every non-root vertex only appears as a summand once. Thus the total number of additions is also bounded linearly and the total running time is $\mathcal{O}(n)$.
+There are $2n$ subproblems to solve, and each subproblem compares sums up many cases as the number of neighbors of the associated vertex. This already bounds the running time at $\mathcal{O}(n^2)$, but notice that every subproblem associated with a non-root vertex appears at most twice as a summand (\emph{e.g.}, if $v$ is $u$'s parent, $A[u]$ is only used when calculating $B[v]$ and $B[u]$ is used only for $A[v]$ and $B[v]$). Thus the total number of additions/comparisons is also bounded linearly and the total running time is $\mathcal{O}(n)$.
 
 \subsection{Sparsifying the graph}
 
@@ -80,18 +86,52 @@ There are no conflicts between candidates targeting the same word, because the g
 
 \subsection{MWIS on pseudoforests}
 
-A pseudoforest consists of \emph{pseudotrees}, which are trees with an additional edge (that creates exactly one cycle). The MWIS algorithm for trees can be adapted for pseudoforests by fixing a cycle node and branching on its inclusion in the independent set. Specifically, let $P$ be a pseudoforest and $v \in V(P)$ be a cycle node, and let $N[v]$ denote the neighbors of $v$. There are two cases: \begin{itemize}
+A pseudoforest consists of \emph{pseudotrees}, which are trees with an additional edge (resultin in exactly one cycle). The MWIS algorithm for trees can be adapted for pseudotrees by fixing a cycle node and branching on its inclusion in the independent set. Specifically, let $P$ be a pseudotree and $v \in V(P)$rm  a cycle node, and let $N[v]$ denote the neighbors of $v$. There are two cases: \begin{itemize}
     \item If $v$ is in the solution: $\mathrm{MWIS}(P) = w(v) + \mathrm{MWIS}(P - \left(\{v\} \cup N[v] \right))$
     \item If $v$ is not in the solution: $\mathrm{MWIS}(P) = 0 + \mathrm{MWIS}(P - \{v\})$.
 \end{itemize}
-Notice that removing $v$ already destroys the cycle and leaves behind a forest, so the smaller subproblems of either case can be solved exactly in $\mathcal{O}(n)$ time. The overall running time is therefore $\mathcal{O}(n)$.
+Notice that removing $v$ is sufficient to destroy the only cycle, so the remaining subproblems of either case can be solved exactly in $\mathcal{O}(n)$ time. The overall running time is therefore $\mathcal{O}(n)$.
 
 \subsection{Leftover phase}
 
 After one pass of the DP algorithm on the preferred candidates, some words end up with no accepted candidates because their preferred candidate was not part of the DP solution. Such words may have had other (non-preferred) candidates that do not conflict with the DP solution, but these candidates were eliminated in the sparsification phase and therefore were not considered yet. These candidates are accounted for with a singular greedy pass. After the DP solution is finalized, all candidates are revisited in decreasing order of coverage and added to the solution if they do not conflict with what is already in the solution.
 
-\subsection{IDEA: Iterative DP}
+\subsection{Phase 2}
 
-Instead of applying the DP once on preferred candidates and immediately applying the greedy pass on leftover candidates, we can apply the DP iteratively. After the first application, we fix the set of accepted candidates and extract a second set of preferences that do not conflict with the fixed solution. We can then apply DP on this second set and add the new solution to the fixed solution, and repeat this process until no more candidates can be extracted.
+The leftover phase is followed by a final pass of \texttt{tree-dp}'s phase II procedure (explained in \texttt{tree\_dp.pdf}).
+
+\newpage
+
+\section{Further ideas}
+
+Here are some ideas not yet implemented, but could be worth pursuing.
+
+\subsection{Combining \texttt{pseudoforest-dp} with \texttt{tree-dp3}}
+
+All DP algorithms in the repository follow the same formula of DP $\rightarrow$ leftover $\rightarrow$ phase 2 with the following differences:
+\begin{itemize}
+    \item \texttt{tree-dp} generates the same candidate graph but ignores any candidate that would close a cycle. Note that the ignored candidate is decided by the order in which the candidates are processed.
+    \item \texttt{tree-dp4} avoids cycles by dropping the lowest coverage candidate of the cycle instead.
+    \item \texttt{pseudoforest-dp} allows cycle formation and solves them exactly.
+    \item \texttt{tree-dp3} avoids cycles like \texttt{tree-dp} and phase II with a different heuristic: It creates a dependency graph on \emph{words} (rather than candidates) and exactly solves small neighborhoods on this graph.
+\end{itemize}
+The compression achieved by \texttt{pseudoforest-dp}'s DP phase is provably no worse than the other algorithms' (\texttt{pseudoforest-dp} sometimes sees more candidates, and never less). However, \texttt{tree-dp3} sometimes achieves the overall best compression with its LNS heurisitc. This heuristic can also replace phase II in \texttt{pseudoforest-dp} to potentially get better results.
+
+\subsection{Iterative DP}
+
+After one pass of the DP algorithm, some words receive no accepted candidates under the optimal DP solution. These words likely have other (non-preferred) candidates which were invisible to the DP: The leftover pass is aimed towards finding and accepting such candidates. Instead of accepting the leftover viable candidates in the greedy order, we can use DP iteratively on the remaining candidates until no further candidates can be generated.
+
+\subsection{Source intervals without LCP depth}
+
+When generating candidates with some offset $a$, the algorithms require that the source intervals have LCP-depth $\geq a + 1$. This is sufficient to ensure that the $a + 1$-th character of the intervals is the same, but it is not necessary: There can be intervals where the LCP-depth dips below $a + 1$ but the $a + 1$-th character remains the same: Allowing candidates to source from such intervals can yield better results
+\footnote{
+    Dropping the LCP-depth requirement breaks the guarantee that the reconstructed positions appear in the same order in the SA as the original positions. But this does not seem to be a requirement for our application.
+}.
+
+\subsection{Additional candidates via post-deletion source contiguity}
+
+Recall that we require source intervals to be contiguous so that a single reference \texttt{(pos, num, add)} can be used to reconstruct \texttt{num} positions on the final structure. More specifically, we want the source rows to be contiguous in the \emph{final} SA: Requiring them to be contiguous on the pre-compression SA is sufficient for this, but not necessary.
+
+As an example, suppose we have a link that sources from the rows $[1, 2, 5, 6]$. This cannot be used to create a valid candidate in our definition, but suppose there was another candidate that targets the rows $[3, 4]$. If we delete these rows, $[1, 2, 5, 6]$ is now contiguous and can be used by a candidate.
 
 \end{document}
