@@ -21,7 +21,7 @@
 // ancestor" better than "each strain diverged from the previous one").
 //
 // Example:
-//   ./simulate_pangenome -r ecoli_k12.fasta -n 4 --divergence 0.01 --seed 1 -o pangenome_ecoli_n4.fasta
+//   ./simulate_pangenome -r ecoli_003.fasta -n 4 --divergence 0.01 --seed 1 -o pangenome_ecoli_n4.fasta
 //   ./simulate_pangenome -y 200000 -n 8 --divergence 0.01 --seed 1 -o /tmp/pg8.fasta
 
 #include "random_dna.hpp"

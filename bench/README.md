@@ -128,6 +128,6 @@ New synthetic families need a generator binary built the same way
 `run_suite.py` just shells out to whatever `generator` name you give it. To
 glue several already-resolved datasets into one FASTA (e.g. multiple real
 genomes for a real, non-simulated pangenome) use `kind="concat"` with a
-`refs` list of `"@name"` references instead -- see `pangenome_ecoli_real_n3`
-/ `_n8` / `_n16` (prefixes of `REAL_ECOLI_STRAIN_POOL`, 16 real E. coli
-strains deep) for an example.
+`refs` list of `"@name"` references instead -- see `pangenome_ecoli_real_n8`
+/ `_n16` / `_n32` / `_n64` / `_n100` (prefixes of `REAL_ECOLI_STRAIN_POOL`,
+100 real E. coli strains deep as of Aug-28) for an example.

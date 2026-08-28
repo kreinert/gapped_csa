@@ -159,7 +159,7 @@ def resolve_path(name: str, by_name: dict, bin_dir: Path, data_dir: Path,
                   tmp_dir: Path, cache: dict, log) -> "Path | None":
     """Resolve one dataset name to a local FASTA path, generating/checking/
     concatenating as its `kind` requires. Memoized in `cache` so a dataset
-    referenced via "@name" by others (e.g. "@ecoli_k12", used by both the
+    referenced via "@name" by others (e.g. "@ecoli_003", used by both the
     simulated pangenome sweep and the real-strain concat entry) is only
     resolved once per run."""
     if name in cache:

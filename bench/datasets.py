@@ -38,16 +38,35 @@ deliberately not decided here -- see config.py. Nothing in this file (or
 anywhere else tracked by git) should hardcode a real filesystem path.
 """
 
-# Ordered pool of 16 real strains for the n=8/n=16 real-strain pangenome
-# sweep below, each entry taking a prefix of this list. Order is hand-picked
-# so the n=8 prefix alone already spans lab/commensal, EHEC, UPEC/ExPEC,
-# EAEC and ETEC pathotypes rather than front-loading near-duplicates -- see
-# the pathotype notes on each dataset in category C below.
+# Ordered pool of 100 real strains for the n=8/16/32/64/100 real-strain
+# pangenome sweep below, each entry taking a prefix of this list.
+# Aug-28 update: this used to be 16 strains hand-ordered to span
+# pathotypes/phylogroups (see git history) -- replaced wholesale with a
+# 100-strain pool confirmed very similar to one another (Mete, Aug 28
+# 2026), so pathotype-spanning order no longer applies. Order here is
+# just the reference strain ("@ecoli_003") first, then the rest in the
+# order Mete's source list gave them.
 REAL_ECOLI_STRAIN_POOL = [
-    "@ecoli_k12", "@ecoli_sakai", "@ecoli_cft073", "@ecoli_hs",
-    "@ecoli_042", "@ecoli_edl933", "@ecoli_e24377a", "@ecoli_uti89",
-    "@ecoli_umn026", "@ecoli_apec_o1", "@ecoli_iai1", "@ecoli_536",
-    "@ecoli_55989", "@ecoli_s88", "@ecoli_ed1a", "@ecoli_iai39",
+    "@ecoli_003", "@ecoli_001", "@ecoli_002", "@ecoli_004", "@ecoli_005",
+    "@ecoli_006", "@ecoli_007", "@ecoli_008", "@ecoli_009", "@ecoli_010",
+    "@ecoli_011", "@ecoli_012", "@ecoli_013", "@ecoli_014", "@ecoli_015",
+    "@ecoli_016", "@ecoli_017", "@ecoli_018", "@ecoli_019", "@ecoli_020",
+    "@ecoli_021", "@ecoli_022", "@ecoli_023", "@ecoli_024", "@ecoli_025",
+    "@ecoli_026", "@ecoli_027", "@ecoli_028", "@ecoli_029", "@ecoli_030",
+    "@ecoli_031", "@ecoli_032", "@ecoli_033", "@ecoli_034", "@ecoli_035",
+    "@ecoli_036", "@ecoli_037", "@ecoli_038", "@ecoli_039", "@ecoli_040",
+    "@ecoli_041", "@ecoli_042", "@ecoli_043", "@ecoli_044", "@ecoli_045",
+    "@ecoli_046", "@ecoli_047", "@ecoli_048", "@ecoli_049", "@ecoli_050",
+    "@ecoli_051", "@ecoli_052", "@ecoli_053", "@ecoli_054", "@ecoli_055",
+    "@ecoli_056", "@ecoli_057", "@ecoli_058", "@ecoli_059", "@ecoli_060",
+    "@ecoli_061", "@ecoli_062", "@ecoli_063", "@ecoli_064", "@ecoli_065",
+    "@ecoli_066", "@ecoli_067", "@ecoli_068", "@ecoli_069", "@ecoli_070",
+    "@ecoli_071", "@ecoli_072", "@ecoli_073", "@ecoli_074", "@ecoli_075",
+    "@ecoli_076", "@ecoli_077", "@ecoli_078", "@ecoli_079", "@ecoli_080",
+    "@ecoli_081", "@ecoli_082", "@ecoli_083", "@ecoli_084", "@ecoli_085",
+    "@ecoli_086", "@ecoli_087", "@ecoli_088", "@ecoli_089", "@ecoli_090",
+    "@ecoli_091", "@ecoli_092", "@ecoli_093", "@ecoli_094", "@ecoli_095",
+    "@ecoli_096", "@ecoli_097", "@ecoli_098", "@ecoli_099", "@ecoli_100",
 ]
 
 DATASETS = [
@@ -70,18 +89,40 @@ DATASETS = [
          args=["-x", "50", "-y", "200", "--repetitive-frac", "0.1", "--seed", "1"]),
 
     # --- C. real genomes -----------------------------------------------
-    # URLs verified live (Aug 2026) -- see docs/benchmark_design.md S3C for
-    # how each was chosen and why NCBI's static FTP mirror + UCSC goldenPath
-    # were used instead of Ensembl (Ensembl restructured its FTP layout this
-    # month; the old species-name URLs are being retired, so anything copied
-    # from an older tutorial is likely already broken). sha256 is still
-    # unpinned -- run `./fetch_data.py --print-hash <name>` after the first
-    # successful fetch and copy the value back in here.
-    dict(name="ecoli_k12", category="real_genome", kind="fetched",
-         source="NCBI RefSeq GCF_000005845.2 (ASM584v2), chromosome NC_000913.3",
-         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/005/845/"
-              "GCF_000005845.2_ASM584v2/GCF_000005845.2_ASM584v2_genomic.fna.gz"),
-         sha256="53bb6a51b6e92139ced1e38f74b7938781027c52200922ff03718c2237d23bb4"),
+    # Aug-28 update: the 16 hand-picked, pathotype-diverse E. coli strains
+    # previously here (K-12, Sakai, CFT073, +13 more spanning EHEC/UPEC/
+    # EAEC/ETEC pathotypes) have been REMOVED and replaced wholesale with a
+    # pool of 100 E. coli assemblies confirmed (by Mete, Aug 28 2026) to be
+    # very similar to one another -- i.e. this batch is deliberately near-
+    # duplicate rather than pathotype-diverse, which answers (differently
+    # than expected) the open question in benchmark_design.md S7 about
+    # whether strain selection should be phylogroup-balanced. All 100 are
+    # `fetched`-kind, `sha256=None` -- this session's sandbox (both the
+    # cloud container and the device_bash bridge to Mete's machine) cannot
+    # reach ftp.ncbi.nlm.nih.gov at all (org egress allowlist -- confirmed
+    # blocked, not just untested), so none of the 100 could actually be
+    # downloaded or hashed here. Run `./fetch_data.py` on a machine with
+    # normal internet access, then copy each printed sha256 back into the
+    # matching entry below (same workflow the previous batch used).
+    #
+    # ecoli_003 (GCF_003697165.2, ASM369716v2) is the single "primary" real
+    # E. coli genome -- the one entry that (a) sits in the main real_genome
+    # category alongside dmel_genome/human_chr21 for the full algorithm x
+    # shape x max_add grid, and (b) is the `-r` reference simulate_pangenome
+    # uses for the simulated n=1/2/4/8 sweep below, taking over ecoli_k12's
+    # old role in both places. Picked by accession number alone (a 2018-era,
+    # low-numbered RefSeq accession vs. the 040000000-048000000 range
+    # everything else in this batch was assigned in 2025-2026) as weak
+    # evidence of an older/more-established assembly -- CONFIRMED after
+    # fetching (Aug 28): 2 contigs (`NZ_CP033092.2` chromosome + one
+    # plasmid, both "complete genome"/"complete sequence"), and it's
+    # actually the E. coli type strain (DSM 30083 = JCM 1649 = ATCC 11775).
+    # Good pick.
+    dict(name="ecoli_003", category="real_genome", kind="fetched",
+         source="NCBI RefSeq GCF_003697165.2 (ASM369716v2)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/003/697/165/"
+              "GCF_003697165.2_ASM369716v2/GCF_003697165.2_ASM369716v2_genomic.fna.gz"),
+         sha256="17124ac56df45b547706ddb0b2a56274d893022f42fe445afb5a08e19eb874b1"),
     dict(name="dmel_genome", category="real_genome", kind="fetched",
          source="UCSC dm6 (= Ensembl BDGP6.46 / GCA_000001215.4), whole genome, soft-masked",
          url="https://hgdownload.soe.ucsc.edu/goldenPath/dm6/bigZips/dm6.fa.gz",
@@ -91,94 +132,509 @@ DATASETS = [
          url="https://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/chr21.fa.gz",
          sha256="35c71b68436d1a278ecb6a1e875af3ba4020738a028a7feac769a6d62790ae1f"),
 
-    # Second and third real E. coli strains, for the "real strains" pangenome
-    # entry below -- distinct pathotypes/phylogroups from K-12, so genuinely
-    # different genomes rather than resequencing the same isolate.
-    dict(name="ecoli_sakai", category="real_genome", kind="fetched",
-         source="NCBI RefSeq GCF_000008865.2 (ASM886v2), O157:H7 str. Sakai",
+    # The other 99 strains in the 100-strain "very similar" pool -- category
+    # real_genome_pool (NOT real_genome) so they feed REAL_ECOLI_STRAIN_POOL
+    # below without each also multiplying the main algorithm x shape x
+    # max_add grid by 99x on top of ecoli_003/dmel_genome/human_chr21.
+    # Named ecoli_001..ecoli_100 by the row order of the URL list Mete
+    # supplied (Aug 28 2026); ecoli_003 above is #003 of that same list,
+    # pulled out and renumbered nowhere -- it just keeps its dataset name
+    # and additionally plays the primary/reference role.
+    dict(name="ecoli_001", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_046581325.1 (ASM4658132v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/046/581/325/"
+              "GCF_046581325.1_ASM4658132v1/GCF_046581325.1_ASM4658132v1_genomic.fna.gz"),
+         sha256="ad7365b41099582386a97c59b8a5b3d9114b257cfff59974c71e31c0fe626558"),
+    dict(name="ecoli_002", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_040279995.2 (ASM4027999v2)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/040/279/995/"
+              "GCF_040279995.2_ASM4027999v2/GCF_040279995.2_ASM4027999v2_genomic.fna.gz"),
+         sha256="4765ba8b1abb0ee521aced530bc47682d0727741f9c6b3514ebca897fa7c965c"),
+    dict(name="ecoli_004", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_046581375.1 (ASM4658137v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/046/581/375/"
+              "GCF_046581375.1_ASM4658137v1/GCF_046581375.1_ASM4658137v1_genomic.fna.gz"),
+         sha256="b6a9a555183553b7556521920b270875533a11c39c8304eae62dae7fffd5c148"),
+    dict(name="ecoli_005", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_046603975.1 (ASM4660397v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/046/603/975/"
+              "GCF_046603975.1_ASM4660397v1/GCF_046603975.1_ASM4660397v1_genomic.fna.gz"),
+         sha256="26630dacc2f0936132463135c9b0afb703805f9d206bcf82ecddd3f265ad52ed"),
+    dict(name="ecoli_006", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_000008865.2 (ASM886v2)",
          url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/008/865/"
               "GCF_000008865.2_ASM886v2/GCF_000008865.2_ASM886v2_genomic.fna.gz"),
          sha256="71c2e5c364293c9ba36fc2c7acbcaa75cd6884295fe06260ba198826a8b1ddd3"),
-    dict(name="ecoli_cft073", category="real_genome", kind="fetched",
-         source="NCBI RefSeq GCF_014262945.1 (ASM1426294v1), uropathogenic CFT073",
-         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/014/262/945/"
-              "GCF_014262945.1_ASM1426294v1/GCF_014262945.1_ASM1426294v1_genomic.fna.gz"),
-         sha256="0aa2c239f4ec0f7bfd2dc3c6cef1ec15969c80be0393aefd1b0289c143240978"),
-
-    # 13 more real strains (verified live, Aug 2026, same way as the three
-    # above) so the real-strain pangenome sweep below can go up to n=8/n=16
-    # without ever resequencing the same isolate twice. Pathotypes are as
-    # reported in Rasko et al. 2008 J. Bacteriol (EDL933/HS/E24377A/UTI89/
-    # 536/042/APEC O1) and Touchon et al. 2009 PLoS Genet (IAI1/ED1a/S88/
-    # UMN026/IAI39/55989) -- both are classic, widely-used E. coli diversity
-    # panels, not an arbitrary grab of whatever NCBI returned first.
-    dict(name="ecoli_hs", category="real_genome", kind="fetched",
-         source="NCBI RefSeq GCF_000017765.1 (ASM1776v1), commensal strain HS",
-         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/017/765/"
-              "GCF_000017765.1_ASM1776v1/GCF_000017765.1_ASM1776v1_genomic.fna.gz"),
-         sha256="d427a238a5a5a32e4cb504ab8e11169c9c2486b56905d311fe8e698e4b492b8a"),
-    dict(name="ecoli_042", category="real_genome", kind="fetched",
-         source="NCBI RefSeq GCF_000027125.1 (ASM2712v1), EAEC strain 042",
-         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/027/125/"
-              "GCF_000027125.1_ASM2712v1/GCF_000027125.1_ASM2712v1_genomic.fna.gz"),
-         sha256="6b449c0f341ccc448d1de7ba2e61d449cf66d0c336257e4caa673d46131498c5"),
-    dict(name="ecoli_edl933", category="real_genome", kind="fetched",
-         source=("NCBI RefSeq GCF_000006665.1 (ASM666v1), EHEC O157:H7 str. "
-                 "EDL933 -- a second, independently isolated O157:H7 lineage "
-                 "alongside ecoli_sakai above"),
-         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/006/665/"
-              "GCF_000006665.1_ASM666v1/GCF_000006665.1_ASM666v1_genomic.fna.gz"),
-         sha256="84ae40b897e1c7651612a3f62c8d5050e604608d8e573d07c193f9c37462af23"),
-    dict(name="ecoli_e24377a", category="real_genome", kind="fetched",
-         source="NCBI RefSeq GCF_000017745.1 (ASM1774v1), ETEC strain E24377A",
-         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/017/745/"
-              "GCF_000017745.1_ASM1774v1/GCF_000017745.1_ASM1774v1_genomic.fna.gz"),
-         sha256="919e37f0a296bac5d8e4b221cdc0f4514df725cca4db53d170b72a6afabfd15e"),
-    dict(name="ecoli_uti89", category="real_genome", kind="fetched",
-         source="NCBI RefSeq GCF_000013265.1 (ASM1326v1), UPEC/ExPEC strain UTI89",
-         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/013/265/"
-              "GCF_000013265.1_ASM1326v1/GCF_000013265.1_ASM1326v1_genomic.fna.gz"),
-         sha256="81c3f1807af638bce3f95c15a8d87ee24184b02777d52fb05634e00b55429124"),
-    dict(name="ecoli_umn026", category="real_genome", kind="fetched",
-         source="NCBI RefSeq GCF_000026325.1 (ASM2632v2), ExPEC strain UMN026",
-         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/026/325/"
-              "GCF_000026325.1_ASM2632v2/GCF_000026325.1_ASM2632v2_genomic.fna.gz"),
-         sha256="d40e06f1490c5777c379ad925caa6361e8588e9c65535437d46ca44b3bebb46b"),
-    dict(name="ecoli_apec_o1", category="real_genome", kind="fetched",
-         source="NCBI RefSeq GCF_000014845.1 (ASM1484v1), avian-pathogenic ExPEC strain APEC O1",
-         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/014/845/"
-              "GCF_000014845.1_ASM1484v1/GCF_000014845.1_ASM1484v1_genomic.fna.gz"),
-         sha256="f0ab95865593beb469d9423c75a5ba49bb5f3f142f61c5d0820b9980a41903f2"),
-    dict(name="ecoli_536", category="real_genome", kind="fetched",
-         source="NCBI RefSeq GCF_000013305.1 (ASM1330v1), UPEC/ExPEC strain 536",
-         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/013/305/"
-              "GCF_000013305.1_ASM1330v1/GCF_000013305.1_ASM1330v1_genomic.fna.gz"),
-         sha256="68319392e5ea6cb477d6a4908298e936c8f8f0d1cff85054d956c17891589534"),
-    dict(name="ecoli_iai1", category="real_genome", kind="fetched",
-         source="NCBI RefSeq GCF_000026265.1 (ASM2626v1), commensal strain IAI1",
-         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/026/265/"
-              "GCF_000026265.1_ASM2626v1/GCF_000026265.1_ASM2626v1_genomic.fna.gz"),
-         sha256="c65a68318dc65b95141d6bdb0f7457d6b3c561ae7e8271407bc215317074a5ae"),
-    dict(name="ecoli_55989", category="real_genome", kind="fetched",
-         source="NCBI RefSeq GCF_000026245.1 (ASM2624v1), EAEC strain 55989",
-         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/026/245/"
-              "GCF_000026245.1_ASM2624v1/GCF_000026245.1_ASM2624v1_genomic.fna.gz"),
-         sha256="bd737a35a5e4b8d731d43d5708270f60381ba226acc63ca58a1cca83ec2c371a"),
-    dict(name="ecoli_s88", category="real_genome", kind="fetched",
-         source="NCBI RefSeq GCF_000026285.1 (ASM2628v2), ExPEC strain S88 (meningitis-associated)",
-         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/026/285/"
-              "GCF_000026285.1_ASM2628v2/GCF_000026285.1_ASM2628v2_genomic.fna.gz"),
-         sha256="335dd2635bcb9cc98b29a2058f060201ee065cc49c2c877fa9b5134e4694f1f8"),
-    dict(name="ecoli_ed1a", category="real_genome", kind="fetched",
-         source="NCBI RefSeq GCF_000026305.1 (ASM2630v1), commensal strain ED1a",
-         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/026/305/"
-              "GCF_000026305.1_ASM2630v1/GCF_000026305.1_ASM2630v1_genomic.fna.gz"),
-         sha256="cab7fda0166436e7426dbe5f4341b07b15b517a9f7cc7fc8d9bc782c47d3b29e"),
-    dict(name="ecoli_iai39", category="real_genome", kind="fetched",
-         source="NCBI RefSeq GCF_000026345.1 (ASM2634v1), ExPEC strain IAI39",
-         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/026/345/"
-              "GCF_000026345.1_ASM2634v1/GCF_000026345.1_ASM2634v1_genomic.fna.gz"),
-         sha256="a8384b63f8071022f01ebe2cd9ff331a04117564a8f0f04aeceba2aa4b554261"),
+    dict(name="ecoli_007", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_046581385.1 (ASM4658138v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/046/581/385/"
+              "GCF_046581385.1_ASM4658138v1/GCF_046581385.1_ASM4658138v1_genomic.fna.gz"),
+         sha256="1fe8c90f82b74eb9fca5538baf46c3fd92e3efe95bba35faeaa1a63d9c788e59"),
+    dict(name="ecoli_008", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_040272325.2 (ASM4027232v2)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/040/272/325/"
+              "GCF_040272325.2_ASM4027232v2/GCF_040272325.2_ASM4027232v2_genomic.fna.gz"),
+         sha256="18b4b7b3244f8b39914ade590c7c25c03f1915c2d174ad2cbeeaeddd0d151931"),
+    dict(name="ecoli_009", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_047115195.1 (ASM4711519v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/047/115/195/"
+              "GCF_047115195.1_ASM4711519v1/GCF_047115195.1_ASM4711519v1_genomic.fna.gz"),
+         sha256="fffa6f2d2aa564424ae828b5b4deeca9477ac466bab0cf7978f371d65fdb281f"),
+    dict(name="ecoli_010", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_047300965.1 (ASM4730096v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/047/300/965/"
+              "GCF_047300965.1_ASM4730096v1/GCF_047300965.1_ASM4730096v1_genomic.fna.gz"),
+         sha256="75c368f5ad26621728bc271f4741786aba9de165a5f5f725e03dc54019a3bdef"),
+    dict(name="ecoli_011", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_046605345.1 (ASM4660534v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/046/605/345/"
+              "GCF_046605345.1_ASM4660534v1/GCF_046605345.1_ASM4660534v1_genomic.fna.gz"),
+         sha256="26dfaf253231bea8cd124bfb69eb5333066b2d96d13ac67ae0194930f8c8e77d"),
+    dict(name="ecoli_012", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_047300905.1 (ASM4730090v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/047/300/905/"
+              "GCF_047300905.1_ASM4730090v1/GCF_047300905.1_ASM4730090v1_genomic.fna.gz"),
+         sha256="98b74de52bf472f22aa4e4f60b81f126180f02342bce94d73c6fe6eff6faec80"),
+    dict(name="ecoli_013", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_046713585.1 (18AR0845)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/046/713/585/"
+              "GCF_046713585.1_18AR0845/GCF_046713585.1_18AR0845_genomic.fna.gz"),
+         sha256="0934c29476c3ed5610328d2725fb246a088da8e345c4228a769c4e3155eb1e32"),
+    dict(name="ecoli_014", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_047456025.1 (ASM4745602v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/047/456/025/"
+              "GCF_047456025.1_ASM4745602v1/GCF_047456025.1_ASM4745602v1_genomic.fna.gz"),
+         sha256="be6adb12087ece0b1e01deae6c4a968767dbc6b53c5e39c3981ff085c9a1bb71"),
+    dict(name="ecoli_015", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_047037185.1 (ASM4703718v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/047/037/185/"
+              "GCF_047037185.1_ASM4703718v1/GCF_047037185.1_ASM4703718v1_genomic.fna.gz"),
+         sha256="ff592b8cbc17c5eaeb999e1e8e95f193691e4513d04946ac1d0865dada1df566"),
+    dict(name="ecoli_016", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_047551885.1 (ASM4755188v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/047/551/885/"
+              "GCF_047551885.1_ASM4755188v1/GCF_047551885.1_ASM4755188v1_genomic.fna.gz"),
+         sha256="f3f31fe812490c63a1e3090e0e371ab0e34b4ff8b1890a66492c2982ae9fad44"),
+    dict(name="ecoli_017", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048020285.1 (ASM4802028v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/020/285/"
+              "GCF_048020285.1_ASM4802028v1/GCF_048020285.1_ASM4802028v1_genomic.fna.gz"),
+         sha256="0bdb9f1ca644840a7110812788ae15588d514a1d1dd20ce8d11231f860f52d80"),
+    dict(name="ecoli_018", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048161525.1 (Br_54_kylling)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/161/525/"
+              "GCF_048161525.1_Br_54_kylling/GCF_048161525.1_Br_54_kylling_genomic.fna.gz"),
+         sha256="418d21dd4c768b75189f1aef18e2a1e84e011621926eadae2722f7b4e5829866"),
+    dict(name="ecoli_019", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048020275.1 (ASM4802027v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/020/275/"
+              "GCF_048020275.1_ASM4802027v1/GCF_048020275.1_ASM4802027v1_genomic.fna.gz"),
+         sha256="bedcabd825f1e93eee37da903868c46f94b78363298ce59bf7b01213fc5b5cfd"),
+    dict(name="ecoli_020", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048016545.1 (ASM4801654v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/016/545/"
+              "GCF_048016545.1_ASM4801654v1/GCF_048016545.1_ASM4801654v1_genomic.fna.gz"),
+         sha256="cfea459db42125a7b73b39de99404ddaa2298bdbb848678e5f7422b3b5c3bf89"),
+    dict(name="ecoli_021", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048163035.1 (Br_178_kylling)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/163/035/"
+              "GCF_048163035.1_Br_178_kylling/GCF_048163035.1_Br_178_kylling_genomic.fna.gz"),
+         sha256="f0e1b92985f69715e103669c72ebd2c54550322516f0acf862de3f8167c7fa93"),
+    dict(name="ecoli_022", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048163005.1 (Br_167_kylling)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/163/005/"
+              "GCF_048163005.1_Br_167_kylling/GCF_048163005.1_Br_167_kylling_genomic.fna.gz"),
+         sha256="5ece80455781b001ec6d85212259bf72a31574241f6b150f51d3af5dbc04f639"),
+    dict(name="ecoli_023", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048160285.1 (ASM4816028v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/160/285/"
+              "GCF_048160285.1_ASM4816028v1/GCF_048160285.1_ASM4816028v1_genomic.fna.gz"),
+         sha256="0c5429cf10562ca1b1fded7165f7fd6a678adbe5e37cfd5e6598964bf5983d91"),
+    dict(name="ecoli_024", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048162985.1 (Br_112_kylling)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/162/985/"
+              "GCF_048162985.1_Br_112_kylling/GCF_048162985.1_Br_112_kylling_genomic.fna.gz"),
+         sha256="e97ec009f190e67afa400f087ef509d47d5420796cecd71d93b37b93c81b5541"),
+    dict(name="ecoli_025", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048163845.1 (A65EC)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/163/845/"
+              "GCF_048163845.1_A65EC/GCF_048163845.1_A65EC_genomic.fna.gz"),
+         sha256="0a099b07e0bfee90c758fab6b84b961b0c50a2443c5334b6708b30b266f61822"),
+    dict(name="ecoli_026", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048163865.1 (A134_1EC)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/163/865/"
+              "GCF_048163865.1_A134_1EC/GCF_048163865.1_A134_1EC_genomic.fna.gz"),
+         sha256="4f0f9b2d6f749ab19b192e59fc44d6ca96a93886642babf88d42fc35d8398afa"),
+    dict(name="ecoli_027", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048296705.1 (ASM4829670v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/296/705/"
+              "GCF_048296705.1_ASM4829670v1/GCF_048296705.1_ASM4829670v1_genomic.fna.gz"),
+         sha256="dd0fb8a8d5b993ed9a7bd25b79e4c69245418c499026b4c9e267d8102ec5e1e8"),
+    dict(name="ecoli_028", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048401735.1 (ASM4840173v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/401/735/"
+              "GCF_048401735.1_ASM4840173v1/GCF_048401735.1_ASM4840173v1_genomic.fna.gz"),
+         sha256="bb14e42e12e443121929b4dc7337f9e66789f700cb655b081948faf0e3e0aca1"),
+    dict(name="ecoli_029", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048402635.1 (ASM4840263v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/402/635/"
+              "GCF_048402635.1_ASM4840263v1/GCF_048402635.1_ASM4840263v1_genomic.fna.gz"),
+         sha256="d630aa0709005d7cb168725cff40be6a323c48e26f034b5f76a119748db54358"),
+    dict(name="ecoli_030", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048403475.1 (ASM4840347v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/403/475/"
+              "GCF_048403475.1_ASM4840347v1/GCF_048403475.1_ASM4840347v1_genomic.fna.gz"),
+         sha256="d48b0691e7fbbbda0292754a648cacf6f69af6a0bd8d7213f8caa5cd03f6a059"),
+    dict(name="ecoli_031", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048403405.1 (ASM4840340v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/403/405/"
+              "GCF_048403405.1_ASM4840340v1/GCF_048403405.1_ASM4840340v1_genomic.fna.gz"),
+         sha256="7cdbe60d8f679a09134bc7cb7860f4174b4371fd5577752a8154f4ed6d267ef8"),
+    dict(name="ecoli_032", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048403485.1 (ASM4840348v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/403/485/"
+              "GCF_048403485.1_ASM4840348v1/GCF_048403485.1_ASM4840348v1_genomic.fna.gz"),
+         sha256="7b1bca962bf08bda0aa6e1b35b4265dd757cd4a6bb8edcb86e3f2210c4df8711"),
+    dict(name="ecoli_033", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048457185.1 (ASM4845718v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/457/185/"
+              "GCF_048457185.1_ASM4845718v1/GCF_048457185.1_ASM4845718v1_genomic.fna.gz"),
+         sha256="c3c1146c11013292cf11d153ad5d4926f5bc3f4d83ec55574abbe875bfb725fd"),
+    dict(name="ecoli_034", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048405095.1 (ASM4840509v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/405/095/"
+              "GCF_048405095.1_ASM4840509v1/GCF_048405095.1_ASM4840509v1_genomic.fna.gz"),
+         sha256="2abda9d277d9a4659d42fc5681223d2065528a0aebde265fa1a8b9af0dca228a"),
+    dict(name="ecoli_035", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048405105.1 (ASM4840510v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/405/105/"
+              "GCF_048405105.1_ASM4840510v1/GCF_048405105.1_ASM4840510v1_genomic.fna.gz"),
+         sha256="a4cfc73b594b49d1dcd1f5ff240f3c9bcbe2cda67491d7f3112c50dfb24f100b"),
+    dict(name="ecoli_036", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048457195.1 (ASM4845719v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/457/195/"
+              "GCF_048457195.1_ASM4845719v1/GCF_048457195.1_ASM4845719v1_genomic.fna.gz"),
+         sha256="580743a7daae969688c52c349c12ae595923f29ea09acd4ddb90c8bba2385bdb"),
+    dict(name="ecoli_037", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048568955.1 (ASM4856895v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/568/955/"
+              "GCF_048568955.1_ASM4856895v1/GCF_048568955.1_ASM4856895v1_genomic.fna.gz"),
+         sha256="c0842147ba51e03c823a48a7d8c68e74f74225f1bee1f359c134ffa86281b0a9"),
+    dict(name="ecoli_038", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048568935.1 (ASM4856893v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/568/935/"
+              "GCF_048568935.1_ASM4856893v1/GCF_048568935.1_ASM4856893v1_genomic.fna.gz"),
+         sha256="fa09ed682965c350aab0a5c4e135fdb1b987f7fe7f5528ddd29ed0675dcfcc52"),
+    dict(name="ecoli_039", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048568965.1 (ASM4856896v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/568/965/"
+              "GCF_048568965.1_ASM4856896v1/GCF_048568965.1_ASM4856896v1_genomic.fna.gz"),
+         sha256="bf8aa2af0e5c160c786c4ce2fc1744e538d7b4dea1966c6bd295ba62cdd59b72"),
+    dict(name="ecoli_040", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048568995.1 (ASM4856899v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/568/995/"
+              "GCF_048568995.1_ASM4856899v1/GCF_048568995.1_ASM4856899v1_genomic.fna.gz"),
+         sha256="83a037badbed363a7b5e003f31fbdaeb2d27979d8c92931d390ff55189710119"),
+    dict(name="ecoli_041", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048569025.1 (ASM4856902v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/569/025/"
+              "GCF_048569025.1_ASM4856902v1/GCF_048569025.1_ASM4856902v1_genomic.fna.gz"),
+         sha256="d3b1d12737bf455d83135382d2cc9ee5924477613731543ed3f5fa41b8c2683a"),
+    dict(name="ecoli_042", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048569015.1 (ASM4856901v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/569/015/"
+              "GCF_048569015.1_ASM4856901v1/GCF_048569015.1_ASM4856901v1_genomic.fna.gz"),
+         sha256="bcea236599a7e8194b4e1a9475d220f1949ae00dbb65f6b27823ab9e606ab760"),
+    dict(name="ecoli_043", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048571005.1 (ASM4857100v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/571/005/"
+              "GCF_048571005.1_ASM4857100v1/GCF_048571005.1_ASM4857100v1_genomic.fna.gz"),
+         sha256="f89ae1338e2ad301296536ee6ce6b5a74e8b13cfe7ac9c4dbe8430fee61217c5"),
+    dict(name="ecoli_044", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048569075.1 (ASM4856907v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/569/075/"
+              "GCF_048569075.1_ASM4856907v1/GCF_048569075.1_ASM4856907v1_genomic.fna.gz"),
+         sha256="37f771b40a796b765c49d22a53c32226cb44ae1c8c8be35037ff20cdda416699"),
+    dict(name="ecoli_045", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048571285.1 (ASM4857128v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/571/285/"
+              "GCF_048571285.1_ASM4857128v1/GCF_048571285.1_ASM4857128v1_genomic.fna.gz"),
+         sha256="7816d6dd3ae5cbaef6469c8d3a5f776bf80472114528e1bd9453b49bf99f5a81"),
+    dict(name="ecoli_046", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048571325.1 (ASM4857132v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/571/325/"
+              "GCF_048571325.1_ASM4857132v1/GCF_048571325.1_ASM4857132v1_genomic.fna.gz"),
+         sha256="d576219797d56d41ee168186551e29821d51c26c473b92bab4a97c41dd295a1d"),
+    dict(name="ecoli_047", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048569065.1 (ASM4856906v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/569/065/"
+              "GCF_048569065.1_ASM4856906v1/GCF_048569065.1_ASM4856906v1_genomic.fna.gz"),
+         sha256="f70c10858e0d76631fc5cd99e5dbcb85b7ea1cc5e5bede899496c3f7896b9534"),
+    dict(name="ecoli_048", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048571335.1 (ASM4857133v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/571/335/"
+              "GCF_048571335.1_ASM4857133v1/GCF_048571335.1_ASM4857133v1_genomic.fna.gz"),
+         sha256="48ff3e98e364489e5eb502d67175c991a0572780df91835b11f3cf0511ea738f"),
+    dict(name="ecoli_049", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048571345.1 (ASM4857134v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/571/345/"
+              "GCF_048571345.1_ASM4857134v1/GCF_048571345.1_ASM4857134v1_genomic.fna.gz"),
+         sha256="42715923f5566f207e5a4d053c73785536355aaf5a53b1a9cd839ab8cce8dd23"),
+    dict(name="ecoli_050", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048571375.1 (ASM4857137v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/571/375/"
+              "GCF_048571375.1_ASM4857137v1/GCF_048571375.1_ASM4857137v1_genomic.fna.gz"),
+         sha256="fc26f0fc7896488aa043dfa6894679e8b495a04d148f2d823ed7182406a5bb8c"),
+    dict(name="ecoli_051", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048571365.1 (ASM4857136v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/571/365/"
+              "GCF_048571365.1_ASM4857136v1/GCF_048571365.1_ASM4857136v1_genomic.fna.gz"),
+         sha256="7c06a5bd911c64ba029795b23982f81b08f274b3405cbedc263e2f416c6e3972"),
+    dict(name="ecoli_052", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048571405.1 (ASM4857140v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/571/405/"
+              "GCF_048571405.1_ASM4857140v1/GCF_048571405.1_ASM4857140v1_genomic.fna.gz"),
+         sha256="1f37e5521db8a1dbdb0de24a1ca531e111a8eba763eccc2286422012d7c79a58"),
+    dict(name="ecoli_053", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048571355.1 (ASM4857135v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/571/355/"
+              "GCF_048571355.1_ASM4857135v1/GCF_048571355.1_ASM4857135v1_genomic.fna.gz"),
+         sha256="53a8a704a4ad98758716ccdd4fe09363dde67c8334547c362d167d5ef78855b6"),
+    dict(name="ecoli_054", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048571385.1 (ASM4857138v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/571/385/"
+              "GCF_048571385.1_ASM4857138v1/GCF_048571385.1_ASM4857138v1_genomic.fna.gz"),
+         sha256="a0692534778e904169feb9372e0c7b072f0229b91c02be96ad703a2126b73880"),
+    dict(name="ecoli_055", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048571395.1 (ASM4857139v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/571/395/"
+              "GCF_048571395.1_ASM4857139v1/GCF_048571395.1_ASM4857139v1_genomic.fna.gz"),
+         sha256="3ed3a678cdf84d81d2989227676af29d8a5ae98be125d9e1e78866ac1efe3d6b"),
+    dict(name="ecoli_056", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048571435.1 (ASM4857143v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/571/435/"
+              "GCF_048571435.1_ASM4857143v1/GCF_048571435.1_ASM4857143v1_genomic.fna.gz"),
+         sha256="0ff57486a488d0a8e943b46e72f2aabdc441fac55fb184bf69e4f2ac1ac89d6b"),
+    dict(name="ecoli_057", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048571445.1 (ASM4857144v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/571/445/"
+              "GCF_048571445.1_ASM4857144v1/GCF_048571445.1_ASM4857144v1_genomic.fna.gz"),
+         sha256="7cc33a25e4dab2898cdaf95c300f4272412adf00c7aacc72a05b3c93f0830c27"),
+    dict(name="ecoli_058", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048571465.1 (ASM4857146v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/571/465/"
+              "GCF_048571465.1_ASM4857146v1/GCF_048571465.1_ASM4857146v1_genomic.fna.gz"),
+         sha256="ee46dbe1b4883c55eddd56479c646220a9a0da0a7c7d2ced8bd7fdcb83dc1cf9"),
+    dict(name="ecoli_059", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048571535.1 (ASM4857153v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/571/535/"
+              "GCF_048571535.1_ASM4857153v1/GCF_048571535.1_ASM4857153v1_genomic.fna.gz"),
+         sha256="3742b93740f975dbf39dfde29df9b4f5f8fee9b98db71270979afc8c9ee24bef"),
+    dict(name="ecoli_060", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048571575.1 (ASM4857157v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/571/575/"
+              "GCF_048571575.1_ASM4857157v1/GCF_048571575.1_ASM4857157v1_genomic.fna.gz"),
+         sha256="207b74ee05f34673cf8eac00ad40ca9aaf6b38c88b2663727425585ddfd45243"),
+    dict(name="ecoli_061", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048571485.1 (ASM4857148v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/571/485/"
+              "GCF_048571485.1_ASM4857148v1/GCF_048571485.1_ASM4857148v1_genomic.fna.gz"),
+         sha256="df64732e1467a97732f47cb68f717fa2557fee644fb63cb4254cc00cb2715dc5"),
+    dict(name="ecoli_062", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048571455.1 (ASM4857145v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/571/455/"
+              "GCF_048571455.1_ASM4857145v1/GCF_048571455.1_ASM4857145v1_genomic.fna.gz"),
+         sha256="803f05eab0e30bc7121b14e104da141ccb458dacefd0c0d45988810c63950a67"),
+    dict(name="ecoli_063", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048571555.1 (ASM4857155v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/571/555/"
+              "GCF_048571555.1_ASM4857155v1/GCF_048571555.1_ASM4857155v1_genomic.fna.gz"),
+         sha256="758fb9bc5afff66cb7c31996df2434e7312e657ccc06ffbf55afa9723de48110"),
+    dict(name="ecoli_064", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048571585.1 (ASM4857158v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/571/585/"
+              "GCF_048571585.1_ASM4857158v1/GCF_048571585.1_ASM4857158v1_genomic.fna.gz"),
+         sha256="276a53f888e36a880b07b1ee328cae8f5245d90ee45c1c47393c893301f47691"),
+    dict(name="ecoli_065", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048571595.1 (ASM4857159v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/571/595/"
+              "GCF_048571595.1_ASM4857159v1/GCF_048571595.1_ASM4857159v1_genomic.fna.gz"),
+         sha256="d57c52f4bc1da4d63701177b9e87d34c9e394616addb4b73554a699b14af28b7"),
+    dict(name="ecoli_066", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048572565.1 (ASM4857256v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/572/565/"
+              "GCF_048572565.1_ASM4857256v1/GCF_048572565.1_ASM4857256v1_genomic.fna.gz"),
+         sha256="7684044ba7d85f76240528689856997f2d04e7209e46eace833798d12ca0347a"),
+    dict(name="ecoli_067", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048572625.1 (ASM4857262v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/572/625/"
+              "GCF_048572625.1_ASM4857262v1/GCF_048572625.1_ASM4857262v1_genomic.fna.gz"),
+         sha256="121c3991354cc2f44f0ecb56f8cfb04b8ba8e795a531dc279785f9cedf23f23e"),
+    dict(name="ecoli_068", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048572595.1 (ASM4857259v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/572/595/"
+              "GCF_048572595.1_ASM4857259v1/GCF_048572595.1_ASM4857259v1_genomic.fna.gz"),
+         sha256="e39988714c167bd6bfd7160821956d3a884a22826ec522835a259b1ebc913cbd"),
+    dict(name="ecoli_069", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048572585.1 (ASM4857258v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/572/585/"
+              "GCF_048572585.1_ASM4857258v1/GCF_048572585.1_ASM4857258v1_genomic.fna.gz"),
+         sha256="5d285e9f084c683b9a596005ad816e71cd3c038ec84963d5da2555ceeaee7f9e"),
+    dict(name="ecoli_070", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048572605.1 (ASM4857260v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/572/605/"
+              "GCF_048572605.1_ASM4857260v1/GCF_048572605.1_ASM4857260v1_genomic.fna.gz"),
+         sha256="8062e6de28c32569611648d25f8492232134da5ce4b0e2452838d65081b03d9b"),
+    dict(name="ecoli_071", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048572615.1 (ASM4857261v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/572/615/"
+              "GCF_048572615.1_ASM4857261v1/GCF_048572615.1_ASM4857261v1_genomic.fna.gz"),
+         sha256="7aa63c3882a2df3e3ce3a5124c2b6bd24f0b32a06b81b691de8842ee7ca81bb6"),
+    dict(name="ecoli_072", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048572645.1 (ASM4857264v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/572/645/"
+              "GCF_048572645.1_ASM4857264v1/GCF_048572645.1_ASM4857264v1_genomic.fna.gz"),
+         sha256="4edf5625d3046119471c3f5bc7d2723dc68be6126c20b08c423fedd73e07b791"),
+    dict(name="ecoli_073", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048572655.1 (ASM4857265v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/572/655/"
+              "GCF_048572655.1_ASM4857265v1/GCF_048572655.1_ASM4857265v1_genomic.fna.gz"),
+         sha256="0d63ab2bb9a5048b6ac0fa346b2e9d7b4e0f40ff0f4b22932a417d3afeab2b8c"),
+    dict(name="ecoli_074", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048572665.1 (ASM4857266v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/572/665/"
+              "GCF_048572665.1_ASM4857266v1/GCF_048572665.1_ASM4857266v1_genomic.fna.gz"),
+         sha256="b511b07affcce306abee2c301e3598aa0cf30c0d6833af34d792f5f919b9c0b7"),
+    dict(name="ecoli_075", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048572705.1 (VTB96933v)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/572/705/"
+              "GCF_048572705.1_VTB96933v/GCF_048572705.1_VTB96933v_genomic.fna.gz"),
+         sha256="b77da74e8bd1f1bb880784e457310879ccf98159c5611898b404c8f569fefe27"),
+    dict(name="ecoli_076", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048572675.1 (ASM4857267v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/572/675/"
+              "GCF_048572675.1_ASM4857267v1/GCF_048572675.1_ASM4857267v1_genomic.fna.gz"),
+         sha256="3674fe6d31715a16a15224a16f84bb83ef46a503d593fa149eb605a0dc045a51"),
+    dict(name="ecoli_077", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048585475.1 (ASM4858547v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/585/475/"
+              "GCF_048585475.1_ASM4858547v1/GCF_048585475.1_ASM4858547v1_genomic.fna.gz"),
+         sha256="faee44d58e669788f752f03e30444144b504bc2c708a60a7796fc17e5498a05a"),
+    dict(name="ecoli_078", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048585465.1 (ASM4858546v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/585/465/"
+              "GCF_048585465.1_ASM4858546v1/GCF_048585465.1_ASM4858546v1_genomic.fna.gz"),
+         sha256="c7b953e803859b1b25a59ddeaf2f66fecd7d34060c954b849f5a74b90a19d89b"),
+    dict(name="ecoli_079", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048572685.1 (ASM4857268v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/572/685/"
+              "GCF_048572685.1_ASM4857268v1/GCF_048572685.1_ASM4857268v1_genomic.fna.gz"),
+         sha256="3cfcdd8d7176052ba78c2834a83c504bec16c0ced3c80d327eec3068c1d42f7c"),
+    dict(name="ecoli_080", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048585485.1 (ASM4858548v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/585/485/"
+              "GCF_048585485.1_ASM4858548v1/GCF_048585485.1_ASM4858548v1_genomic.fna.gz"),
+         sha256="7aea96151a4a29b9aebf77c2eae8b93d620429cba31dc70b025bb7dc43760f0d"),
+    dict(name="ecoli_081", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048585495.1 (ASM4858549v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/585/495/"
+              "GCF_048585495.1_ASM4858549v1/GCF_048585495.1_ASM4858549v1_genomic.fna.gz"),
+         sha256="84242d44535ef4615f977dda8113c86cbbcd637d05f426cc4fecd702bed1bd3b"),
+    dict(name="ecoli_082", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048585505.1 (ASM4858550v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/585/505/"
+              "GCF_048585505.1_ASM4858550v1/GCF_048585505.1_ASM4858550v1_genomic.fna.gz"),
+         sha256="1af2370f252fb50cb220824d9662fd0e15d817676f8099b5bc72a7f14c96bfa6"),
+    dict(name="ecoli_083", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048585515.1 (ASM4858551v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/585/515/"
+              "GCF_048585515.1_ASM4858551v1/GCF_048585515.1_ASM4858551v1_genomic.fna.gz"),
+         sha256="7bfbe55a2e4b412577c01d3ed21514b3a7d1d2a855190838791a084937389288"),
+    dict(name="ecoli_084", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048585525.1 (ASM4858552v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/585/525/"
+              "GCF_048585525.1_ASM4858552v1/GCF_048585525.1_ASM4858552v1_genomic.fna.gz"),
+         sha256="29c84e51f61dfaf8dbb2dbe780fcdd8f284dd86c4e08b29e1fd3fae0a230a652"),
+    dict(name="ecoli_085", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048585535.1 (ASM4858553v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/585/535/"
+              "GCF_048585535.1_ASM4858553v1/GCF_048585535.1_ASM4858553v1_genomic.fna.gz"),
+         sha256="acfa210645d9b14dbdf029baef2263b27c398640355624e0d86824e1d2421206"),
+    dict(name="ecoli_086", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048585545.1 (ASM4858554v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/585/545/"
+              "GCF_048585545.1_ASM4858554v1/GCF_048585545.1_ASM4858554v1_genomic.fna.gz"),
+         sha256="9fb6cff5ce1aa4b79f217cd1f0cb42ace5a1f63c1aa74a1281b81883b1735679"),
+    dict(name="ecoli_087", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048585555.1 (ASM4858555v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/585/555/"
+              "GCF_048585555.1_ASM4858555v1/GCF_048585555.1_ASM4858555v1_genomic.fna.gz"),
+         sha256="cc75abce743b75cf9b863edb1ddc27761fdbae719fbd6b80551fc8e8870c99e7"),
+    dict(name="ecoli_088", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048585565.1 (ASM4858556v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/585/565/"
+              "GCF_048585565.1_ASM4858556v1/GCF_048585565.1_ASM4858556v1_genomic.fna.gz"),
+         sha256="842fe3a8837dc73af6e94a7ef671f29fc92290a2c3a3b79b409e606549a7e2de"),
+    dict(name="ecoli_089", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048585575.1 (ASM4858557v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/585/575/"
+              "GCF_048585575.1_ASM4858557v1/GCF_048585575.1_ASM4858557v1_genomic.fna.gz"),
+         sha256="b3e0fced9ce573263bab21d6ff12426611cecc84b336229104fa2fa4a0984a2d"),
+    dict(name="ecoli_090", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048585585.1 (ASM4858558v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/585/585/"
+              "GCF_048585585.1_ASM4858558v1/GCF_048585585.1_ASM4858558v1_genomic.fna.gz"),
+         sha256="ab761cd124a2294e649f857b642f1001a861d87b49801c7ea487113025eac35b"),
+    dict(name="ecoli_091", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048585595.1 (ASM4858559v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/585/595/"
+              "GCF_048585595.1_ASM4858559v1/GCF_048585595.1_ASM4858559v1_genomic.fna.gz"),
+         sha256="8261a8195c8de294acaa5d0f866e6067f6b4455a3022803b0659cf80762e875e"),
+    dict(name="ecoli_092", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048585605.1 (ASM4858560v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/585/605/"
+              "GCF_048585605.1_ASM4858560v1/GCF_048585605.1_ASM4858560v1_genomic.fna.gz"),
+         sha256="08bd6f1c9996f47bbd361aac4346aacee67b1fe4f077bd390ee066c2f2b17f16"),
+    dict(name="ecoli_093", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_047782965.1 (ASM4778296v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/047/782/965/"
+              "GCF_047782965.1_ASM4778296v1/GCF_047782965.1_ASM4778296v1_genomic.fna.gz"),
+         sha256="9d1ced90656939a5d941e5857e075be8645fdfbb3333e076e84cc62538b5fa56"),
+    dict(name="ecoli_094", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_047715505.1 (de_novo)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/047/715/505/"
+              "GCF_047715505.1_de_novo/GCF_047715505.1_de_novo_genomic.fna.gz"),
+         sha256="36d5bbd3381241b9ea5b42fa51687d66ea32c1a44873570fd8e617efb82eb56c"),
+    dict(name="ecoli_095", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_047782975.1 (ASM4778297v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/047/782/975/"
+              "GCF_047782975.1_ASM4778297v1/GCF_047782975.1_ASM4778297v1_genomic.fna.gz"),
+         sha256="d49b19dff675e2c4155d9248d8f2e5d6191b04567927b9a7a55a3e3771154dd0"),
+    dict(name="ecoli_096", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048011955.1 (ASM4801195v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/011/955/"
+              "GCF_048011955.1_ASM4801195v1/GCF_048011955.1_ASM4801195v1_genomic.fna.gz"),
+         sha256="77e479c7fe08ab25a8099b983a9b3eb1d1993634a916c33798d864b9960d7e32"),
+    dict(name="ecoli_097", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_047782985.1 (ASM4778298v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/047/782/985/"
+              "GCF_047782985.1_ASM4778298v1/GCF_047782985.1_ASM4778298v1_genomic.fna.gz"),
+         sha256="e1a90f2726216f2fef428f358d815f7b01c6319c351713efeb6e2313532a9199"),
+    dict(name="ecoli_098", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048012845.1 (ASM4801284v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/012/845/"
+              "GCF_048012845.1_ASM4801284v1/GCF_048012845.1_ASM4801284v1_genomic.fna.gz"),
+         sha256="fa9f951dea067c72546ac83e19a54f640bc672f6561f5cdebc7e1bfadbeb93a0"),
+    dict(name="ecoli_099", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048011965.1 (ASM4801196v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/011/965/"
+              "GCF_048011965.1_ASM4801196v1/GCF_048011965.1_ASM4801196v1_genomic.fna.gz"),
+         sha256="ce574735c2274cfc363382317a1327dec81344c8fdf172df2edb8b24ac3d40fe"),
+    dict(name="ecoli_100", category="real_genome_pool", kind="fetched",
+         source="NCBI RefSeq GCF_048012795.1 (ASM4801279v1)",
+         url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/012/795/"
+              "GCF_048012795.1_ASM4801279v1/GCF_048012795.1_ASM4801279v1_genomic.fna.gz"),
+         sha256="ce226c738424b8d389d6293948b948aada8d37871c2b283870a8c018d7ea2716"),
 
     # --- D. curated frequent-k-mer regions ----------------------------------
     # Already exist somewhere outside this repo; point --data-dir (see
@@ -193,11 +649,12 @@ DATASETS = [
 
     # --- E. pangenome sweep -------------------------------------------------
     # Same reference, same divergence; strain count is the one variable the
-    # email asks about (1, 2, 4, 8). "@ecoli_k12" is resolved to that
-    # dataset's local path by run_suite.py before simulate_pangenome runs.
+    # email asks about (1, 2, 4, 8). "@ecoli_003" is resolved to that
+    # dataset's local path by run_suite.py before simulate_pangenome runs --
+    # takes over ecoli_k12's old role here (Aug-28 strain swap, see S3C).
     *[dict(name=f"pangenome_ecoli_n{n}", category="pangenome", kind="synthetic",
            generator="simulate_pangenome",
-           args=["-r", "@ecoli_k12", "-n", str(n), "--divergence", "0.01", "--seed", "1"])
+           args=["-r", "@ecoli_003", "-n", str(n), "--divergence", "0.01", "--seed", "1"])
       for n in (1, 2, 4, 8)],
 
     # Real-strain counterpart (secondary/stretch goal per the design doc):
@@ -205,15 +662,15 @@ DATASETS = [
     # concatenated, rather than one reference plus simulated point mutations.
     # kind="concat" just cats the resolved FASTAs of `refs` together --
     # no divergence knob, no seed, because there's nothing to simulate.
-    dict(name="pangenome_ecoli_real_n3", category="pangenome", kind="concat",
-         refs=["@ecoli_k12", "@ecoli_sakai", "@ecoli_cft073"]),
-
-    # n=8 and n=16 prefixes of REAL_ECOLI_STRAIN_POOL above -- the real-data
-    # counterpart of the simulated pangenome_ecoli_n{1,2,4,8} sweep, now that
-    # 16 distinct real strains are available to draw from.
+    #
+    # Aug-28 update: the old n=3/8/16 sweep (over the 16-strain pool) is now
+    # n=8/16/32/64/100 over the 100-strain pool -- same doubling pattern,
+    # extended up to the full pool now that far more strains are available.
+    # No more dedicated n=3 sanity-check entry (that was specifically
+    # K-12+Sakai+CFT073; those three no longer have a special role here).
     *[dict(name=f"pangenome_ecoli_real_n{n}", category="pangenome", kind="concat",
            refs=REAL_ECOLI_STRAIN_POOL[:n])
-      for n in (8, 16)],
+      for n in (8, 16, 32, 64, 100)],
 ]
 
 # Shapes to sweep per dataset. Trimmed down from the weight-30 family in

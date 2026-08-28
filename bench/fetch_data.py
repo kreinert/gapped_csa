@@ -22,8 +22,8 @@ rather than crashing the whole run; just rerun later to retry it.
 Usage:
   ./fetch_data.py                        # verify everything already cached
                                           # (fetch whatever isn't cached yet)
-  ./fetch_data.py --only ecoli_k12       # just one
-  ./fetch_data.py --print-hash ecoli_k12 # fetch/verify, then print the
+  ./fetch_data.py --only ecoli_003       # just one
+  ./fetch_data.py --print-hash ecoli_003 # fetch/verify, then print the
                                           # sha256 to pin in datasets.py
   ./fetch_data.py --force                # re-download + re-verify everything
 """
