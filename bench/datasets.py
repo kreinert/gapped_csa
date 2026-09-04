@@ -684,9 +684,13 @@ SHAPES = [
     "#" * 10 + "." * 4 + "#" * 20,    # 10+g4+20
 ]
 
-# Per your Aug-14 call: tree-dp / tree-dp2 / tree-dp3 are out of scope.
-ALGOS = ["greedy", "dep-order", "tree-dp4", "pseudoforest-dp"]
-MAX_ADDS = [8, 16]
+# Full retained set: greedy-size and greedy-degree (Phase I greedy variants),
+# dep-order (dependency-order un-pin/retarget), and pseudoforest-dp /
+# pseudoforest-dp-iterate (exact DP, single-fire and iterated). Every one of
+# these now runs the same Phase II (dirty-set retarget) + LNS pipeline; see
+# compress.hpp's top-of-file CompressAlgo comment.
+ALGOS = ["greedy-size", "greedy-degree", "dep-order", "pseudoforest-dp", "pseudoforest-dp-iterate"]
+MAX_ADDS = [8, 16, 32, 64, 128]
 
 # Above this input size, run_suite.py sets GCSA_SKIP_SELFTEST=1 (the
 # brute-force check in main.cpp is O(n) extra work per config; fine at

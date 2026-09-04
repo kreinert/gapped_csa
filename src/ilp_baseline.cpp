@@ -570,11 +570,11 @@ int main(int argc, char** argv) {
               << "  (#vars=" << n_vars << " #constraints=" << n_cons << ")\n";
 
     // Heuristics
-    size_t Cg = heuristic_C(sh, text, max_add, CompressAlgo::Greedy);
+    size_t Cg = heuristic_C(sh, text, max_add, CompressAlgo::GreedySize);
     size_t Cd = heuristic_C(sh, text, max_add, CompressAlgo::DepOrder);
-    size_t Ct = heuristic_C(sh, text, max_add, CompressAlgo::TreeDp);
-    size_t Ct3 = heuristic_C(sh, text, max_add, CompressAlgo::TreeDp3);
-    size_t Ct4 = heuristic_C(sh, text, max_add, CompressAlgo::TreeDp4);
+    size_t Cgd = heuristic_C(sh, text, max_add, CompressAlgo::GreedyDegree);
+    size_t Cp = heuristic_C(sh, text, max_add, CompressAlgo::PseudoforestDp);
+    size_t Cpi = heuristic_C(sh, text, max_add, CompressAlgo::PseudoforestDpIterate);
 
     IlpSolution sol = solve_with_external(lp_out, P, n_vars, n_cons);
 
@@ -582,10 +582,10 @@ int main(int argc, char** argv) {
         std::cout << "solver: NOT FOUND / failed\n"
                   << "  " << sol.message << "\n"
                   << "heuristic |C|: greedy=" << Cg
+                  << " greedy-degree=" << Cgd
                   << " dep-order=" << Cd
-                  << " tree-dp=" << Ct
-                  << " tree-dp3=" << Ct3
-                  << " tree-dp4=" << Ct4 << "\n"
+                  << " pseudoforest-dp=" << Cp
+                  << " pseudoforest-dp-iterate=" << Cpi << "\n"
                   << "Open " << lp_out << " with cbc/glpsol/gurobi to get optimal |C|.\n";
         return 2;
     }
@@ -598,7 +598,7 @@ int main(int argc, char** argv) {
     size_t n_sel = 0;
     for (auto v : sol.y) n_sel += v;
 
-    size_t best_h = std::min({Cg, Cd, Ct, Ct3, Ct4});
+    size_t best_h = std::min({Cg, Cgd, Cd, Cp, Cpi});
     bool bounds = (sol.opt_C >= 0 && (size_t)sol.opt_C <= best_h);
 
     auto gap = [&](size_t h) -> double {
@@ -613,15 +613,15 @@ int main(int argc, char** argv) {
               << "optimal |C| = " << sol.opt_C
               << "  (selected " << n_sel << " candidates)\n"
               << "heuristic |C|: greedy=" << Cg
+              << " greedy-degree=" << Cgd
               << " dep-order=" << Cd
-              << " tree-dp=" << Ct
-              << " tree-dp3=" << Ct3
-              << " tree-dp4=" << Ct4 << "\n"
+              << " pseudoforest-dp=" << Cp
+              << " pseudoforest-dp-iterate=" << Cpi << "\n"
               << "gap vs opt (%): greedy=" << gap(Cg)
+              << " greedy-degree=" << gap(Cgd)
               << " dep-order=" << gap(Cd)
-              << " tree-dp=" << gap(Ct)
-              << " tree-dp3=" << gap(Ct3)
-              << " tree-dp4=" << gap(Ct4) << "\n"
+              << " pseudoforest-dp=" << gap(Cp)
+              << " pseudoforest-dp-iterate=" << gap(Cpi) << "\n"
               << "self-check: " << (ok ? "OK" : ("FAIL (" + err + ")")) << "\n"
               << "decode-check: " << (dec_ok ? "OK" : ("FAIL (" + derr + ")"))
               << "  (|C|=" << decoded_C << ")\n"

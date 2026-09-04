@@ -58,10 +58,10 @@ int main() {
             std::string t = random_dna(n, rng);
             for (auto& sh : shapes) {
                 if ((int)sh.size() > n) continue;
-                size_t g = stored(t, sh, CompressAlgo::Greedy);
+                size_t g = stored(t, sh, CompressAlgo::GreedySize);
                 size_t d = stored(t, sh, CompressAlgo::DepOrder);
                 if (d < g && (int)t.size() < best_n) {
-                    if (!correct(t, sh, CompressAlgo::Greedy)) continue;
+                    if (!correct(t, sh, CompressAlgo::GreedySize)) continue;
                     if (!correct(t, sh, CompressAlgo::DepOrder)) continue;
                     best_n = (int)t.size();
                     best_text = t; best_shape = sh;
@@ -86,10 +86,10 @@ int main() {
                 for (int i = 0; i < reps; ++i) t += motif;
                 for (auto& sh : shapes) {
                     if ((int)sh.size() > (int)t.size()) continue;
-                    size_t g = stored(t, sh, CompressAlgo::Greedy);
+                    size_t g = stored(t, sh, CompressAlgo::GreedySize);
                     size_t d = stored(t, sh, CompressAlgo::DepOrder);
                     if (d < g && (int)t.size() < best_n) {
-                        if (!correct(t, sh, CompressAlgo::Greedy)) continue;
+                        if (!correct(t, sh, CompressAlgo::GreedySize)) continue;
                         if (!correct(t, sh, CompressAlgo::DepOrder)) continue;
                         best_n = (int)t.size();
                         best_text = t; best_shape = sh;

@@ -164,13 +164,13 @@ static void print_usage(const char* argv0) {
         << "  --shape=<value>     long-form alias for -s\n"
         << "  -q <query>          query string to locate\n"
         << "  -r <reads.fasta>    locate every read in a FASTA\n"
-        << "  --algo <name>       greedy|dep-order|tree-dp|tree-dp3|tree-dp4"
-        << " (default: greedy)\n"
+        << "  --algo <name>       greedy-size|greedy-degree|dep-order|pseudoforest-dp|\n"
+        << "                      pseudoforest-dp-iterate (default: greedy-size)\n"
         << "  --max-add N         max differential offset (default: 8)\n"
         << "  --phase2-iters N    Phase II dirty-generation budget (default: "
         << kPhase2DefaultIters << ").\n"
         << "                      Phase II stops earlier at a fixed point. Applies to\n"
-        << "                      dep-order and tree-dp. Precedence: this flag >\n"
+        << "                      every --algo. Precedence: this flag >\n"
         << "                      GCSA_PHASE2_MAX_ITERS > default.\n"
         << "                      GCSA_DISABLE_PHASE2=1 skips Phase II entirely, for\n"
         << "                      any --algo (e.g. to measure the forest DP alone).\n"
@@ -198,7 +198,7 @@ int main(int argc, char** argv) {
     bool want_table = false, want_sa = false, want_bound = false;
     int max_add = 8;
     int phase2_iters = 0;  // 0 = unset: GCSA_PHASE2_MAX_ITERS, else the default
-    CompressAlgo algo = CompressAlgo::Greedy;
+    CompressAlgo algo = CompressAlgo::GreedySize;
     std::string min_cov_arg;  // "" = unset -> GCSA_MIN_COVERAGE -> built-in default
 
     for (int i = 1; i < argc; ++i) {
@@ -224,14 +224,13 @@ int main(int argc, char** argv) {
         else if (k == "--help" || k == "-h") { print_usage(argv[0]); return 0; }
         else if (k == "--algo") {
             std::string a = need("--algo");
-            if (a == "greedy") algo = CompressAlgo::Greedy;
+            if (a == "greedy-size" || a == "greedy" || a == "gs") algo = CompressAlgo::GreedySize;
+            else if (a == "greedy-degree" || a == "gd") algo = CompressAlgo::GreedyDegree;
             else if (a == "dep-order" || a == "dep") algo = CompressAlgo::DepOrder;
-            else if (a == "tree-dp" || a == "dp") algo = CompressAlgo::TreeDp;
-            else if (a == "tree-dp3" || a == "dp3") algo = CompressAlgo::TreeDp3;
-            else if (a == "tree-dp4" || a == "dp4") algo = CompressAlgo::TreeDp4;
             else if (a == "pseudoforest-dp" || a == "pf-dp" || a == "pfdp") algo = CompressAlgo::PseudoforestDp;
+            else if (a == "pseudoforest-dp-iterate" || a == "pf-dp-iterate" || a == "pfdp-iterate" || a == "pfdpi") algo = CompressAlgo::PseudoforestDpIterate;
             else {
-                std::cerr << "--algo must be greedy|dep-order|tree-dp|tree-dp3|tree-dp4|pseudoforest-dp\n";
+                std::cerr << "--algo must be greedy-size|greedy-degree|dep-order|pseudoforest-dp|pseudoforest-dp-iterate\n";
                 return 1;
             }
         }

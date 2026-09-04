@@ -61,34 +61,77 @@
 // lower bound for every algorithm below.
 //
 // Compression strategies (CompressAlgo):
-//   Greedy    – size-order availability-aware greedy; pins sources forever.
-//   DepOrder  – dependency-order + un-pin / retarget.
-//   TreeDp    – DP on the preference forest (strong cov>=kMinCoverage edges, |I_c|>2):
-//               for each source hub, choose KEEP vs COMPRESS knowing how
-//               dependents' costs change; then Phase II unpin/retarget.
-//               (GCSA_DISABLE_PHASE2=1 runs the forest DP + accept + leftover
-//               alone, without Phase II, on any algorithm below.)
+//   Every algorithm below builds an initial accepted-link set (its "Phase
+//   I"), then hands it to the same shared Phase II: the dirty-set greedy
+//   unpin/retarget pass (run_phase2_) followed by the exact bounded-cluster
+//   LNS pass (run_phase2_local_), run together via run_phase2_and_lns_. The
+//   LNS only ever lowers |C| and composes with the retarget loop instead of
+//   replacing it (retargeting reaches links -- composite adds -- the static
+//   candidate cache does not hold, which is exactly where the LNS alone
+//   gives ground on long repeats), so every algorithm gets both by default.
+//   GCSA_LNS_ONLY=1 skips the greedy pass and measures the LNS alone;
+//   GCSA_DISABLE_PHASE2=1 skips the greedy pass the same way, but the LNS
+//   pass still runs regardless -- it isn't gated by that flag. What differs
+//   between algorithms below is only Phase I: how the initial accepted set
+//   gets built.
+//
+//   GreedySize   – size-order availability-aware greedy; pins sources forever.
+//   GreedyDegree – richer-graph greedy MWIS: instead of sparsifying to one
+//               candidate per word and solving that graph exactly, keep every
+//               word's whole cached candidate list (up to kCandCacheDefaultCap)
+//               as separate nodes, build the real cross-word conflict edges
+//               among ALL of them (same source-vs-covered overlap test as
+//               PseudoforestDp's ConflictGraph::dep, just against every
+//               cached candidate of the source word instead of only its
+//               single preferred one -- same-word candidates are mutually
+//               exclusive by construction and are never materialized as
+//               edges), then repeatedly accept the live candidate with the
+//               highest score = coverage - sum, over each distinct other
+//               word still contesting it, of that word's best *currently
+//               conflicting* candidate (not that word's own top pick --
+//               using the top pick would just re-derive edges the exact DP
+//               below already prices for free; see the session note this
+//               algorithm came out of). Lazy priority-queue greedy: a
+//               candidate's true score only ever rises as neighboring words
+//               get resolved, so a popped entry whose freshly-recomputed
+//               score still matches what it was pushed with is provably the
+//               current global best and can be accepted immediately. No
+//               separate leftover pass is needed -- every cached candidate of
+//               every word already gets its own turn in the same queue.
+//   DepOrder  – dependency-order + un-pin / retarget: accept each interval's
+//               globally-preferred candidate in reverse topological order of
+//               the preference DAG (sinks first), pinning sources dependents
+//               still need.
 //   PseudoforestDp – "extract preference, solve exactly" DP (see
 //               exact_pseudoforest_dp.pdf, "Sparsifying the graph"). Builds
 //               the preference pseudoforest (out-degree<=1, no cov/size
 //               threshold; a node's candidate only becomes a real
 //               dependency edge when its rank range actually conflicts with
 //               its source's own candidate -- see ConflictGraph::dep) once, over
-//               every unresolved interval; tree components use the same
-//               KEEP vs COMPRESS recurrence as TreeDp, unicyclic components
-//               are solved exactly by folding the cycle instead of dropping
-//               an edge to force acyclicity. Then one leftover greedy sweep
-//               (sees every candidate for a word, not just its single
-//               preferred one -- catches what the DP's sparsification
-//               can't) and Phase II. (The doc's "IDEA: Iterative DP" --
-//               repeating extract/solve to a fixed point before ever
-//               falling back to greedy -- was prototyped and shelved for
-//               now: on the cases tested, the leftover sweep's floor
-//               already matches the DP's own floor, so a second round is
-//               always empty. build_pseudoforest_graph_'s require_avail
-//               parameter and the round-oriented framing in the functions
-//               below are left in place for that experiment to resume
-//               later without rederiving them.)
+//               every unresolved interval; tree components solve with a KEEP
+//               vs COMPRESS recurrence, unicyclic components are solved
+//               exactly by folding the cycle instead of dropping an edge to
+//               force acyclicity. By default ("single-fire") this runs once,
+//               then one leftover greedy sweep (sees every candidate for a
+//               word, not just its single preferred one -- catches what the
+//               DP's sparsification can't) before Phase II.
+//   PseudoforestDpIterate – the same DP, but repeats the extract/solve step
+//               to a fixed point instead of firing once -- the doc's "IDEA:
+//               Iterative DP": each further round re-extracts each still-
+//               unresolved node's currently-available best candidate over
+//               the shrunk residual instance, before ever falling back to
+//               leftover greedy. Not a strict improvement despite each round
+//               being an exact solve: each round commits, in one batch
+//               snapshot, to one candidate per name and can't fall back to
+//               that name's second-best candidate within the round the way
+//               the leftover sweep can. Measured on the E. coli benchmark
+//               genomes, the end-to-end effect is a coin flip -- a handful
+//               of positions either way out of millions kept, never both
+//               zero and never large. Kept as its own algorithm (not a
+//               hidden env-var toggle on PseudoforestDp) so it can be swept
+//               and compared on equal footing with the rest.
+//               GCSA_PFDP_MAX_ROUNDS caps the round count if ever needed
+//               (unbounded by default).
 
 #pragma once
 
@@ -146,7 +189,7 @@ inline int bytes_needed(uint64_t v) {
 }
 
 // Minimum coverage to accept a compression link (all algos + Phase II).
-// Preference-forest / DAG *edges* use the same floor (see DepOrder / TreeDp).
+// Preference-forest / DAG *edges* use the same floor (see DepOrder / PseudoforestDp).
 // Runtime-adjustable (main.cpp's --min-coverage / GCSA_MIN_COVERAGE); the 3
 // below is only the built-in default, read once before CompressedIndex::build
 // so every enumerate_candidates_/enumerate_all_links_ call site (which all
@@ -240,8 +283,8 @@ inline bool gcsa_intra_links() {
 // merged source runs make emit_run_'s all-or-nothing availability check more
 // fragile: one already-pinned/removed rank anywhere in a larger window now
 // blocks the whole candidate, where a smaller LCP-bounded window would have
-// left a neighboring piece usable), while the DP-based algorithms (TreeDp
-// family, PseudoforestDp) came out ahead even there, presumably because
+// left a neighboring piece usable), while PseudoforestDp came out ahead
+// even there, presumably because
 // Phase II's fuller unpin/retarget can route around it. Left off by default
 // pending a proper sweep across bench/'s tunable-repetitiveness and pangenome
 // categories, where this trade-off actually matters.
@@ -291,33 +334,23 @@ inline void gcsa_parallel_for(size_t n, Fn&& fn) {
 }
 
 enum class CompressAlgo {
-    Greedy,        // size-first, pin sources
-    DepOrder,      // dependency-order + un-pin / retarget
-    TreeDp,        // preference-forest DP (KEEP vs COMPRESS per hub) + Phase II
-    TreeDp3,       // same as TreeDp with the cluster-LNS Phase II
-    TreeDp4,       // same as TreeDp with value-based cycle repair in Phase I
-    PseudoforestDp, // exact DP on the full out-degree<=1 preference graph
+    GreedySize,            // size-first, pin sources
+    GreedyDegree,          // richer-candidate-set greedy MWIS, degree/conflict-aware
+    DepOrder,              // dependency-order + un-pin / retarget
+    PseudoforestDp,        // exact DP on the full out-degree<=1 preference graph (single-fire)
+    PseudoforestDpIterate, // same DP, iterated to a fixed point (see compress_pseudoforest_dp_)
 };
 
 inline const char* algo_name(CompressAlgo a) {
     switch (a) {
-        case CompressAlgo::Greedy:        return "greedy";
-        case CompressAlgo::DepOrder:      return "dep-order";
-        case CompressAlgo::TreeDp:        return "tree-dp";
-        case CompressAlgo::TreeDp3:       return "tree-dp3";
-        case CompressAlgo::TreeDp4:       return "tree-dp4";
-        case CompressAlgo::PseudoforestDp: return "pseudoforest-dp";
+        case CompressAlgo::GreedySize:            return "greedy-size";
+        case CompressAlgo::GreedyDegree:          return "greedy-degree";
+        case CompressAlgo::DepOrder:              return "dep-order";
+        case CompressAlgo::PseudoforestDp:        return "pseudoforest-dp";
+        case CompressAlgo::PseudoforestDpIterate: return "pseudoforest-dp-iterate";
     }
     return "?";
 }
-
-// What compress_tree_dp_ runs after the forest DP + leftover greedy.
-// (There is no "skip Phase II" mode here: GCSA_DISABLE_PHASE2=1 already
-// covers that generically, for every algorithm, via run_phase2_ itself.)
-enum class Phase2Mode {
-    Greedy,  // tree-dp: dirty-set unpin/retarget
-    Local,   // tree-dp3: exact cluster large-neighborhood search
-};
 
 // Positive-integer env override, `def` when unset/invalid.
 inline int gcsa_env_int(const char* name, int def) {
@@ -345,7 +378,7 @@ public:
     // phase2_iters: Phase II dirty-generation budget; 0 = unspecified, which
     // falls back to GCSA_PHASE2_MAX_ITERS and then kPhase2DefaultIters.
     void build(const Shape& shape, std::string text,
-               int max_add = 8, CompressAlgo algo = CompressAlgo::Greedy,
+               int max_add = 8, CompressAlgo algo = CompressAlgo::GreedySize,
                int phase2_iters = 0) {
         using Clock = std::chrono::steady_clock;
         const bool timing = (std::getenv("GCSA_TIMING") != nullptr);
@@ -377,7 +410,7 @@ public:
     // (string(k,'#')), ...) -- same positions_of/locate results -- but via a
     // cheaper construction path (see build_plain_sa in gapped_sa.hpp).
     void build(int k, std::string text,
-               int max_add = 8, CompressAlgo algo = CompressAlgo::Greedy,
+               int max_add = 8, CompressAlgo algo = CompressAlgo::GreedySize,
                int phase2_iters = 0) {
         using Clock = std::chrono::steady_clock;
         const bool timing = (std::getenv("GCSA_TIMING") != nullptr);
@@ -560,7 +593,7 @@ public:
     //   sum_best_coverage -- Sigma, over eligible words, of
     //     best_candidate_(word, avail=false).coverage() -- i.e. the exact
     //     same enumerate_candidates_ call every algorithm below uses for its
-    //     own Phase-I preference (pseudoforest-dp/tree-dp/dep-order/greedy
+    //     own Phase-I preference (pseudoforest-dp/dep-order/greedy-size/greedy-degree
     //     all call this, at this same require_avail=false, before any
     //     conflict is resolved). (L5) caps every word at one H_offset, so no
     //     feasible solution built from THIS candidate search can ever delete
@@ -648,7 +681,7 @@ private:
     GappedSA G_;
     int span_ = 1;
     int max_add_ = 8;
-    CompressAlgo algo_ = CompressAlgo::Greedy;
+    CompressAlgo algo_ = CompressAlgo::GreedySize;
     int phase2_iters_ = 0;  // 0 = unspecified; see run_phase2_ for precedence
 
     // Regular (ungapped) SA mode: no LexText, no mod-residue grouping.
@@ -1559,11 +1592,13 @@ private:
 
     // Dirty-set unpin / retarget: try higher-coverage candidates (including
     // former sources), retargeting dependents with transitive add when needed.
-    // Shared by DepOrder Phase II and TreeDp Phase II.
+    // Shared by every algorithm's Phase II (see run_phase2_and_lns_ below,
+    // which pairs this with the cluster LNS pass).
     //
     // Candidates with require_avail=false depend only on SA/LCP structure, so we
     // enumerate once per interval and reuse across generations. Optional
-    // `precomputed` cache (e.g. from TreeDp preference build) avoids re-enum.
+    // `precomputed` cache (e.g. from an algorithm's own preference build)
+    // avoids re-enum.
     //
     // Work queue (generation dirty-set):
     //   seed dirty = all |I|>1; process in size order.
@@ -1586,10 +1621,10 @@ private:
     //   GCSA_PHASE2_MIN_GAIN=G  – min total kept-drop (|C| reduction) per dirty
     //                             generation to count as progress (default 1).
     //
-    // Env GCSA_DISABLE_PHASE2 (optional): skip Phase II entirely, so callers
-    // (DepOrder, TreeDp, PseudoforestDp) can be compared on their Phase I /
-    // DP output alone, without the shared retarget sweep smoothing over
-    // differences between them.
+    // Env GCSA_DISABLE_PHASE2 (optional): skip the greedy retarget pass (the
+    // LNS pass in run_phase2_and_lns_ still runs regardless), so any
+    // algorithm can be compared on its Phase I / DP output alone, without
+    // the shared retarget sweep smoothing over differences between them.
     void run_phase2_(const std::vector<Interval>& intervals,
                      std::unordered_map<uint64_t, Candidate>& accepted,
                      const char* label,
@@ -2024,24 +2059,45 @@ private:
         }
     }
 
+    // Phase II, generalized to every remaining algorithm: the dirty-set
+    // greedy unpin/retarget (run_phase2_) followed by the exact bounded-
+    // cluster LNS (run_phase2_local_). This used to be tree-dp3's pipeline
+    // alone; every algorithm now gets both passes, since the LNS only ever
+    // lowers |C| and composes with the retarget loop rather than replacing
+    // it (retargeting reaches links -- composite adds -- that the static
+    // candidate cache does not hold, which is exactly where the LNS alone
+    // gives ground on long repeats). GCSA_LNS_ONLY=1 skips the greedy pass
+    // and measures the LNS alone; GCSA_DISABLE_PHASE2=1 (checked inside
+    // run_phase2_) skips the greedy pass the same way, but the LNS pass
+    // still runs regardless -- it isn't gated by that flag.
+    void run_phase2_and_lns_(const std::vector<Interval>& intervals,
+                             std::unordered_map<uint64_t, Candidate>& accepted,
+                             const char* label, bool trace, bool timing,
+                             std::unordered_map<uint64_t, std::vector<Candidate>>* cand_cache,
+                             double phase1_ms) {
+        if (gcsa_env_int("GCSA_LNS_ONLY", 0) == 0)
+            run_phase2_(intervals, accepted, label, trace, timing, cand_cache, phase1_ms);
+        run_phase2_local_(intervals, accepted, label, timing, cand_cache);
+    }
+
     // ---- algorithms -------------------------------------------------------
-    void compress_greedy_(const std::vector<Interval>& intervals,
+    void compress_greedy_size_(const std::vector<Interval>& intervals,
                           std::unordered_map<uint64_t, Candidate>& accepted) {
         using Clock = std::chrono::steady_clock;
         const bool timing = (std::getenv("GCSA_TIMING") != nullptr);
+        const bool trace = (std::getenv("GCSA_TRACE_GREEDY_SIZE") != nullptr);
         auto t0 = Clock::now();
-        // See compress_tree_dp_'s m0/pct_kept for what this measures.
+        // m0 = |C| before this algorithm's own Phase I; pct_kept expresses
+        // later |C| values as a percentage of that baseline.
         const size_t m0 = kept_count_;
         auto pct_kept = [&](size_t kept) {
             return 100.0 * (double)kept / (double)std::max<size_t>(1, m0);
         };
-        gcsa_log("[greedy] size-order accept...\n");
+        gcsa_log("[greedy-size] size-order accept...\n");
         std::vector<const Interval*> order;
         for (const auto& iv : intervals) if (iv.hi - iv.lo > 1) order.push_back(&iv);
         std::sort(order.begin(), order.end(),
                   [](const Interval* a, const Interval* b){ return (a->hi-a->lo) > (b->hi-b->lo); });
-        // Optional trace: set GCSA_TRACE_GREEDY=1
-        const bool trace = (std::getenv("GCSA_TRACE_GREEDY") != nullptr);
         int step = 0;
         if (trace) {
             gcsa_log("greedy order:");
@@ -2050,6 +2106,12 @@ private:
                          name_to_string(G_.shape, ivp->name).c_str(), ivp->hi - ivp->lo);
             gcsa_log("\n");
         }
+        // Static candidate lists for all |I|>1, reused by Phase II + LNS
+        // below (the same pattern every other algorithm follows). Phase I
+        // here only ever needs each interval's single best candidate, so
+        // this cache is left to be filled lazily by whichever of Phase II /
+        // LNS touches a name first.
+        std::unordered_map<uint64_t, std::vector<Candidate>> cand_cache;
         for (const Interval* ivp : order) {
             Candidate c = best_candidate_(ivp->name, ivp->lo, ivp->hi, /*avail=*/true);
             ++step;
@@ -2076,16 +2138,231 @@ private:
             if (c.coverage() < kMinCoverage) continue;
             accept_(c, accepted);
         }
-        gcsa_log("[greedy] size-order accept done\n");
-        const size_t after = kept_count_;
-        gcsa_log("[greedy] size-order accept: |C| %zu -> %zu  (%.1f%% of original kept, -%zu)\n",
-                 m0, after, pct_kept(after), m0 - after);
-        gcsa_log("[greedy] success: original |C|=%zu -- size-order accept=%.1f%% (of original kept)\n",
-                 m0, pct_kept(after));
+        gcsa_log("[greedy-size] size-order accept done\n");
+        const size_t after_greedy = kept_count_;
+        gcsa_log("[greedy-size] size-order accept: |C| %zu -> %zu  (%.1f%% of original kept, -%zu)\n",
+                 m0, after_greedy, pct_kept(after_greedy), m0 - after_greedy);
+
+        auto t_p2_0 = Clock::now();
+        double phase1_ms = std::chrono::duration<double, std::milli>(t_p2_0 - t0).count();
+        run_phase2_and_lns_(intervals, accepted, "greedy-size", trace, timing, &cand_cache, phase1_ms);
+        auto t_p2_1 = Clock::now();
+        const size_t after_phase2 = kept_count_;
+        gcsa_log("[greedy-size] phase II:  |C| %zu -> %zu  (%.1f%% of original kept, -%zu)\n",
+                 after_greedy, after_phase2, pct_kept(after_phase2),
+                 after_greedy - after_phase2);
+        gcsa_log(
+            "[greedy-size] success: original |C|=%zu -- size-order accept=%.1f%%, "
+            "+phase II=%.1f%% (of original kept)\n",
+            m0, pct_kept(after_greedy), pct_kept(after_phase2));
         if (timing) {
-            double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-            gcsa_log("[timing] greedy: %.1fms  (#I>1=%zu accepted=%zu)\n",
-                     ms, order.size(), accepted.size());
+            auto ms = [](Clock::time_point a, Clock::time_point b) {
+                return std::chrono::duration<double, std::milli>(b - a).count();
+            };
+            gcsa_log("[timing] greedy-size: accept=%.1fms phase2=%.1fms total=%.1fms  "
+                     "(#I>1=%zu accepted=%zu kept=%zu)\n",
+                     phase1_ms, ms(t_p2_0, t_p2_1), ms(t0, Clock::now()),
+                     order.size(), accepted.size(), kept_count_);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // GreedyDegree building blocks
+    // ------------------------------------------------------------------
+    // A richer, degree-aware greedy MWIS -- see the class comment above
+    // (search "GreedyDegree") for the design rationale and the session note
+    // it came out of. Three pieces:
+    //   1. flatten every word's cached (up to kCandCacheDefaultCap) candidate
+    //      list into one flat pool -- every candidate is its own node, not
+    //      just each word's single best one.
+    //   2. build the real cross-word conflict edges among pool entries.
+    //   3. lazily greedy-pop by score = coverage - sum-of-best-conflicting-
+    //      candidate-per-distinct-word, accepting through the same accept_()/
+    //      cand_available_() machinery every other algorithm uses, so
+    //      correctness never depends on this function getting the score
+    //      heuristic right -- only compression quality does.
+
+    // Score of pool[i]: its own coverage minus, for every *distinct* other
+    // word still contesting it (i.e. not yet in `resolved`), that word's
+    // best *currently conflicting* candidate -- not that word's own top
+    // pick. Deduping by word matters: a word can have several cached
+    // candidates all conflicting with pool[i] (it was only ever going to
+    // use one of them), so summing all of them would overstate what
+    // accepting pool[i] actually costs. Using each word's *global* best
+    // instead of the *locally conflicting* best would collapse this into
+    // exactly the pseudoforest-dp preference graph -- redundant with what
+    // the exact DP there already prices for free (see the session note).
+    long long greedy_degree_score_(int i, const std::vector<Candidate>& pool,
+                                   const std::vector<std::vector<int>>& adjacency,
+                                   const std::unordered_set<uint64_t>& resolved) const {
+        std::unordered_map<uint64_t, int> best_per_word;
+        for (int j : adjacency[i]) {
+            uint64_t w = pool[j].name;
+            if (resolved.count(w)) continue;  // that word's fate is already sealed elsewhere
+            int cov = pool[j].coverage();
+            auto it = best_per_word.find(w);
+            if (it == best_per_word.end() || it->second < cov) best_per_word[w] = cov;
+        }
+        long long penalty = 0;
+        for (auto& kv : best_per_word) penalty += kv.second;
+        return (long long)pool[i].coverage() - penalty;
+    }
+
+    void compress_greedy_degree_(const std::vector<Interval>& intervals,
+                                 std::unordered_map<uint64_t, Candidate>& accepted) {
+        using Clock = std::chrono::steady_clock;
+        const bool timing = (std::getenv("GCSA_TIMING") != nullptr);
+        const bool trace = (std::getenv("GCSA_TRACE_GREEDY_DEGREE") != nullptr);
+        const char* label = "greedy-degree";
+        auto t_all = Clock::now();
+        const size_t m0 = kept_count_;
+        auto pct_kept = [&](size_t kept) {
+            return 100.0 * (double)kept / (double)std::max<size_t>(1, m0);
+        };
+
+        // ---- Step 1: every word's cached candidate list (reused by Phase II) ----
+        gcsa_log("[%s] candidate enumeration...\n", label);
+        auto t0 = Clock::now();
+        std::unordered_map<uint64_t, std::vector<Candidate>> cand_cache;
+        {
+            std::vector<std::vector<Candidate>> temp(intervals.size());
+            gcsa_parallel_for(intervals.size(), [&](size_t i) {
+                const auto& iv = intervals[i];
+                // |I|<=2 can never reach kMinCoverage=3 -- same reasoning as
+                // every other algorithm's identical filter.
+                if (iv.hi - iv.lo <= 2) return;
+                temp[i] = enumerate_candidates_(iv.name, iv.lo, iv.hi, /*avail=*/false);
+            });
+            for (size_t i = 0; i < intervals.size(); ++i)
+                if (!temp[i].empty()) cand_cache.emplace(intervals[i].name, std::move(temp[i]));
+        }
+        auto t1 = Clock::now();
+
+        // ---- Step 2: flatten into one pool, indexed per word ----
+        std::vector<Candidate> pool;
+        std::unordered_map<uint64_t, std::vector<int>> word_to_pool;
+        for (auto& kv : cand_cache) {
+            auto& idxs = word_to_pool[kv.first];
+            idxs.reserve(kv.second.size());
+            for (const auto& c : kv.second) {
+                idxs.push_back((int)pool.size());
+                pool.push_back(c);  // copy -- cand_cache's originals stay put for Phase II
+            }
+        }
+        const int N = (int)pool.size();
+        gcsa_log("[%s] candidate pool: %d candidates across %zu words\n",
+                 label, N, word_to_pool.size());
+
+        // ---- Step 3: cross-word conflict edges only (same-word candidates
+        // are mutually exclusive by construction -- see `resolved` below --
+        // and materializing that as edges would be both redundant and, at
+        // up to kCandCacheDefaultCap^2/2 pairs per word, needlessly large) ----
+        auto t2 = Clock::now();
+        std::vector<std::vector<int>> adjacency(N);
+        for (int i = 0; i < N; ++i) {
+            const Candidate& ci = pool[i];
+            uint64_t src_word = name_of_rank_(ci.src_lo);
+            if (src_word == ci.name) continue;  // self-reference: same-word, not a real edge
+            auto it = word_to_pool.find(src_word);
+            if (it == word_to_pool.end()) continue;  // source word has no candidate of its own
+            for (int j : it->second) {
+                const Candidate& cj = pool[j];
+                // Does ci's source intersect cj's covered set? Same overlap
+                // test as PseudoforestDp's ConflictGraph::dep (covered is
+                // sorted ascending -- order-preserving reconstruction --
+                // same reasoning as there), just run against every cached
+                // candidate of the source word instead of only its single
+                // preferred one.
+                auto lo = std::lower_bound(cj.covered.begin(), cj.covered.end(), ci.src_lo);
+                if (lo != cj.covered.end() && *lo < ci.src_hi) {
+                    adjacency[i].push_back(j);
+                    adjacency[j].push_back(i);
+                }
+            }
+        }
+        for (auto& adj : adjacency) {
+            std::sort(adj.begin(), adj.end());
+            adj.erase(std::unique(adj.begin(), adj.end()), adj.end());
+        }
+        auto t3 = Clock::now();
+        size_t total_edges = 0;
+        for (auto& adj : adjacency) total_edges += adj.size();
+        gcsa_log("[%s] conflict graph: %d nodes, %zu edge-endpoints\n", label, N, total_edges);
+
+        // ---- Step 4: seed the heap ----
+        std::unordered_set<uint64_t> resolved;  // words already decided (accepted or exhausted)
+        using HeapEntry = std::pair<long long, int>;  // (score, pool index)
+        std::priority_queue<HeapEntry> heap;
+        for (int i = 0; i < N; ++i)
+            heap.push({greedy_degree_score_(i, pool, adjacency, resolved), i});
+        auto t4 = Clock::now();
+
+        // ---- Step 5: lazy greedy pop ----
+        // Monotonicity: pool[i]'s true score only ever *increases* over time
+        // (as contesting words get resolved and drop out of its penalty
+        // sum), so every entry still sitting in the heap is an upper bound
+        // on its own true current score. When the popped max's freshly
+        // recomputed score still equals what it was pushed with, nothing
+        // else in the heap can possibly beat it right now -- safe to accept
+        // immediately. Standard lazy-priority-queue pattern (decrease-key
+        // via re-push instead of an in-place update).
+        size_t n_accepted = 0, n_dead = 0, n_stale_repush = 0;
+        while (!heap.empty()) {
+            long long score = heap.top().first;
+            int i = heap.top().second;
+            heap.pop();
+            if (resolved.count(pool[i].name)) continue;  // word already decided by a different candidate
+            long long fresh = greedy_degree_score_(i, pool, adjacency, resolved);
+            if (fresh != score) { heap.push({fresh, i}); ++n_stale_repush; continue; }
+            if (!cand_available_(pool[i])) { ++n_dead; continue; }  // source/covered consumed meanwhile
+            Candidate c = pool[i];
+            if (trace) {
+                gcsa_log("  ACCEPT %s <- %s add=%d cov=%d score=%lld\n",
+                    name_to_string(G_.shape, c.name).c_str(),
+                    name_to_string(G_.shape, name_of_rank_(c.src_lo)).c_str(),
+                    c.add, c.coverage(), score);
+            }
+            accept_(c, accepted);
+            resolved.insert(pool[i].name);
+            ++n_accepted;
+        }
+        auto t5 = Clock::now();
+        gcsa_log("[%s] greedy pop done: accepted=%zu dead=%zu stale-repush=%zu\n",
+                 label, n_accepted, n_dead, n_stale_repush);
+        const size_t after_greedy = kept_count_;
+        gcsa_log("[%s] greedy: |C| %zu -> %zu  (%.1f%% of original kept, -%zu)\n",
+                 label, m0, after_greedy, pct_kept(after_greedy), m0 - after_greedy);
+
+        // No separate leftover pass: every cached candidate of every word
+        // already got a turn in the same heap (a word only ever leaves the
+        // loop unresolved if none of its up-to-cap candidates ever cleared
+        // both a fresh-score check and cand_available_, i.e. it genuinely
+        // has nothing left, exactly the leftover-pass exit condition too --
+        // see run_pseudoforest_leftover_'s comment for that same floor).
+        auto t_p2_0 = Clock::now();
+        double phase1_ms = std::chrono::duration<double, std::milli>(t5 - t0).count();
+        run_phase2_and_lns_(intervals, accepted, label, trace, timing, &cand_cache, phase1_ms);
+        auto t_p2_1 = Clock::now();
+        const size_t after_phase2 = kept_count_;
+        gcsa_log("[%s] phase II:  |C| %zu -> %zu  (%.1f%% of original kept, -%zu)\n",
+                 label, after_greedy, after_phase2, pct_kept(after_phase2),
+                 after_greedy - after_phase2);
+        gcsa_log(
+            "[%s] success: original |C|=%zu -- greedy=%.1f%%, +phase II=%.1f%% (of original kept)\n",
+            label, m0, pct_kept(after_greedy), pct_kept(after_phase2));
+
+        if (timing) {
+            auto ms = [](Clock::time_point a, Clock::time_point b) {
+                return std::chrono::duration<double, std::milli>(b - a).count();
+            };
+            const double phase2_total = ms(t_p2_0, t_p2_1);
+            gcsa_log(
+                "[timing] %s enum=%.1fms flatten=%.1fms graph=%.1fms heap_init=%.1fms "
+                "pop=%.1fms phase2=%.1fms total=%.1fms  pool=%d edges=%zu "
+                "accepted=%zu kept=%zu\n",
+                label, ms(t0, t1), ms(t1, t2), ms(t2, t3), ms(t3, t4), ms(t4, t5),
+                phase2_total, ms(t_all, Clock::now()), N, total_edges,
+                accepted.size(), kept_count_);
         }
     }
 
@@ -2094,7 +2371,8 @@ private:
         using Clock = std::chrono::steady_clock;
         const bool timing = (std::getenv("GCSA_TIMING") != nullptr);
         auto t_all = Clock::now();
-        // See compress_tree_dp_'s m0/pct_kept for what this measures.
+        // m0 = |C| before this algorithm's own Phase I; pct_kept
+        // expresses later |C| values as a percentage of that baseline.
         const size_t m0 = kept_count_;
         auto pct_kept = [&](size_t kept) {
             return 100.0 * (double)kept / (double)std::max<size_t>(1, m0);
@@ -2256,7 +2534,7 @@ private:
                  m0, after_phase1, pct_kept(after_phase1), m0 - after_phase1);
 
         double phase1_ms = std::chrono::duration<double, std::milli>(t3 - t0).count();
-        run_phase2_(intervals, accepted, "dep-order", trace, timing, &cand_cache, phase1_ms);
+        run_phase2_and_lns_(intervals, accepted, "dep-order", trace, timing, &cand_cache, phase1_ms);
         auto t4 = Clock::now();
         const size_t after_phase2 = kept_count_;
         gcsa_log("[dep-order] phase II:  |C| %zu -> %zu  (%.1f%% of original kept, -%zu)\n",
@@ -2275,417 +2553,6 @@ private:
                 "         N=%d prefs=%zu\n",
                 ms(t0, t1), ms(t2, t3), ms(t3, t4), ms(t_all, t4),
                 N, prefs.size());
-        }
-    }
-
-    // Preference-forest DP: each strong preference edge (cov>=kMinCoverage, |I|>2) makes
-    // the target a child of its preferred source.  For every node we choose
-    // KEEP (all ranks stored, children may compress against us) vs COMPRESS
-    // (drop cov ranks via the preferred candidate; children lose that source).
-    // Exact for |C| on this forest model; leftover names get an avail. greedy.
-    // phase2: which Phase II follows — the dirty-set unpin/retarget (TreeDp)
-    // or the exact cluster LNS (TreeDp3). GCSA_DISABLE_PHASE2=1 skips
-    // whichever one runs, for any algo.
-    //
-    // Hot-path notes (large N):
-    //   - Preference enum is independent per interval → GCSA_THREADS parallel.
-    //   - cand_cache reused for leftover + Phase II (no re-enum).
-    //   - Forest DP uses dense node ids + vector memo; roots are independent.
-    void compress_tree_dp_(const std::vector<Interval>& intervals,
-                           std::unordered_map<uint64_t, Candidate>& accepted,
-                           Phase2Mode phase2 = Phase2Mode::Greedy,
-                           bool cycle_repair = false) {
-        using Clock = std::chrono::steady_clock;
-        const bool timing = (std::getenv("GCSA_TIMING") != nullptr);
-        const bool trace = (std::getenv("GCSA_TRACE_DP") != nullptr);
-        const char* label = algo_name(algo_);
-        auto t_all = Clock::now();
-        const int nthreads = gcsa_num_threads();
-        // |C| before any of this function's stages touch it — i.e. the
-        // uncompressed size (m SA ranks) — so DP/leftover/Phase II below can
-        // each report their own contribution to the reduction.
-        const size_t m0 = kept_count_;
-        auto pct_kept = [&](size_t kept) {
-            return 100.0 * (double)kept / (double)std::max<size_t>(1, m0);
-        };
-
-        std::unordered_map<uint64_t, const Interval*> by_name;
-        by_name.reserve(intervals.size() * 2);
-        for (const auto& iv : intervals) by_name[iv.name] = &iv;
-
-        struct Pref { const Interval* iv; Candidate cand; uint64_t src_name; };
-        std::unordered_map<uint64_t, Pref> prefs;   // target -> preferred
-        // Static (avail=false) candidate lists — reused by leftover + Phase II.
-        // Prefs use pick_best_ on enum order (stable tie-break); Phase II wants
-        // coverage-desc order, so we sort only after recording the preferred.
-        std::unordered_map<uint64_t, std::vector<Candidate>> cand_cache;
-
-        gcsa_log("[%s] preference forest build...\n", label);
-        if (timing)
-            gcsa_log("[timing] %s pref threads=%d\n", label, nthreads);
-        auto t_pref0 = Clock::now();
-
-        std::vector<const Interval*> big_ivs;
-        big_ivs.reserve(intervals.size());
-        for (const auto& iv : intervals)
-            if (iv.hi - iv.lo > 1) big_ivs.push_back(&iv);
-
-        // Stream into prefs/cand_cache under a mutex instead of retaining a
-        // PrefWork[] the size of |{I : |I|>1}| — that doubled peak RAM on large
-        // skmer concatenations (hundreds of thousands of intervals) and OOM'd.
-        prefs.reserve(big_ivs.size());
-        cand_cache.reserve(big_ivs.size() * 2);
-        std::mutex pref_mu;
-        gcsa_parallel_for(big_ivs.size(), [&](size_t i) {
-            const Interval& iv = *big_ivs[i];
-            auto cands = enumerate_candidates_(iv.name, iv.lo, iv.hi, /*avail=*/false);
-            bool has_pref = false;
-            Candidate best;
-            uint64_t src_name = 0;
-            if (iv.hi - iv.lo > 2) {
-                best = pick_best_(cands);
-                if (best.coverage() >= kMinCoverage) {
-                    has_pref = true;
-                    src_name = name_of_rank_(best.src_lo);
-                }
-            }
-            std::sort(cands.begin(), cands.end(), [](const Candidate& a, const Candidate& b){
-                if (a.coverage() != b.coverage()) return a.coverage() > b.coverage();
-                return a.add > b.add;
-            });
-            trim_cand_cache_(cands);
-            std::lock_guard<std::mutex> lock(pref_mu);
-            if (has_pref)
-                prefs.emplace(iv.name, Pref{&iv, std::move(best), src_name});
-            cand_cache.emplace(iv.name, std::move(cands));
-        });
-        auto t_pref1 = Clock::now();
-
-        // Forest edges: only cov>=kMinCoverage (same threshold as DepOrder DAG edges).
-        std::unordered_map<uint64_t, std::vector<uint64_t>> children;
-        std::unordered_map<uint64_t, uint64_t> parent;
-        // Cycle check: t->s would cycle iff s already has t as an ancestor
-        // (parent-chain walk). Equivalent to the old downward DFS reaches(t,s).
-        auto has_ancestor = [&](uint64_t s, uint64_t t) {
-            for (uint64_t u = s; ;) {
-                if (u == t) return true;
-                auto it = parent.find(u);
-                if (it == parent.end()) return false;
-                u = it->second;
-            }
-        };
-
-        auto t_forest0 = Clock::now();
-        // Deterministic edge order (name asc) so parallel pref build does not
-        // change which cycle-breaking edges survive.
-        std::vector<uint64_t> pref_names;
-        pref_names.reserve(prefs.size());
-        for (auto& kv : prefs) pref_names.push_back(kv.first);
-        std::sort(pref_names.begin(), pref_names.end());
-        size_t cycles_seen = 0, cycles_repaired = 0, cycle_gain = 0;
-        const int cycle_min_gain = gcsa_env_int("GCSA_CYCLE_MIN_GAIN", 1);
-        for (uint64_t t : pref_names) {
-            auto& p = prefs[t];
-            uint64_t s = p.src_name;
-            if (p.cand.coverage() < kMinCoverage) continue;
-            if (s == t) continue;
-            if (!by_name.count(s)) continue;
-            if (!has_ancestor(s, t)) {
-                parent[t] = s;
-                children[s].push_back(t);
-                continue;
-            }
-            // t -> s would close a cycle. Which edge of that cycle dies is
-            // otherwise decided by name order, not by value: drop the
-            // least-valuable one instead. The node whose edge is dropped is the
-            // one that cannot compress via its preference, so the loss is that
-            // edge's coverage. Adding t -> s creates exactly this one cycle, so
-            // removing any single edge of it leaves the forest acyclic.
-            ++cycles_seen;
-            if (!cycle_repair) continue;
-            uint64_t victim = t;
-            int victim_cov = p.cand.coverage();
-            for (uint64_t u = s; u != t; u = parent[u]) {
-                auto pit = prefs.find(u);
-                if (pit == prefs.end()) { victim = t; break; }
-                int cov = pit->second.cand.coverage();
-                if (cov < victim_cov) { victim_cov = cov; victim = u; }
-            }
-            // Rewiring mid-chain is more disruptive than dropping t's edge (t is
-            // still a leaf here), so only do it when the edge we save is
-            // meaningfully better than the one we sacrifice.
-            if (victim == t) continue;  // name order already picked the cheapest
-            if (p.cand.coverage() - victim_cov < cycle_min_gain) continue;
-            uint64_t vp = parent[victim];
-            auto& sib = children[vp];
-            sib.erase(std::remove(sib.begin(), sib.end(), victim), sib.end());
-            parent.erase(victim);
-            parent[t] = s;
-            children[s].push_back(t);
-            ++cycles_repaired;
-            cycle_gain += (size_t)(p.cand.coverage() - victim_cov);
-        }
-
-        std::unordered_set<uint64_t> nodes;
-        for (auto& kv : prefs) nodes.insert(kv.first);
-        for (auto& kv : children) {
-            nodes.insert(kv.first);
-            for (uint64_t c : kv.second) nodes.insert(c);
-        }
-        std::vector<uint64_t> roots;
-        for (uint64_t n : nodes)
-            if (!parent.count(n)) roots.push_back(n);
-        std::sort(roots.begin(), roots.end());
-        auto t_forest1 = Clock::now();
-
-        if (trace) {
-            gcsa_log("=== %s forest (src -> dependents) ===\n", label);
-            for (auto& kv : children) {
-                gcsa_log("  %s ->",
-                         name_to_string(G_.shape, kv.first).c_str());
-                for (uint64_t c : kv.second)
-                    gcsa_log(" %s",
-                             name_to_string(G_.shape, c).c_str());
-                gcsa_log("\n");
-            }
-            gcsa_log("roots:");
-            for (uint64_t r : roots)
-                gcsa_log(" %s", name_to_string(G_.shape, r).c_str());
-            gcsa_log("\n");
-        }
-
-        // Dense forest arrays for DP.
-        std::vector<uint64_t> node_of;
-        node_of.reserve(nodes.size());
-        for (uint64_t n : nodes) node_of.push_back(n);
-        std::sort(node_of.begin(), node_of.end());
-        std::unordered_map<uint64_t, int> id_of;
-        id_of.reserve(node_of.size() * 2);
-        for (size_t i = 0; i < node_of.size(); ++i) id_of[node_of[i]] = (int)i;
-        const int NN = (int)node_of.size();
-
-        std::vector<std::vector<int>> ch(NN);
-        std::vector<int> isize_arr(NN, 0);
-        std::vector<int> pref_cov(NN, -1);          // -1 = cannot compress via pref
-        std::vector<const Candidate*> pref_ptr(NN, nullptr);
-        for (int i = 0; i < NN; ++i) {
-            auto it = by_name.find(node_of[i]);
-            if (it != by_name.end())
-                isize_arr[i] = it->second->hi - it->second->lo;
-            auto pit = prefs.find(node_of[i]);
-            if (pit != prefs.end() && pit->second.cand.coverage() >= kMinCoverage) {
-                pref_cov[i] = pit->second.cand.coverage();
-                pref_ptr[i] = &pit->second.cand;
-            }
-        }
-        for (auto& kv : children) {
-            int p = id_of[kv.first];
-            for (uint64_t c : kv.second) ch[p].push_back(id_of[c]);
-        }
-
-        struct Cell { int cost; bool compress; };
-        // Per-root DP (disjoint trees) — parallelize over roots.
-        std::vector<std::vector<std::pair<int, Candidate>>> chosen_by_root(roots.size());
-
-        gcsa_log("[%s] DP on forest...\n", label);
-        auto t_dp0 = Clock::now();
-        gcsa_parallel_for(roots.size(), [&](size_t ri) {
-            const int root = id_of.at(roots[ri]);
-            // memo[2*v + src_ok]: cost < 0 => empty
-            std::vector<Cell> memo((size_t)NN * 2, Cell{-1, false});
-
-            std::function<Cell(int, bool)> solve = [&](int v, bool src_ok) -> Cell {
-                Cell& slot = memo[(size_t)v * 2 + (src_ok ? 1 : 0)];
-                if (slot.cost >= 0) return slot;
-
-                const auto& kids = ch[v];
-                int cost_keep = isize_arr[v];
-                for (int w : kids) cost_keep += solve(w, /*src_ok=*/true).cost;
-
-                int cost_comp = std::numeric_limits<int>::max();
-                bool can_comp = false;
-                if (src_ok && pref_cov[v] >= kMinCoverage) {
-                    can_comp = true;
-                    int cc = isize_arr[v] - pref_cov[v];
-                    for (int w : kids) cc += solve(w, /*src_ok=*/false).cost;
-                    cost_comp = cc;
-                }
-
-                if (can_comp && cost_comp < cost_keep)
-                    slot = {cost_comp, true};
-                else
-                    slot = {cost_keep, false};
-                return slot;
-            };
-
-            auto& local = chosen_by_root[ri];
-            std::function<void(int, bool)> apply = [&](int v, bool src_ok) {
-                Cell cell = solve(v, src_ok);
-                if (cell.compress) {
-                    local.push_back({v, *pref_ptr[v]});
-                    for (int w : ch[v]) apply(w, /*src_ok=*/false);
-                } else {
-                    for (int w : ch[v]) apply(w, /*src_ok=*/true);
-                }
-            };
-
-            // Root: KEEP, or COMPRESS if preferred source is outside this tree.
-            const auto& kids = ch[root];
-            int cost_keep = isize_arr[root];
-            for (int w : kids) cost_keep += solve(w, true).cost;
-
-            int cost_comp = std::numeric_limits<int>::max();
-            bool can_comp = false;
-            if (pref_cov[root] >= kMinCoverage) {
-                auto pit = prefs.find(node_of[root]);
-                uint64_t s = pit->second.src_name;
-                if (s != node_of[root] && !has_ancestor(s, node_of[root])) {
-                    can_comp = true;
-                    int cc = isize_arr[root] - pref_cov[root];
-                    for (int w : kids) cc += solve(w, false).cost;
-                    cost_comp = cc;
-                }
-            }
-
-            if (trace) {
-                // fprintf is not great under parallel; only print when single-threaded.
-                if (nthreads <= 1)
-                    gcsa_log("root %s: keep=%d comp=%s\n",
-                             name_to_string(G_.shape, node_of[root]).c_str(), cost_keep,
-                             can_comp ? std::to_string(cost_comp).c_str() : "n/a");
-            }
-
-            if (can_comp && cost_comp < cost_keep) {
-                local.push_back({root, *pref_ptr[root]});
-                for (int w : kids) apply(w, false);
-            } else {
-                for (int w : kids) apply(w, true);
-            }
-        });
-
-        std::unordered_map<uint64_t, Candidate> chosen;
-        chosen.reserve(nodes.size());
-        for (auto& vec : chosen_by_root)
-            for (auto& p : vec)
-                chosen.emplace(node_of[p.first], std::move(p.second));
-        auto t_dp1 = Clock::now();
-        gcsa_log("[%s] DP done\n", label);
-
-        // Materialize: accept deepest dependents first (pins hubs before hubs decide).
-        gcsa_log("[%s] accept chosen...\n", label);
-        auto t_acc0 = Clock::now();
-        const std::vector<uint64_t> kEmptyKids;
-        auto children_of = [&](uint64_t v) -> const std::vector<uint64_t>& {
-            auto it = children.find(v);
-            return it == children.end() ? kEmptyKids : it->second;
-        };
-        std::function<void(uint64_t)> accept_subtree = [&](uint64_t v) {
-            for (uint64_t w : children_of(v)) accept_subtree(w);
-            auto it = chosen.find(v);
-            if (it == chosen.end()) return;
-            Candidate c = it->second;
-            bool ok = cand_available_(c);
-            if (!ok) {
-                auto cit = cand_cache.find(v);
-                if (cit != cand_cache.end())
-                    c = best_from_sorted_cache_(cit->second, /*require_avail=*/true);
-                else {
-                    const Interval* iv = by_name[v];
-                    c = best_candidate_(iv->name, iv->lo, iv->hi, /*avail=*/true);
-                }
-            }
-            if (c.coverage() >= kMinCoverage) {
-                if (trace) {
-                    gcsa_log("  ACCEPT %s <- %s add=%d cov=%d\n",
-                        name_to_string(G_.shape, v).c_str(),
-                        name_to_string(G_.shape, name_of_rank_(c.src_lo)).c_str(),
-                        c.add, c.coverage());
-                }
-                accept_(c, accepted);
-            }
-        };
-        for (uint64_t r : roots) accept_subtree(r);
-        auto t_acc1 = Clock::now();
-        const size_t after_dp = kept_count_;
-        gcsa_log("[%s] DP alone:   |C| %zu -> %zu  (%.1f%% of original kept, -%zu)\n",
-                 label, m0, after_dp, pct_kept(after_dp), m0 - after_dp);
-
-        // Leftover intervals: greedy with availability, using static cand_cache.
-        gcsa_log("[%s] leftover greedy...\n", label);
-        auto t_left0 = Clock::now();
-        std::vector<const Interval*> leftover;
-        for (const auto& iv : intervals) {
-            if (iv.hi - iv.lo <= 1) continue;
-            if (accepted.count(iv.name)) continue;
-            leftover.push_back(&iv);
-        }
-        std::sort(leftover.begin(), leftover.end(),
-                  [](const Interval* a, const Interval* b) {
-                      return (a->hi - a->lo) > (b->hi - b->lo);
-                  });
-        for (const Interval* ivp : leftover) {
-            Candidate c;
-            auto cit = cand_cache.find(ivp->name);
-            if (cit != cand_cache.end())
-                c = best_from_sorted_cache_(cit->second, /*require_avail=*/true);
-            else
-                c = best_candidate_(ivp->name, ivp->lo, ivp->hi, /*avail=*/true);
-            if (c.coverage() < kMinCoverage) continue;
-            accept_(c, accepted);
-        }
-        auto t_left1 = Clock::now();
-        gcsa_log("[%s] leftover done\n", label);
-        const size_t after_leftover = kept_count_;
-        gcsa_log("[%s] leftover:   |C| %zu -> %zu  (%.1f%% of original kept, -%zu)\n",
-                 label, after_dp, after_leftover, pct_kept(after_leftover),
-                 after_dp - after_leftover);
-
-        // Phase II (reuses cand_cache either way).
-        auto t_p2_0 = Clock::now();
-        double phase1_ms = std::chrono::duration<double, std::milli>(t_left1 - t_pref0).count();
-        if (phase2 == Phase2Mode::Greedy) {
-            run_phase2_(intervals, accepted, label, trace, timing, &cand_cache, phase1_ms);
-        } else if (phase2 == Phase2Mode::Local) {
-            // The cluster solve only ever lowers |C|, so it composes with the
-            // retarget loop instead of replacing it: retargeting reaches links
-            // (composite adds) the static candidate cache does not contain,
-            // which is exactly where the LNS alone gives ground on long
-            // repeats. GCSA_LNS_ONLY=1 measures the LNS on its own.
-            if (gcsa_env_int("GCSA_LNS_ONLY", 0) == 0)
-                run_phase2_(intervals, accepted, label, trace, timing, &cand_cache, phase1_ms);
-            run_phase2_local_(intervals, accepted, label, timing, &cand_cache);
-        }
-        auto t_p2_1 = Clock::now();
-        const size_t after_phase2 = kept_count_;
-        gcsa_log("[%s] phase II:   |C| %zu -> %zu  (%.1f%% of original kept, -%zu)\n",
-                 label, after_leftover, after_phase2, pct_kept(after_phase2),
-                 after_leftover - after_phase2);
-        gcsa_log(
-            "[%s] success: original |C|=%zu -- DP alone=%.1f%%, "
-            "+leftover=%.1f%%, +phase II=%.1f%% (of original kept)\n",
-            label, m0, pct_kept(after_dp), pct_kept(after_leftover),
-            pct_kept(after_phase2));
-
-        if (timing) {
-            auto ms = [](Clock::time_point a, Clock::time_point b) {
-                return std::chrono::duration<double, std::milli>(b - a).count();
-            };
-            const double phase1_total = ms(t_pref0, t_left1);
-            const double phase2_total = ms(t_p2_0, t_p2_1);
-            gcsa_log(
-                "[timing] %s pref=%.1fms forest=%.1fms dp=%.1fms accept=%.1fms "
-                "leftover=%.1fms phase2=%.1fms total=%.1fms "
-                "phase2/phase1=%.2f\n"
-                "         roots=%zu forest_nodes=%zu prefs=%zu #I>1=%zu "
-                "accepted=%zu kept=%zu threads=%d "
-                "cycles=%zu repaired=%zu edge_gain=%zu\n",
-                label, ms(t_pref0, t_pref1), ms(t_forest0, t_forest1),
-                ms(t_dp0, t_dp1), ms(t_acc0, t_acc1), ms(t_left0, t_left1),
-                phase2_total, ms(t_all, Clock::now()),
-                phase2_total / std::max(1.0, phase1_total),
-                roots.size(), nodes.size(), prefs.size(), cand_cache.size(),
-                accepted.size(), kept_count_, nthreads,
-                cycles_seen, cycles_repaired, cycle_gain);
         }
     }
 
@@ -2725,7 +2592,7 @@ private:
     // component of real dependencies is either a tree (rooted at a node
     // with no dependency) or unicyclic (exactly one cycle, with trees
     // hanging off each cycle node) -- never anything worse. No edge is ever
-    // dropped to force acyclicity (unlike TreeDp): unicyclic components are
+    // dropped to force acyclicity: unicyclic components are
     // handled by folding the cycle instead (see solve_pseudoforest_dp_), so
     // no cov/size threshold is needed either -- every still-unresolved
     // interval participates.
@@ -2779,7 +2646,7 @@ private:
             // Set (if non-null) right after the per-interval candidate-scoring
             // loop below, before the dependency/cycle-detection pass -- lets
             // callers split "cand" (independent per interval, parallelized via
-            // GCSA_THREADS like DepOrder/TreeDp's preference enum) from
+            // GCSA_THREADS like DepOrder's preference enum) from
             // "graph" (the dependency-map + cycle-detection walk, inherently
             // sequential) for GCSA_TIMING, without this function owning a
             // `timing` flag itself.
@@ -2788,11 +2655,11 @@ private:
         graph.by_name.reserve(intervals.size() * 2);
         for (const auto& iv : intervals) graph.by_name[iv.name] = &iv;
 
-        // Independent per interval -- same shape as DepOrder/TreeDp's
+        // Independent per interval -- same shape as DepOrder's
         // parallelized preference enum, now parallelized the same way via
         // GCSA_THREADS. cand_cache may already hold iv.name's entry from an
         // earlier round (see the class comment above build_pseudoforest_
-        // graph_): unlike DepOrder/TreeDp's enumeration, which only ever runs
+        // graph_): unlike DepOrder's enumeration, which only ever runs
         // once per build against an empty cache, this function is called once
         // per pseudoforest-dp round, so a later round can hit a prior round's
         // cache. Both the lookup and the eventual insert touch that same
@@ -2999,7 +2866,7 @@ private:
             return it == graph.children.end() ? kEmpty : it->second;
         };
 
-        // ---- KEEP / COMPRESS DP (identical recurrence to TreeDp) ----------
+        // ---- KEEP / COMPRESS DP --------------------------------------------
         struct Cell { long long cost; bool compress; };
         std::map<std::pair<uint64_t, int>, Cell> memo;
 
@@ -3212,24 +3079,48 @@ private:
         return n;
     }
 
-    // Single-fire "extract preference, solve exactly" (exact_pseudoforest_dp.pdf,
+    // "Extract preference, solve exactly" DP (exact_pseudoforest_dp.pdf,
     // "Sparsifying the graph"): one preference-graph extraction over every
-    // unresolved interval, one exact DP solve, one greedy leftover sweep to
-    // mop up whatever the DP's one-candidate-per-word sparsification
-    // couldn't see (self-links included -- see run_pseudoforest_leftover_),
-    // then Phase II. This mirrors the original single-pass algorithm
-    // exactly.
+    // unresolved interval, one exact DP solve, then (by default) straight to
+    // a greedy leftover sweep that mops up whatever the DP's
+    // one-candidate-per-word sparsification couldn't see (self-links
+    // included -- see run_pseudoforest_leftover_), then Phase II. This is
+    // the "single-fire" mode and mirrors the original algorithm exactly.
     //
-    // The doc's "IDEA: Iterative DP" -- repeating extract/solve to a fixed
-    // point before ever falling back to greedy, refining candidates against
-    // whatever earlier rounds already accepted -- is deliberately not done
-    // here for now. It was prototyped and worked, but on every case tested
-    // a second round was always empty: the leftover sweep's floor matches
-    // the DP's own floor, so anything the DP could possibly extract in a
-    // later round, leftover would already have taken in this one. Revisit
-    // once real-data experiments motivate it; build_pseudoforest_graph_'s
-    // require_avail parameter and its round-oriented framing are left in
-    // place so that experiment doesn't need to be rederived.
+    // GCSA_PFDP_ITERATE=1 turns on the doc's "IDEA: Iterative DP": instead
+    // of falling straight to leftover after the first DP round, repeat
+    // extract/solve to a fixed point first. Every round after the first
+    // re-extracts the preference pseudoforest with require_avail=true --
+    // i.e. each still-unresolved node's *currently available* best
+    // candidate, given every earlier round's accepted set -- over just the
+    // residual (shrunk) instance, and solves it exactly again, same as
+    // round 0. Leftover still runs exactly once, after the loop reaches a
+    // fixed point (a round whose DP accepts nothing) or hits
+    // GCSA_PFDP_MAX_ROUNDS -- it remains the only backstop for whatever no
+    // round's one-candidate-per-word sparsification could even pose as a DP
+    // node (see run_pseudoforest_leftover_). The loop needs no artificial
+    // cap to terminate: a productive round accepts at least one more name,
+    // which strictly shrinks the residual instance, so it's bounded by the
+    // interval count regardless; GCSA_PFDP_MAX_ROUNDS is only there to bail
+    // out early if that's ever desired.
+    //
+    // NOT a strict improvement, despite every individual round being an
+    // exact MWIS solve: each round's DP commits, in one batch snapshot, to
+    // exactly one candidate per still-unresolved node and can never
+    // reconsider a *different* candidate for that same node within the
+    // round, even when the chosen one loses to a conflict. Plain leftover
+    // greedy, by contrast, re-derives "the best still-available candidate"
+    // for one node at a time against always-current state (accept_'s
+    // effects from every prior node already applied), so it can fall back
+    // to a node's second-best candidate mid-pass in a way no DP round can
+    // until an entirely new round starts. Measured on the E. coli benchmark
+    // genomes (`bench/`'s pool, several shapes and max-add values): the
+    // net effect through leftover (and again through Phase II) is a coin
+    // flip -- typically zero, otherwise a handful of |C| positions either
+    // way out of several million kept, never consistently one direction.
+    // Off by default pending a wider real-data sweep; build_pseudoforest_
+    // graph_'s require_avail parameter and the round-oriented framing below
+    // existed for exactly this experiment.
     void compress_pseudoforest_dp_(const std::vector<Interval>& intervals,
                                    std::unordered_map<uint64_t, Candidate>& accepted) {
         using Clock = std::chrono::steady_clock;
@@ -3239,10 +3130,27 @@ private:
             const char* e = std::getenv("GCSA_PFDP_RANK_AWARE");
             return !e || std::atoi(e) != 0;
         }();
+        // Iteration is primarily selected via --algo pseudoforest-dp-iterate
+        // (CompressAlgo::PseudoforestDpIterate); GCSA_PFDP_ITERATE=1 remains
+        // as a legacy override that also turns iteration on for plain
+        // --algo pseudoforest-dp.
+        const bool iterate = (algo_ == CompressAlgo::PseudoforestDpIterate) || [] {
+            const char* e = std::getenv("GCSA_PFDP_ITERATE");
+            return e && std::atoi(e) != 0;
+        }();
+        // 0 == unbounded (run to a fixed point; see comment above for why
+        // that's already guaranteed to terminate without a cap).
+        const size_t max_rounds = [] () -> size_t {
+            const char* e = std::getenv("GCSA_PFDP_MAX_ROUNDS");
+            if (!e) return 0;
+            long v = std::atol(e);
+            return v > 0 ? (size_t)v : 0;
+        }();
         const char* label = algo_name(algo_);
         auto t_all = Clock::now();
         const int nthreads = gcsa_num_threads();
-        // See compress_tree_dp_'s m0/pct_kept for what this measures.
+        // m0 = |C| before this algorithm's own Phase I; pct_kept
+        // expresses later |C| values as a percentage of that baseline.
         const size_t m0 = kept_count_;
         auto pct_kept = [&](size_t kept) {
             return 100.0 * (double)kept / (double)std::max<size_t>(1, m0);
@@ -3250,42 +3158,76 @@ private:
 
         std::unordered_map<uint64_t, std::vector<Candidate>> cand_cache;  // reused by Phase II
 
-        // "cand" = the per-interval candidate-scoring loop inside
-        // build_pseudoforest_graph_ (independent per interval, parallelized
-        // via GCSA_THREADS the same way as DepOrder/TreeDp's preference
-        // enum). "graph" = the dependency-map + cycle-detection walk that
-        // follows it, which mutates shared state as it traverses and so is
-        // inherently sequential -- see build_pseudoforest_graph_'s comments.
-        gcsa_log("[%s] preference graph build...\n", label);
-        auto t_graph0 = Clock::now();
-        Clock::time_point t_cand_end = t_graph0;
-        ConflictGraph graph = build_pseudoforest_graph_(intervals, accepted,
-                                                    /*require_avail=*/false, cand_cache,
-                                                    rank_aware, &t_cand_end);
-        auto t_graph1 = Clock::now();
-        if (trace) trace_pseudoforest_graph_(graph, 0);
+        // Wall-clock start of Phase I proper (graph build through leftover),
+        // for run_phase2_'s time-budget calc. Captured once here (not per
+        // round) so it
+        // covers every round when iterating, the same way it covered the
+        // single round before.
+        auto t_phase1_start = Clock::now();
+        // Per-phase ms, summed across every round, for GCSA_TIMING.
+        double cand_ms = 0.0, graph_ms = 0.0, dp_ms = 0.0, accept_ms = 0.0;
+        size_t total_dp_nodes = 0, total_cycles = 0, total_chosen = 0;
+        size_t rounds = 0;
 
-        size_t n_chosen = 0;
-        std::unordered_map<uint64_t, Candidate> chosen;
-        auto t_dp0 = Clock::now();
-        if (!graph.cand.empty()) {
-            gcsa_log("[%s] DP on %zu nodes...\n", label, graph.cand.size());
-            chosen = solve_pseudoforest_dp_(graph, rank_aware, trace);
-            gcsa_log("[%s] DP done (cand=%zu cycles=%zu chosen=%zu)\n",
-                     label, graph.cand.size(), graph.cycles.size(), chosen.size());
-            n_chosen = chosen.size();
-        } else {
-            gcsa_log("[%s] no preferences to extract\n", label);
+        for (;;) {
+            // Round 0 matches the original algorithm's single pass exactly
+            // (require_avail=false: each node's globally-best candidate,
+            // nothing accepted yet). Every later round asks for each
+            // still-unresolved node's best candidate that is still
+            // available given what earlier rounds already accepted -- the
+            // "extract a second set of preferences that do not conflict
+            // with the fixed solution" step from the doc.
+            const bool require_avail = (rounds > 0);
+            gcsa_log("[%s] round %zu: preference graph build...\n", label, rounds);
+            auto t_graph0 = Clock::now();
+            Clock::time_point t_cand_end = t_graph0;
+            ConflictGraph graph = build_pseudoforest_graph_(intervals, accepted,
+                                                        require_avail, cand_cache,
+                                                        rank_aware, &t_cand_end);
+            auto t_graph1 = Clock::now();
+            if (trace) trace_pseudoforest_graph_(graph, rounds);
+            cand_ms += std::chrono::duration<double, std::milli>(t_cand_end - t_graph0).count();
+            graph_ms += std::chrono::duration<double, std::milli>(t_graph1 - t_cand_end).count();
+
+            if (graph.cand.empty()) {
+                gcsa_log("[%s] round %zu: no preferences to extract\n", label, rounds);
+                ++rounds;
+                break;
+            }
+
+            gcsa_log("[%s] round %zu: DP on %zu nodes...\n", label, rounds, graph.cand.size());
+            auto t_dp0 = Clock::now();
+            std::unordered_map<uint64_t, Candidate> chosen =
+                solve_pseudoforest_dp_(graph, rank_aware, trace);
+            auto t_dp1 = Clock::now();
+            dp_ms += std::chrono::duration<double, std::milli>(t_dp1 - t_dp0).count();
+            const size_t n_chosen = chosen.size();
+            gcsa_log("[%s] round %zu: DP done (cand=%zu cycles=%zu chosen=%zu)\n",
+                     label, rounds, graph.cand.size(), graph.cycles.size(), n_chosen);
+            total_dp_nodes += graph.cand.size();
+            total_cycles += graph.cycles.size();
+            total_chosen += n_chosen;
+
+            if (n_chosen) {
+                auto t_acc0 = Clock::now();
+                accept_pseudoforest_chosen_(chosen, graph.by_name, accepted, trace);
+                auto t_acc1 = Clock::now();
+                accept_ms += std::chrono::duration<double, std::milli>(t_acc1 - t_acc0).count();
+            }
+            ++rounds;
+
+            if (!iterate) break;               // single-fire: stop after round 0
+            if (n_chosen == 0) break;           // fixed point: nothing left for another round to find
+            if (max_rounds && rounds >= max_rounds) {
+                gcsa_log("[%s] GCSA_PFDP_MAX_ROUNDS=%zu reached, stopping\n", label, max_rounds);
+                break;
+            }
         }
-        auto t_dp1 = Clock::now();
 
-        auto t_acc0 = Clock::now();
-        if (n_chosen) accept_pseudoforest_chosen_(chosen, graph.by_name, accepted, trace);
-        auto t_acc1 = Clock::now();
         const size_t after_dp = kept_count_;
         gcsa_log(
-            "[%s] DP alone: |C| %zu -> %zu  (%.1f%% of original kept, -%zu)\n",
-            label, m0, after_dp, pct_kept(after_dp), m0 - after_dp);
+            "[%s] DP alone (%zu round%s): |C| %zu -> %zu  (%.1f%% of original kept, -%zu)\n",
+            label, rounds, rounds == 1 ? "" : "s", m0, after_dp, pct_kept(after_dp), m0 - after_dp);
 
         gcsa_log("[%s] leftover greedy...\n", label);
         auto t_left0 = Clock::now();
@@ -3296,15 +3238,13 @@ private:
             "[%s] leftover:  |C| %zu -> %zu  (%.1f%% of original kept, -%zu)\n",
             label, after_dp, after_leftover, pct_kept(after_leftover), after_dp - after_leftover);
 
-        // Phase II: same unpin/retarget fixed point as DepOrder/TreeDp. Pass
-        // the real Phase I wall time (graph build through leftover), the same
-        // way TreeDp does -- previously this call left phase1_ms at its 0.0
-        // default, which (via run_phase2_'s time-budget calc) starved Phase II
-        // to a flat 50ms floor (GCSA_PHASE2_MIN_MS) on any large-m run
-        // regardless of how long Phase I actually took.
+        // Phase II + LNS: same combined pass every algorithm now runs (see
+        // run_phase2_and_lns_). Pass the real Phase I wall time (graph
+        // build through leftover, every round included) for run_phase2_'s
+        // time-budget calc.
         auto t_p2_0 = Clock::now();
-        double phase1_ms = std::chrono::duration<double, std::milli>(t_left1 - t_graph0).count();
-        run_phase2_(intervals, accepted, label, trace, timing, &cand_cache, phase1_ms);
+        double phase1_ms = std::chrono::duration<double, std::milli>(t_left1 - t_phase1_start).count();
+        run_phase2_and_lns_(intervals, accepted, label, trace, timing, &cand_cache, phase1_ms);
         auto t_p2_1 = Clock::now();
         const size_t after_phase2 = kept_count_;
         gcsa_log(
@@ -3321,17 +3261,18 @@ private:
                 return std::chrono::duration<double, std::milli>(b - a).count();
             };
             const double phase2_total = ms(t_p2_0, t_p2_1);
+            const double leftover_total = ms(t_left0, t_left1);
             gcsa_log(
-                "[timing] %s cand=%.1fms graph=%.1fms dp=%.1fms accept=%.1fms "
+                "[timing] %s rounds=%zu cand=%.1fms graph=%.1fms dp=%.1fms accept=%.1fms "
                 "leftover=%.1fms phase2=%.1fms total=%.1fms "
                 "phase2/phase1=%.2f\n"
                 "         dp_nodes=%zu cycles=%zu chosen=%zu n_leftover=%zu "
                 "accepted=%zu kept=%zu threads=%d\n",
-                label, ms(t_graph0, t_cand_end), ms(t_cand_end, t_graph1),
-                ms(t_dp0, t_dp1), ms(t_acc0, t_acc1), ms(t_left0, t_left1),
+                label, rounds, cand_ms, graph_ms,
+                dp_ms, accept_ms, leftover_total,
                 phase2_total, ms(t_all, Clock::now()),
                 phase2_total / std::max(1.0, phase1_ms),
-                graph.cand.size(), graph.cycles.size(), n_chosen, n_leftover,
+                total_dp_nodes, total_cycles, total_chosen, n_leftover,
                 accepted.size(), kept_count_, nthreads);
         }
     }
@@ -3367,17 +3308,13 @@ private:
         std::unordered_map<uint64_t, Candidate> accepted;
         if (algo_ == CompressAlgo::DepOrder)
             compress_dep_order_(intervals, accepted);
-        else if (algo_ == CompressAlgo::TreeDp)
-            compress_tree_dp_(intervals, accepted, Phase2Mode::Greedy);
-        else if (algo_ == CompressAlgo::TreeDp3)
-            compress_tree_dp_(intervals, accepted, Phase2Mode::Local);
-        else if (algo_ == CompressAlgo::TreeDp4)
-            compress_tree_dp_(intervals, accepted, Phase2Mode::Greedy,
-                              /*cycle_repair=*/true);
-        else if (algo_ == CompressAlgo::PseudoforestDp)
+        else if (algo_ == CompressAlgo::PseudoforestDp ||
+                 algo_ == CompressAlgo::PseudoforestDpIterate)
             compress_pseudoforest_dp_(intervals, accepted);
+        else if (algo_ == CompressAlgo::GreedyDegree)
+            compress_greedy_degree_(intervals, accepted);
         else
-            compress_greedy_(intervals, accepted);
+            compress_greedy_size_(intervals, accepted);
 
         gcsa_log("[%s] finalize: build C / hash table...\n", algo_name(algo_));
         finalize_(intervals, accepted);

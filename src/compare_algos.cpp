@@ -1,7 +1,7 @@
 // compare_algos.cpp
 //
-// Side-by-side comparison of CompressAlgo::Greedy, DepOrder, TreeDp,
-// TreeDp3, TreeDp4, PseudoforestDp on the note's #.# example, the
+// Side-by-side comparison of CompressAlgo::GreedySize, GreedyDegree, DepOrder,
+// PseudoforestDp, PseudoforestDpIterate on the note's #.# example, the
 // GCCTTTAAAG×3 demo, short repetitive DNA, and the weight-30 repetition
 // suite.
 //
@@ -110,94 +110,81 @@ static void print_header() {
               << std::setw(28) << "case"
               << std::setw(7)  << "g|C|"
               << std::setw(6)  << "g%"
+              << std::setw(7)  << "gd|C|"
+              << std::setw(6)  << "gd%"
               << std::setw(7)  << "d|C|"
               << std::setw(6)  << "d%"
-              << std::setw(7)  << "t|C|"
-              << std::setw(6)  << "t%"
-              << std::setw(7)  << "t3|C|"
-              << std::setw(6)  << "t3%"
-              << std::setw(7)  << "t4|C|"
-              << std::setw(6)  << "t4%"
               << std::setw(7)  << "p|C|"
               << std::setw(6)  << "p%"
-              << std::setw(16) << "best"
+              << std::setw(7)  << "pi|C|"
+              << std::setw(6)  << "pi%"
+              << std::setw(20) << "best"
               << std::setw(4)  << "g"
+              << std::setw(4)  << "gd"
               << std::setw(4)  << "d"
-              << std::setw(4)  << "t"
-              << std::setw(4)  << "t3"
-              << std::setw(4)  << "t4"
               << std::setw(4)  << "p"
+              << std::setw(4)  << "pi"
               << "\n";
 }
 
-// g=greedy, d=dep-order, t=tree-dp, t3=tree-dp3, t4=tree-dp4,
-// p=pseudoforest-dp
+// g=greedy-size, gd=greedy-degree, d=dep-order, p=pseudoforest-dp,
+// pi=pseudoforest-dp-iterate
 static void print_row(const std::string& tag,
-                      const Result& g, const Result& d, const Result& t,
-                      const Result& t3, const Result& t4,
-                      const Result& p) {
-    size_t bC = std::min({g.C, d.C, t.C, t3.C, t4.C, p.C});
+                      const Result& g, const Result& gd, const Result& d,
+                      const Result& p, const Result& pi) {
+    size_t bC = std::min({g.C, gd.C, d.C, p.C, pi.C});
     std::string best;
     if (g.C == bC) best += (best.empty() ? "" : "/") + std::string("g");
+    if (gd.C == bC) best += (best.empty() ? "" : "/") + std::string("gd");
     if (d.C == bC) best += (best.empty() ? "" : "/") + std::string("d");
-    if (t.C == bC) best += (best.empty() ? "" : "/") + std::string("t");
-    if (t3.C == bC) best += (best.empty() ? "" : "/") + std::string("t3");
-    if (t4.C == bC) best += (best.empty() ? "" : "/") + std::string("t4");
     if (p.C == bC) best += (best.empty() ? "" : "/") + std::string("p");
-    if (best == "g/d/t/t3/t4/p") best = "tie";
+    if (pi.C == bC) best += (best.empty() ? "" : "/") + std::string("pi");
+    if (best == "g/gd/d/p/pi") best = "tie";
 
     auto ok = [](const Result& r) { return (r.ok && r.rt) ? "ok" : "FAIL"; };
     std::cout << std::left << std::setw(28) << tag
               << std::setw(7) << g.C
               << std::setw(6) << std::fixed << std::setprecision(1) << g.keep_pct
+              << std::setw(7) << gd.C
+              << std::setw(6) << gd.keep_pct
               << std::setw(7) << d.C
               << std::setw(6) << d.keep_pct
-              << std::setw(7) << t.C
-              << std::setw(6) << t.keep_pct
-              << std::setw(7) << t3.C
-              << std::setw(6) << t3.keep_pct
-              << std::setw(7) << t4.C
-              << std::setw(6) << t4.keep_pct
               << std::setw(7) << p.C
               << std::setw(6) << p.keep_pct
-              << std::setw(16) << best
+              << std::setw(7) << pi.C
+              << std::setw(6) << pi.keep_pct
+              << std::setw(20) << best
               << std::setw(4) << ok(g)
+              << std::setw(4) << ok(gd)
               << std::setw(4) << ok(d)
-              << std::setw(4) << ok(t)
-              << std::setw(4) << ok(t3)
-              << std::setw(4) << ok(t4)
               << std::setw(4) << ok(p)
+              << std::setw(4) << ok(pi)
               << "\n";
 }
 
 struct Totals {
-    long long sum_g = 0, sum_d = 0, sum_t = 0, sum_t3 = 0, sum_t4 = 0, sum_p = 0;
-    int win_g = 0, win_d = 0, win_t = 0, win_t3 = 0, win_t4 = 0, win_p = 0, tie = 0;
+    long long sum_g = 0, sum_gd = 0, sum_d = 0, sum_p = 0, sum_pi = 0;
+    int win_g = 0, win_gd = 0, win_d = 0, win_p = 0, win_pi = 0, tie = 0;
     int fails = 0, n = 0;
 
-    void add(const Result& g, const Result& d, const Result& t,
-             const Result& t3, const Result& t4,
-             const Result& p) {
+    void add(const Result& g, const Result& gd, const Result& d,
+             const Result& p, const Result& pi) {
         ++n;
         sum_g += (long long)g.C;
+        sum_gd += (long long)gd.C;
         sum_d += (long long)d.C;
-        sum_t += (long long)t.C;
-        sum_t3 += (long long)t3.C;
-        sum_t4 += (long long)t4.C;
         sum_p += (long long)p.C;
-        if (!g.ok || !g.rt || !d.ok || !d.rt ||
-            !t.ok || !t.rt || !t3.ok || !t3.rt ||
-            !t4.ok || !t4.rt || !p.ok || !p.rt) ++fails;
-        size_t b = std::min({g.C, d.C, t.C, t3.C, t4.C, p.C});
-        int winners = (g.C == b) + (d.C == b) + (t.C == b)
-                    + (t3.C == b) + (t4.C == b) + (p.C == b);
+        sum_pi += (long long)pi.C;
+        if (!g.ok || !g.rt || !gd.ok || !gd.rt || !d.ok || !d.rt ||
+            !p.ok || !p.rt || !pi.ok || !pi.rt) ++fails;
+        size_t b = std::min({g.C, gd.C, d.C, p.C, pi.C});
+        int winners = (g.C == b) + (gd.C == b) + (d.C == b) + (p.C == b) + (pi.C == b);
         if (winners > 1) ++tie;
         else if (g.C == b) ++win_g;
+        else if (gd.C == b) ++win_gd;
         else if (d.C == b) ++win_d;
-        else if (t.C == b) ++win_t;
-        else if (t3.C == b) ++win_t3;
-        else if (t4.C == b) ++win_t4;
-        else ++win_p;
+        else if (p.C == b) ++win_p;
+        else ++win_pi;
     }
 };
 
@@ -239,24 +226,23 @@ int main(int argc, char** argv) {
 
     gcsa_set_quiet(!verbose);
 
-    std::cout << "Comparing greedy | dep-order | tree-dp | tree-dp3 | tree-dp4 | pseudoforest-dp"
+    std::cout << "Comparing greedy-size | greedy-degree | dep-order | pseudoforest-dp | pseudoforest-dp-iterate"
               << "  (max_add=" << max_add << ")\n"
-              << "columns: g=greedy  d=dep-order  t=tree-dp"
-              << "  t3=tree-dp3  t4=tree-dp4  p=pseudoforest-dp\n\n";
+              << "columns: g=greedy-size  gd=greedy-degree  d=dep-order"
+              << "  p=pseudoforest-dp  pi=pseudoforest-dp-iterate\n\n";
     print_header();
 
     Totals tot;
 
     auto run_case = [&](const std::string& tag, const Shape& sh, const std::string& text) {
-        Result g = run_algo(sh, text, max_add, CompressAlgo::Greedy, phase2_iters);
+        Result g = run_algo(sh, text, max_add, CompressAlgo::GreedySize, phase2_iters);
+        Result gd = run_algo(sh, text, max_add, CompressAlgo::GreedyDegree, phase2_iters);
         Result d = run_algo(sh, text, max_add, CompressAlgo::DepOrder, phase2_iters);
-        Result t = run_algo(sh, text, max_add, CompressAlgo::TreeDp, phase2_iters);
-        Result t3 = run_algo(sh, text, max_add, CompressAlgo::TreeDp3, phase2_iters);
-        Result t4 = run_algo(sh, text, max_add, CompressAlgo::TreeDp4, phase2_iters);
         Result p = run_algo(sh, text, max_add, CompressAlgo::PseudoforestDp, phase2_iters);
-        print_row(tag, g, d, t, t3, t4, p);
+        Result pi = run_algo(sh, text, max_add, CompressAlgo::PseudoforestDpIterate, phase2_iters);
+        print_row(tag, g, gd, d, p, pi);
         std::cout.flush();
-        tot.add(g, d, t, t3, t4, p);
+        tot.add(g, gd, d, p, pi);
     };
 
     // --- Hand examples -----------------------------------------------------
@@ -269,7 +255,6 @@ int main(int argc, char** argv) {
     run_case("GGGCGGCGGC ##",
              Shape::parse("##"),
              "GGGCGGCGGC");
-    // Known tree-dp counterexamples (ILP optimum |C|=9 resp. 11).
     run_case("ac12 #.#",
              Shape::parse("#.#"),
              "ACACACACACAC");
@@ -279,17 +264,11 @@ int main(int argc, char** argv) {
 
     // --- Cyclic preference structures --------------------------------------
     // Each name points at one preferred source, so the preference graph has
-    // out-degree 1 and its cycles are what the forest build must break. It
-    // breaks them at the member processed last -- the largest packed k-mer name
-    // -- which is an artifact of iteration order, not of value; tree-dp4 drops
-    // the cycle's cheapest edge instead. These are the families where that
-    // choice is load-bearing. They are periodic by construction: a period-p
-    // repeat makes the p gapped k-mers derive from each other cyclically.
-    //
-    // The rows below deliberately cover both signs. Repair maximizes the forest
-    // DP's own objective, but the DP only feeds Phase II, and re-rooting the
-    // chain can leave the retarget loop with less to work with -- so the same
-    // move that wins 97 on tgac-style motifs loses 97 on gtac ones.
+    // out-degree 1 and its cycles are what PseudoforestDp's exact unicyclic
+    // solve (and, upstream, DepOrder's dependency order) has to handle
+    // directly rather than approximate. These are periodic by construction:
+    // a period-p repeat makes the p gapped k-mers derive from each other
+    // cyclically, which stresses that handling at scale.
     auto rep = [](const std::string& motif, size_t n) {
         std::string s;
         s.reserve(n + motif.size());
@@ -299,22 +278,12 @@ int main(int argc, char** argv) {
     };
     const Shape sh_gap = Shape::parse("#.#");
     const Shape sh_adj = Shape::parse("##");
-    // Period 2: the ac12 counterexample at scale. One 2-cycle, coverages 3 vs
-    // 4; the gain stays 1 however long the text gets.
     run_case("cyc ac48 #.#", sh_gap, rep("AC", 48));
-    // Period 4 with motif[1]==motif[3]: the odd positions collapse to a single
-    // name, leaving one cycle whose repair unlocks the whole chain. Nominal
-    // edge gain is 1, but end to end it halves |C| and hits the ILP optimum.
     run_case("cyc taaa48 #.#", sh_gap, rep("TAAA", 48));
     run_case("cyc gaca120 #.#", sh_gap, rep("GACA", 120));
     run_case("cyc taaa400 #.#", sh_gap, rep("TAAA", 400));
-    // Two interacting cycles, both repaired.
     run_case("cyc tgttct120 ##", sh_adj, rep("TGTTCT", 120));
-    // Boundary: a period-4 forest *path*, no cycle to repair (dep-order and
-    // tree-dp3 reach the optimum here; cycle repair cannot).
     run_case("cyc acgt48 #.#", sh_gap, rep("ACGT", 48));
-    // Counter-family: a rotation of the same cyclic sequence, where plain
-    // tree-dp is already optimal and repairing the cycle breaks it.
     run_case("cyc gtac48 #.#", sh_gap, rep("GTAC", 48));
     run_case("cyc gtac400 #.#", sh_gap, rep("GTAC", 400));
 
@@ -348,21 +317,19 @@ int main(int argc, char** argv) {
 
     std::cout << "\n=== Summary ===\n"
               << "configs: " << tot.n << "\n"
-              << "unique wins:  greedy=" << tot.win_g
+              << "unique wins:  greedy-size=" << tot.win_g
+              << "  greedy-degree=" << tot.win_gd
               << "  dep-order=" << tot.win_d
-              << "  tree-dp=" << tot.win_t
-              << "  tree-dp3=" << tot.win_t3
-              << "  tree-dp4=" << tot.win_t4
               << "  pseudoforest-dp=" << tot.win_p
+              << "  pseudoforest-dp-iterate=" << tot.win_pi
               << "  ties/shared=" << tot.tie << "\n"
-              << "total |C|:  greedy=" << tot.sum_g
+              << "total |C|:  greedy-size=" << tot.sum_g
+              << "  greedy-degree=" << tot.sum_gd
               << "  dep-order=" << tot.sum_d
-              << "  tree-dp=" << tot.sum_t
-              << "  tree-dp3=" << tot.sum_t3
-              << "  tree-dp4=" << tot.sum_t4
-              << "  pseudoforest-dp=" << tot.sum_p << "\n"
-              << "vs greedy:" << std::fixed << std::setprecision(2);
-    // Stored positions relative to greedy: "fewer" is better, "more" is worse.
+              << "  pseudoforest-dp=" << tot.sum_p
+              << "  pseudoforest-dp-iterate=" << tot.sum_pi << "\n"
+              << "vs greedy-size:" << std::fixed << std::setprecision(2);
+    // Stored positions relative to greedy-size: "fewer" is better, "more" is worse.
     auto vs_greedy = [&](const char* name, long long a) {
         double p = (tot.sum_g == 0)
                        ? 0.0
@@ -370,11 +337,10 @@ int main(int argc, char** argv) {
         std::cout << "  " << name << " " << (p < 0 ? -p : p) << "% "
                   << (p < 0 ? "more" : "fewer");
     };
+    vs_greedy("greedy-degree", tot.sum_gd);
     vs_greedy("dep-order", tot.sum_d);
-    vs_greedy("tree-dp", tot.sum_t);
-    vs_greedy("tree-dp3", tot.sum_t3);
-    vs_greedy("tree-dp4", tot.sum_t4);
     vs_greedy("pseudoforest-dp", tot.sum_p);
+    vs_greedy("pseudoforest-dp-iterate", tot.sum_pi);
     std::cout << "\ncorrectness failures: " << tot.fails << "\n";
     return tot.fails ? 1 : 0;
 }

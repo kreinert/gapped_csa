@@ -8,6 +8,7 @@
 \usetikzlibrary{arrows.meta,positioning}
 \usepackage[T1]{fontenc}
 \usepackage[utf8]{inputenc}
+\usepackage{lmodern}
 \usepackage[expansion=false]{microtype}
 \usepackage{array}
 \usepackage{hyperref}
@@ -117,9 +118,13 @@ All DP algorithms in the repository follow the same formula of DP $\rightarrow$ 
 \end{itemize}
 The compression achieved by \texttt{pseudoforest-dp}'s DP phase is provably no worse than the other algorithms' (\texttt{pseudoforest-dp} sometimes sees more candidates, and never less). However, \texttt{tree-dp3} sometimes achieves the overall best compression with its LNS heurisitc. This heuristic can also replace phase II in \texttt{pseudoforest-dp} to potentially get better results.
 
-\subsection{Iterative DP}
+\subsection{Iterative DP (implemented)}
 
 After one pass of the DP algorithm, some words receive no accepted candidates under the optimal DP solution. These words likely have other (non-preferred) candidates which were invisible to the DP: The leftover pass is aimed towards finding and accepting such candidates. Instead of accepting the leftover viable candidates in the greedy order, we can use DP iteratively on the remaining candidates until no further candidates can be generated.
+
+Implemented behind \texttt{GCSA\_PFDP\_ITERATE=1} (off by default): each further round re-extracts, over the still-unresolved words only, every remaining word's currently \emph{available} best candidate (given what earlier rounds already accepted) and solves that round's pseudoforest exactly again, same as round 0. The loop stops at a fixed point -- a round whose DP accepts nothing -- or at \texttt{GCSA\_PFDP\_MAX\_ROUNDS} if set; it needs no cap to terminate on its own, since a productive round always accepts at least one more word.
+
+This turned out \emph{not} to be a strict improvement over one DP round followed by the leftover pass, which is worth recording since it runs against the intuition that repeating an exact solve can only help. Each round is exact only against its own single up-front snapshot -- one fixed candidate per still-unresolved word, chosen once at the start of that round -- and a word whose candidate loses a conflict inside the round cannot fall back to its second-best candidate until an entirely new round is run. The plain greedy leftover pass has no such restriction: it re-derives "the best still-available candidate" one word at a time against always-current state, so it can fall back to a second choice mid-pass in a way no single DP round can. Measured on the \texttt{bench/} E.\ coli genomes across several shapes and \texttt{--max-add} values, the end-to-end effect (through leftover, and again through Phase II) is a coin flip: usually no change, otherwise a difference of a handful of $|C|$ positions out of several million kept, in either direction -- never large, and never consistently favoring iteration. It is left opt-in pending a wider sweep.
 
 \subsection{Source intervals without LCP depth}
 

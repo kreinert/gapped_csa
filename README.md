@@ -54,26 +54,32 @@ make
 ./bench_repetition
 ./bench_repetition --min-rep 10 --max-rep 100 --step 10 --seed 1
 
-# Compare / choose compression heuristic (g / d / t)
+# Compare / choose compression heuristic (g / gd / d / p / pi)
 ./compare_algos
-./gcsa --algo greedy
+./gcsa --algo greedy-size
+./gcsa --algo greedy-degree        # richer graph (cand_cache), degree-based greedy MWIS
 ./gcsa --algo dep-order
-./gcsa --algo tree-dp             # preference-forest DP + Phase II
-./gcsa --algo tree-dp3            # tree-dp + exact cluster LNS on top of Phase II
-./gcsa --algo tree-dp4            # tree-dp + value-based cycle-edge repair (free)
-GCSA_DISABLE_PHASE2=1 ./gcsa --algo tree-dp -g /tmp/ex.fa -s "#.#"  # forest DP + leftover only (any --algo)
-GCSA_TRACE_DP=1  ./gcsa -g /tmp/ex.fa -s "#.#" --algo tree-dp
-GCSA_TIMING=1    ./gcsa -g genome.fasta -s "#####" --algo tree-dp   # stage timings
-GCSA_THREADS=8   ./gcsa -g genome.fasta -s "#####" --algo tree-dp   # parallel pref/DP (default=hw)
+./gcsa --algo pseudoforest-dp             # exact DP on the preference pseudoforest (single-fire) + Phase II
+./gcsa --algo pseudoforest-dp-iterate     # same DP, iterated to a fixed point, + Phase II
+# Phase II (dirty-set unpin/retarget, then the exact cluster LNS) runs after
+# every algorithm's Phase I, unconditionally -- see run_phase2_and_lns_ in
+# compress.hpp. GCSA_DISABLE_PHASE2 only skips the retarget half; the LNS
+# still runs. GCSA_LNS_ONLY does the opposite: skip the retarget pass, keep
+# the LNS, to measure the LNS alone.
+GCSA_DISABLE_PHASE2=1 ./gcsa --algo dep-order -g /tmp/ex.fa -s "#.#"
+GCSA_LNS_ONLY=1  ./gcsa -g /tmp/ex.fa -s "#.#" --algo pseudoforest-dp
+GCSA_TRACE_PFDP=1 ./gcsa -g /tmp/ex.fa -s "#.#" --algo pseudoforest-dp
+GCSA_TIMING=1    ./gcsa -g genome.fasta -s "#####" --algo pseudoforest-dp   # stage timings
+GCSA_THREADS=8   ./gcsa -g genome.fasta -s "#####" --algo pseudoforest-dp   # parallel pref/DP (default=hw)
 # Phase II runs a fixed 100 dirty generations (or fewer, if it reaches a fixed
 # point first). Precedence: --phase2-iters > GCSA_PHASE2_MAX_ITERS > default.
 # A budget below the fixed point may increase |C|:
-./gcsa -g genome.fasta -s "#####" --algo tree-dp --phase2-iters 25
-GCSA_PHASE2_MAX_ITERS=2 ./gcsa -g genome.fasta -s "#####" --algo tree-dp
+./gcsa -g genome.fasta -s "#####" --algo pseudoforest-dp --phase2-iters 25
+GCSA_PHASE2_MAX_ITERS=2 ./gcsa -g genome.fasta -s "#####" --algo pseudoforest-dp
 # Optional adaptive early-stop, disabled by default (STALL=0). Stops when
 # consecutive dirty generations each reduce |C| by < MIN_GAIN kept positions;
 # the iteration budget still applies:
-# GCSA_PHASE2_MIN_GAIN=2 GCSA_PHASE2_STALL=2 ./gcsa -g genome.fasta -s "#####" --algo tree-dp
+# GCSA_PHASE2_MIN_GAIN=2 GCSA_PHASE2_STALL=2 ./gcsa -g genome.fasta -s "#####" --algo pseudoforest-dp
 
 # Exact |C| ILP baseline on small texts (needs cbc or glpsol on PATH)
 ./ilp_baseline "ACGTCTTAAACCCTCGTCTTAAACCCAACGTCTTAAACCC" "#.#"
@@ -81,11 +87,15 @@ GCSA_PHASE2_MAX_ITERS=2 ./gcsa -g genome.fasta -s "#####" --algo tree-dp
 # Smaller, faster, NOT a valid lower bound — for inspecting the heuristics' view:
 ./ilp_baseline "GCCTTTAAAGGCCTTTAAAGGCCTTTAAAG" "#.#" --universe legacy
 # Drop intra-interval links from the heuristics' candidate sets (pre-unification):
-GCSA_INTRA_LINKS=0 ./gcsa --algo greedy
+GCSA_INTRA_LINKS=0 ./gcsa --algo greedy-size
 # Let the heuristics' own candidate search merge source runs across an LCP dip
 # (not just numeric adjacency, which is what correctness actually needs; off
 # by default -- see "Link universe" below):
 GCSA_CROSS_LCP=1 ./gcsa -g genome.fasta -s "#####" --algo pseudoforest-dp
+# --algo pseudoforest-dp-iterate above is the first-class way to iterate the
+# DP; the old env-var toggle still works as a legacy override on plain
+# pseudoforest-dp, for scripts that set it:
+GCSA_PFDP_ITERATE=1 ./gcsa -g genome.fasta -s "#####" --algo pseudoforest-dp
 ```
 
 Shapes use `#` (care) and `.` (don't care), e.g. `#.#`, `##.##`, `#..#..#`.
@@ -164,21 +174,27 @@ compression on a 180 kb repetitive input: `####.####` → **40% of the full SA**
 
 ## Limitations & research extensions
 
-- **Source selection**: five heuristics — `greedy`, `dep-order`, `tree-dp`
-  (preference-forest DP KEEP vs COMPRESS, then Phase II unpin/retarget),
-  `tree-dp3` (same forest DP, Phase II unpin/retarget followed by the exact
-  cluster LNS below), and `tree-dp4` (`tree-dp` plus cycle-edge repair
-  below). `GCSA_DISABLE_PHASE2=1` runs any of these with the forest DP +
-  leftover greedy alone, no Phase II. Use `./gcsa --algo <name>` or
-  `./compare_algos`.
-  Tree-dp preference enumeration and per-root forest DP are parallelized via
-  `std::thread` (`GCSA_THREADS=N`, default=`hardware_concurrency`). Set
-  `GCSA_TIMING=1` for per-phase ms (pref / forest / dp / accept / leftover /
-  Phase II; Phase II also prints the generation it reached out of the budget
-  and why it stopped, as `gen X/Y (<budget source>, stop=<reason>)` with
-  `reason` one of `fixed-point|max-iters|adaptive-stall`).
-  Leftover greedy reuses the static candidate cache (no re-enum).
-  Forest cycle checks walk the parent chain; DP uses dense node ids.
+- **Source selection**: five heuristics — `greedy-size` (availability-aware,
+  largest-coverage-first; formerly named `greedy`), `greedy-degree` (degree-aware
+  greedy MWIS on a richer graph, below), `dep-order`, `pseudoforest-dp`
+  (exact DP on the full preference pseudoforest, below, single-fire), and
+  `pseudoforest-dp-iterate` (the same DP, iterated to a fixed point, below).
+  Every one of these builds its own initial accepted set (its "Phase I"),
+  then hands it to the same shared Phase II unconditionally: the dirty-set
+  unpin/retarget pass followed by the exact cluster LNS (see
+  `run_phase2_and_lns_` in `compress.hpp`). `GCSA_DISABLE_PHASE2=1` skips
+  just the retarget half (the LNS still runs) so any algorithm's Phase I /
+  DP output can be inspected on its own; `GCSA_LNS_ONLY=1` does the reverse,
+  skipping the retarget pass and running the LNS alone. Use
+  `./gcsa --algo <name>` or `./compare_algos`.
+  Candidate/preference enumeration in `greedy-degree`, `dep-order`, and
+  `pseudoforest-dp`/`pseudoforest-dp-iterate` is parallelized via
+  `std::thread` (`GCSA_THREADS=N`, default=`hardware_concurrency`), as is
+  Phase II's dirty-set re-enumeration for every algorithm. Set
+  `GCSA_TIMING=1` for per-phase ms (Phase I / accept / Phase II; Phase II
+  also prints the generation it reached out of the budget and why it
+  stopped, as `gen X/Y (<budget source>, stop=<reason>)` with `reason` one
+  of `fixed-point|max-iters|adaptive-stall`).
   Phase II runs a fixed budget of 100 dirty generations
   (`kPhase2DefaultIters`), stopping earlier if it reaches a fixed point. The
   budget comes from `--phase2-iters N`, else `GCSA_PHASE2_MAX_ITERS`, else the
@@ -186,8 +202,8 @@ compression on a 180 kb repetitive input: `####.####` → **40% of the full SA**
   adaptive early-stop
   (`GCSA_PHASE2_MIN_GAIN`, `GCSA_PHASE2_STALL`) ends generations when kept-drop
   plateaus, but is disabled by default (`GCSA_PHASE2_STALL=0`).
-- **Phase II cluster LNS (`tree-dp3`)**: since `|C| = m -` total coverage and
-  the only constraints are one link per name plus "a chosen link's sources are
+- **Phase II cluster LNS**: since `|C| = m -` total coverage and the only
+  constraints are one link per name plus "a chosen link's sources are
   not covered by another chosen link" (both *pairwise* — there is no acyclicity
   requirement), a small set of names can be re-optimized *exactly* with the rest
   of the assignment frozen. Names are dependent when one's candidate sources
@@ -196,15 +212,16 @@ compression on a 180 kb repetitive input: `####.####` → **40% of the full SA**
   Sharing a source is deliberately *not* a dependency — sources are read-only,
   so two links may share them. This recovers the ILP optimum on the two known
   forest-restriction counterexamples (`ACACACACACAC`, `ACGTACGTACGTACGTACGT`).
-  It runs after the retarget loop rather than instead of it: retargeting reaches
-  composite-`add` links the static candidate cache does not hold. Knobs:
+  It runs after the retarget loop rather than instead of it, for every
+  algorithm (see `run_phase2_and_lns_`): retargeting reaches composite-`add`
+  links the static candidate cache does not hold. Knobs:
   `GCSA_LNS_CLUSTER` (max names per cluster, default 8), `GCSA_LNS_OPTS`
   (candidates considered per name, 12), `GCSA_LNS_DEGREE` (dependency-graph
   degree cap, 16), `GCSA_LNS_NODES` (enumeration budget per cluster, 20000;
   clusters that exceed it retry at size 4), `GCSA_LNS_ONLY=1` (skip the retarget
   loop and run the LNS alone), `GCSA_TRACE_LNS=1`. The payoff grows with
-  `--max-add`: on `./compare_algos --max-add 16` it beats `tree-dp` on 122 of
-  139 configs and none worse (213078 vs 252329 total `|C|`).
+  `--max-add`; on a `--max-add 16` sweep the LNS beat the retarget loop alone
+  on the large majority of configs and never lost.
   `GCSA_LNS_CLUSTER` and `GCSA_LNS_NODES` bind *jointly*, and raising them
   together is the single largest quality lever: a bigger `--max-add` densifies
   the dependency graph, so a fixed 8-name ball covers less of each name's real
@@ -214,16 +231,73 @@ compression on a 180 kb repetitive input: `####.####` → **40% of the full SA**
   (`--max-add 16`: 233826 at 20000 nodes vs 169388 at 400000). `GCSA_LNS_AUTO=1`
   sizes both from the measured mean degree. It is off by default because it
   costs 30-80x runtime — a dial, not a free win.
-- **Phase I cycle-edge repair (`tree-dp4`)**: the preference forest gives each
-  name one edge to its preferred source and drops any edge that would close a
-  cycle — but *which* edge dies is decided by name order, not by value. On
-  `ACACACACACAC` that keeps a coverage-3 edge and discards the coverage-4 one.
-  This pass instead drops the cycle's least-valuable edge; adding the closing
-  edge creates exactly one cycle, so removing any single edge of it keeps the
-  forest acyclic. It runs inside forest construction (`forest=10.3ms` →
-  `10.1ms` on a 22.7 s input, i.e. free) and reaches the optimum on
-  `ACACACACACAC`. `GCSA_CYCLE_MIN_GAIN` (default 1) is the coverage improvement
-  required before rewiring mid-chain.
+- **Exact pseudoforest DP (`pseudoforest-dp`)**: instead of a forest, builds
+  every still-unresolved name's *preference* graph directly — its single
+  best candidate, out-degree ≤ 1 (a name has at most one preferred source),
+  with a real edge only when that candidate's source rank range actually
+  overlaps the covered set of the source's own preferred candidate. This
+  graph is a pseudoforest (every component is a tree, or a tree plus one
+  extra edge closing a single cycle — see `doc/exact_pseudoforest_dp.pdf`,
+  "Sparsifying the graph"), so no edge is ever dropped to force acyclicity
+  (unlike a plain preference-forest build): tree components solve with a KEEP vs
+  COMPRESS recurrence, and each unicyclic component's one cycle is solved
+  exactly by fixing one cycle node's status and folding the ring into two
+  forced scenarios (whichever is cheaper). A single greedy leftover sweep
+  then mops up whatever the one-candidate-per-name sparsification couldn't
+  see (every candidate for a name, not just its preferred one — including
+  self-references), followed by Phase II. `GCSA_PFDP_RANK_AWARE=0` reverts
+  to treating every candidate-with-a-preference as a real dependency edge
+  (the pre-conflict-checked, more conservative graph). `GCSA_TRACE_PFDP=1`
+  dumps each round's graph and cycle folds.
+  `--algo pseudoforest-dp-iterate` (or the legacy `GCSA_PFDP_ITERATE=1`
+  override on plain `pseudoforest-dp`) repeats the extract/solve step to a
+  fixed point — each further round re-extracting the *currently available*
+  best candidate for every still-unresolved name over the shrunk residual
+  instance — before ever falling back to the leftover sweep (the doc's
+  "Iterative DP" idea, `GCSA_PFDP_MAX_ROUNDS` caps the round count if ever
+  needed, unbounded by default). Kept as its own algorithm rather than a
+  hidden env-var toggle so it can be swept and compared on equal footing
+  with the rest. This is not a strict win despite every round being an exact
+  solve: each round commits, in one batch snapshot, to one candidate per
+  name and can't fall back to that name's second-best candidate within the
+  round the way the live, one-at-a-time leftover sweep can. Measured on the
+  `bench/` E. coli genomes across shapes and `--max-add`, the end-to-end
+  effect is a coin flip — usually zero, otherwise a handful of `|C|`
+  positions out of several million kept, in either direction — so it's off
+  by default pending a wider sweep.
+- **Degree-aware greedy MWIS (`greedy-degree`)**: `greedy-size` weighs a
+  candidate only by its own coverage, ignoring how many *other* words'
+  candidates it knocks out by consuming their shared source rows.
+  `greedy-degree` builds a richer conflict graph -- every word's full
+  `cand_cache` (up to 64 candidates each, the existing cap that keeps this
+  from re-enumerating the full link universe and OOMing), not just each
+  word's single preferred pick -- and scores each candidate as
+  `coverage - sum(best still-conflicting candidate's coverage, one term per
+  distinct conflicting word)`, popped in decreasing score order via a lazy
+  priority queue (stale entries are recomputed on pop and re-pushed; a
+  candidate's true score only rises as conflicting words resolve, so a
+  popped entry matching its pushed score is provably the current max -- no
+  separate leftover pass is needed). Same-word candidates are *not*
+  materialized as graph edges (that would be `O(64^2)` per word and is
+  redundant with `accept_()`'s own exclusivity bookkeeping); a word drops
+  out of every remaining candidate's penalty the moment any of its own
+  candidates is accepted, via a resolved-words set. The penalty term must be
+  each conflicting word's *locally* best conflicting candidate, not that
+  word's globally preferred one -- using the global preference would just
+  reconstruct `pseudoforest-dp`'s own preference edges and add no
+  information beyond what the exact DP already solves. Availability
+  (`accept_()`/`cand_available_()`) is authoritative throughout, same as
+  every other algorithm. `GCSA_TRACE_GREEDY_DEGREE=1` traces each accept.
+  Empirically mixed so far (measured via `./compare_algos`, not yet swept as
+  widely as the others): on shorter/lower-repetition synthetic inputs it can
+  lose to plain `greedy-size` by a few percent `|C|`, since the richer graph
+  sometimes talks itself out of a locally-large candidate over conflicts that
+  never actually collide once resolution order is fixed; on more repetitive
+  inputs (more reps of a fixed motif) it converges to within a fraction of a
+  percent of `dep-order`/`pseudoforest-dp` and can beat
+  `greedy-size` outright (e.g. ~3.4% fewer kept positions on a `motif-len 200`
+  / `reps 40..100` sweep). Correctness (self-test + serialized round-trip) is
+  clean in every configuration tried.
 - **Link universe (what a differential link may look like)**: an `H_offset`
   entry `(pos, add, num)` decodes to `{C[pos+t] + add*span}`, i.e. it reads
   `num` consecutive *kept* entries of `C` and shifts them. A link is therefore
