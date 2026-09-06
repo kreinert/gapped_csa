@@ -340,7 +340,7 @@ DATASETS = [
          source="NCBI RefSeq GCF_048569015.1 (ASM4856901v1)",
          url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/569/015/"
               "GCF_048569015.1_ASM4856901v1/GCF_048569015.1_ASM4856901v1_genomic.fna.gz"),
-         sha256="bcea236599a7e8194b4e1a9475d220f1949ae00dbb65f6b27823ab9e606ab760"),
+         sha256="6b449c0f341ccc448d1de7ba2e61d449cf66d0c336257e4caa673d46131498c5"),
     dict(name="ecoli_043", category="real_genome_pool", kind="fetched",
          source="NCBI RefSeq GCF_048571005.1 (ASM4857100v1)",
          url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/048/571/005/"
