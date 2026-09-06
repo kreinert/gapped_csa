@@ -26,7 +26,7 @@ outside the git repo entirely as a sibling of gapped_csa/).
   "concat": resolves each entry in `refs` (also "@name" references) and
       concatenates their FASTAs, in order, into one file under --tmp-dir.
       Used for a *real* (not simulated-divergence) multi-strain pangenome
-      entry -- three distinct real genomes glued together, no seed or
+      entry -- several distinct real genomes glued together, no seed or
       divergence knob because there's nothing being simulated.
 
 A dataset's `args` (synthetic) or `refs` (concat) list may reference another
@@ -38,7 +38,7 @@ deliberately not decided here -- see config.py. Nothing in this file (or
 anywhere else tracked by git) should hardcode a real filesystem path.
 """
 
-# Ordered pool of 100 real strains for the n=8/16/32/64/100 real-strain
+# Ordered pool of 100 real strains for the n=1/10/100 real-strain
 # pangenome sweep below, each entry taking a prefix of this list.
 # Aug-28 update: this used to be 16 strains hand-ordered to span
 # pathotypes/phylogroups (see git history) -- replaced wholesale with a
@@ -71,22 +71,26 @@ REAL_ECOLI_STRAIN_POOL = [
 
 DATASETS = [
     # --- A. random --------------------------------------------------------
-    dict(name="random_1e5", category="random", kind="synthetic",
-         generator="simulate_random", args=["-n", "100000", "--seed", "1"]),
+    # A single 1MB uniformly-random sequence -- the "no repeat structure at
+    # all" synthetic baseline.
     dict(name="random_1e6", category="random", kind="synthetic",
          generator="simulate_random", args=["-n", "1000000", "--seed", "1"]),
-    dict(name="random_1e7", category="random", kind="synthetic",
-         generator="simulate_random", args=["-n", "10000000", "--seed", "1"]),
 
-    # --- B. repetitive (tunable %) -----------------------------------------
-    dict(name="repeat_100pct_x50_y200", category="repetitive", kind="synthetic",
-         generator="simulate_repeats", args=["-x", "50", "-y", "200", "--seed", "1"]),
-    dict(name="repeat_50pct_x50_y200", category="repetitive", kind="synthetic",
-         generator="simulate_repeats",
-         args=["-x", "50", "-y", "200", "--repetitive-frac", "0.5", "--seed", "1"]),
-    dict(name="repeat_10pct_x50_y200", category="repetitive", kind="synthetic",
-         generator="simulate_repeats",
-         args=["-x", "50", "-y", "200", "--repetitive-frac", "0.1", "--seed", "1"]),
+    # --- B. repetitive (tunable %, tunable repeat length) --------------------
+    # Multiple copies of a fixed repeat unit, followed by a non-repetitive
+    # random block. Two knobs are swept: repetitiveness (what fraction of
+    # the output is the repeat block -- 100% / 50% / 10%, via
+    # --repetitive-frac) and repeat length (-x = number of copies, -y =
+    # length of each copy in bp). x*y is held at 10000bp across all three
+    # (x, y) pairs below, so only the *shape* of the repeat varies (many
+    # short copies vs. few long ones), not its total footprint.
+    *[dict(name=f"repeat_{pct}pct_x{x}_y{y}", category="repetitive", kind="synthetic",
+           generator="simulate_repeats",
+           args=(["-x", str(x), "-y", str(y)]
+                 + (["--repetitive-frac", str(frac)] if frac != 1.0 else [])
+                 + ["--seed", "1"]))
+      for x, y in ((50, 200), (100, 100), (200, 50))
+      for pct, frac in ((100, 1.0), (50, 0.5), (10, 0.1))],
 
     # --- C. real genomes -----------------------------------------------
     # Aug-28 update: the 16 hand-picked, pathotype-diverse E. coli strains
@@ -123,14 +127,6 @@ DATASETS = [
          url=("https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/003/697/165/"
               "GCF_003697165.2_ASM369716v2/GCF_003697165.2_ASM369716v2_genomic.fna.gz"),
          sha256="17124ac56df45b547706ddb0b2a56274d893022f42fe445afb5a08e19eb874b1"),
-    dict(name="dmel_genome", category="real_genome", kind="fetched",
-         source="UCSC dm6 (= Ensembl BDGP6.46 / GCA_000001215.4), whole genome, soft-masked",
-         url="https://hgdownload.soe.ucsc.edu/goldenPath/dm6/bigZips/dm6.fa.gz",
-         sha256="2c211a6789ebaee418ecf9df847daee6d60e14d9b3377a2e55678890a212d7a9"),
-    dict(name="human_chr21", category="real_genome", kind="fetched",
-         source="UCSC hg38 (= GRCh38), chromosome 21 only",
-         url="https://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/chr21.fa.gz",
-         sha256="35c71b68436d1a278ecb6a1e875af3ba4020738a028a7feac769a6d62790ae1f"),
 
     # The other 99 strains in the 100-strain "very similar" pool -- category
     # real_genome_pool (NOT real_genome) so they feed REAL_ECOLI_STRAIN_POOL
@@ -647,30 +643,16 @@ DATASETS = [
     dict(name="human_freq_kmers", category="freq_kmers", kind="provided",
          path="human_freq_skmers.fasta"),
 
-    # --- E. pangenome sweep -------------------------------------------------
-    # Same reference, same divergence; strain count is the one variable the
-    # email asks about (1, 2, 4, 8). "@ecoli_003" is resolved to that
-    # dataset's local path by run_suite.py before simulate_pangenome runs --
-    # takes over ecoli_k12's old role here (Aug-28 strain swap, see S3C).
-    *[dict(name=f"pangenome_ecoli_n{n}", category="pangenome", kind="synthetic",
-           generator="simulate_pangenome",
-           args=["-r", "@ecoli_003", "-n", str(n), "--divergence", "0.01", "--seed", "1"])
-      for n in (1, 2, 4, 8)],
-
-    # Real-strain counterpart (secondary/stretch goal per the design doc):
-    # genuinely distinct, independently-sequenced E. coli genomes
-    # concatenated, rather than one reference plus simulated point mutations.
-    # kind="concat" just cats the resolved FASTAs of `refs` together --
-    # no divergence knob, no seed, because there's nothing to simulate.
-    #
-    # Aug-28 update: the old n=3/8/16 sweep (over the 16-strain pool) is now
-    # n=8/16/32/64/100 over the 100-strain pool -- same doubling pattern,
-    # extended up to the full pool now that far more strains are available.
-    # No more dedicated n=3 sanity-check entry (that was specifically
-    # K-12+Sakai+CFT073; those three no longer have a special role here).
+    # --- E. E. coli pangenome collections (1, 10, 100 genomes, ~95% identity)
+    # Real, independently-sequenced strains from the 100-strain pool above
+    # (REAL_ECOLI_STRAIN_POOL), concatenated -- not simulated divergence.
+    # kind="concat" just cats the resolved FASTAs of `refs` together, in
+    # pool order (ecoli_003 first, so every larger n's collection is a
+    # superset of every smaller n's). Matches the paper's "(1) collections
+    # of 1, 10, and 100 E. coli genomes sharing 95% identity" real dataset.
     *[dict(name=f"pangenome_ecoli_real_n{n}", category="pangenome", kind="concat",
            refs=REAL_ECOLI_STRAIN_POOL[:n])
-      for n in (8, 16, 32, 64, 100)],
+      for n in (1, 10, 100)],
 ]
 
 # Shapes to sweep per dataset. Trimmed down from the weight-30 family in
