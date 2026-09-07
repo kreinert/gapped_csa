@@ -69,6 +69,18 @@ REAL_ECOLI_STRAIN_POOL = [
     "@ecoli_096", "@ecoli_097", "@ecoli_098", "@ecoli_099", "@ecoli_100",
 ]
 
+# Categories that exist only to be referenced by "@name" from other entries
+# (the real_genome_pool strains feed REAL_ECOLI_STRAIN_POOL above, which
+# feeds the pangenome_ecoli_real_n{1,10,100} concat entries below; ecoli_003
+# is both the pool's first strain and a concat ingredient in its own right)
+# -- not meant to be run through the full shape x algo x max_add grid on
+# their own. run_suite.py excludes them from a default (no
+# --only-category/--only-dataset) sweep; by_name resolution for "@name"
+# refs is unaffected either way since it's built from the unfiltered
+# DATASETS. Pass --only-category real_genome_pool (or --only-dataset
+# ecoli_042 etc.) if you deliberately want to sweep one of these directly.
+INGREDIENT_ONLY_CATEGORIES = {"real_genome", "real_genome_pool"}
+
 DATASETS = [
     # --- A. random --------------------------------------------------------
     # A single 1MB uniformly-random sequence -- the "no repeat structure at

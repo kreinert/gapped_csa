@@ -80,7 +80,8 @@ import time
 from pathlib import Path
 
 import config
-from datasets import ALGOS, DATASETS, MAX_ADDS, SHAPES, SKIP_SELFTEST_ABOVE_BYTES
+from datasets import (ALGOS, DATASETS, INGREDIENT_ONLY_CATEGORIES, MAX_ADDS,
+                      SHAPES, SKIP_SELFTEST_ABOVE_BYTES)
 
 CSV_FIELDS = [
     "dataset", "category", "path", "raw_bytes", "gzip_bytes", "gzip_ratio",
@@ -449,7 +450,24 @@ def main():
         log_dir.mkdir(parents=True, exist_ok=True)
 
     by_name = {d["name"]: d for d in DATASETS}
-    datasets = DATASETS
+
+    # INGREDIENT_ONLY_CATEGORIES (real_genome / real_genome_pool -- the
+    # E. coli strain pool) are excluded from a default sweep: they're only
+    # meant to be resolved via "@name" by the pangenome concat entries, not
+    # each run through the full shape x algo x max_add grid on their own
+    # (that's what used to add ~100 extra individual-strain experiments to
+    # every run). by_name above is built from the unfiltered DATASETS, so
+    # "@name" resolution for the concat entries still works regardless.
+    # --only-category/--only-dataset explicitly naming one of these
+    # categories or datasets overrides the exclusion.
+    explicit_categories = set(args.only_category or [])
+    explicit_names = set(args.only_dataset or [])
+    datasets = [
+        d for d in DATASETS
+        if d["category"] not in INGREDIENT_ONLY_CATEGORIES
+        or d["category"] in explicit_categories
+        or d["name"] in explicit_names
+    ]
     if args.only_category:
         cats = set(args.only_category)
         datasets = [d for d in datasets if d["category"] in cats]

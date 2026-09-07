@@ -39,7 +39,12 @@ cd bench
 Useful flags:
 
 - `--only-category random repetitive` / `--only-dataset name1 name2` -- scope
-  a run down while iterating.
+  a run down while iterating. Note a plain, no-flags run already excludes
+  `real_genome`/`real_genome_pool` (the individual E. coli strains that only
+  exist to be concatenated into the `pangenome_ecoli_real_n{1,10,100}`
+  entries -- see `INGREDIENT_ONLY_CATEGORIES` in `datasets.py`); pass
+  `--only-category real_genome_pool` or `--only-dataset ecoli_042` etc. if
+  you deliberately want to sweep one of those ~100 individual genomes.
 - `--shapes ... --algos ... --max-adds ...` -- override the sweep in
   `datasets.py` for a quick pass (see `SHAPES`/`ALGOS`/`MAX_ADDS` there for
   the current full default matrix -- real-genome-scale inputs are slow
