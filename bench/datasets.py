@@ -676,6 +676,29 @@ SHAPES = [
     "#" * 30,                        # 30cont
     "#" * 20 + "." * 4 + "#" * 10,    # 20+g4+10
     "#" * 10 + "." * 4 + "#" * 20,    # 10+g4+20
+
+    # Canonical spaced seeds from the literature (Sep-8; see the design doc
+    # for the literature survey these were pulled from). Each comment gives
+    # the seed's original 1/0 bit string and source.
+    "###.#..#.#..##.###",              # PatternHunter optimal seed (Ma,
+                                        # Tromp & Li, Bioinformatics 2002):
+                                        # 111010010100110111, span18/w11,
+                                        # optimized for ~70%-identity DNA
+                                        # homology search.
+    "###.#..##..#.#.####",             # BLASTZ "12of19" (Schwartz, Kent et
+                                        # al., Genome Research 2003; still
+                                        # LASTZ's default today):
+                                        # 1110100110010101111, span19/w12.
+    "##.##.##.##.##.#",                # NCBI discontiguous megablast
+                                        # weight-11/span-16 "coding"
+                                        # template (periodic "drop every
+                                        # 3rd position", in contrast to the
+                                        # two irregular optimized seeds
+                                        # above): 1101101101101101.
+    "###################...#.#.##.#.###..##.##",
+                                        # Mete-supplied shape (Sep-8):
+                                        # 11111111111111111110001010110101110011011,
+                                        # span41/w31.
 ]
 
 # Full retained set: greedy-size and greedy-degree (Phase I greedy variants),
