@@ -59,7 +59,16 @@ Two ways to run this concurrently on a cluster -- combine them freely:
   ...                                               # separate cluster
                                                     # jobs/array tasks, then
                                                     # concatenate the CSVs
-                                                    # (see README). Splits by
+                                                    # (see README). Shards
+                                                    # are balanced by
+                                                    # estimated input size
+                                                    # (fetch_data.py first
+                                                    # for accurate weights),
+                                                    # not split round-robin
+                                                    # by index, so one
+                                                    # shard doesn't get
+                                                    # stuck with every big
+                                                    # dataset. Splits by
                                                     # dataset (not by row) so
                                                     # each dataset's fetch/
                                                     # generate + gzip cost is
@@ -243,6 +252,97 @@ def resolve_path(name: str, by_name: dict, bin_dir: Path, data_dir: Path,
     return path
 
 
+def estimate_input_bytes(name: str, by_name: dict, data_dir: Path, cache: dict) -> int:
+    """Estimate a dataset's resolved FASTA size in bytes, WITHOUT actually
+    generating/fetching/concatenating it -- used to balance --shard
+    partitions by workload rather than by raw dataset count (a
+    pangenome_ecoli_real_n100-sized input takes vastly longer at every
+    shape x algo x max_add combination than random_1e6 does, so splitting
+    datasets round-robin by index can strand one cluster task with every
+    big dataset while the others finish early and sit idle).
+
+    "fetched"/"provided" sizes come from stat()-ing the cached/expected
+    file -- 0 if it hasn't been fetched yet, so balancing is only as good
+    as what's already on disk; run ./fetch_data.py first for accurate
+    weights. "synthetic" sizes are computed directly from the generator's
+    args (no need to actually run the generator). "concat" sizes are the
+    sum of their resolved refs' sizes, recursing through `by_name` the same
+    way resolve_path's own "@name" handling does. Memoized in `cache`,
+    mirroring resolve_path's resolved_cache."""
+    if name in cache:
+        return cache[name]
+    ds = by_name.get(name)
+    if ds is None:
+        cache[name] = 0
+        return 0
+
+    def arg_after(args, flag, default=None):
+        return args[args.index(flag) + 1] if flag in args else default
+
+    size = 0
+    if ds["kind"] == "fetched":
+        p = data_dir / f"{name}.fasta"
+        size = p.stat().st_size if p.exists() else 0
+    elif ds["kind"] == "provided":
+        p = data_dir / ds["path"]
+        size = p.stat().st_size if p.exists() else 0
+    elif ds["kind"] == "synthetic":
+        args, gen = ds["args"], ds["generator"]
+        if gen == "simulate_random":
+            size = int(arg_after(args, "-n", 0))
+        elif gen == "simulate_repeats":
+            x = int(arg_after(args, "-x", 0))
+            y = int(arg_after(args, "-y", 0))
+            frac = float(arg_after(args, "--repetitive-frac", 1.0))
+            size = round(x * y / frac) if frac else x * y
+        elif gen == "simulate_pangenome":
+            n = int(arg_after(args, "-n", 1))
+            ref = arg_after(args, "-r")
+            if ref is not None:
+                ref_name = ref[1:] if ref.startswith("@") else ref
+                size = estimate_input_bytes(ref_name, by_name, data_dir, cache) * n
+            else:
+                size = int(arg_after(args, "-y", 0)) * n
+        # else: unknown generator -- leave size=0 (under- rather than
+        # over-balancing an unrecognized one is the safer failure mode)
+    elif ds["kind"] == "concat":
+        size = sum(
+            estimate_input_bytes(r[1:] if isinstance(r, str) and r.startswith("@") else r,
+                                  by_name, data_dir, cache)
+            for r in ds["refs"]
+        )
+    cache[name] = size
+    return size
+
+
+def balance_shards(datasets: list, weights: dict, shard_n: int) -> "tuple[list, list]":
+    """Greedy longest-processing-time-first bin packing: process datasets
+    heaviest (by `weights`) first, always adding the next one to whichever
+    of the `shard_n` bins currently has the smallest total weight.
+    Deterministic given the same (datasets, weights, shard_n), so every
+    independently-launched `--shard I/N` cluster task computes the
+    identical partition on its own -- no coordination between tasks
+    needed. Not optimal bin-packing (that's NP-hard) but a well-known
+    good-enough heuristic, and simple enough to audit. Degrades to
+    (unbalanced, but still deterministic) grouping if every weight is 0 --
+    e.g. nothing has been fetched yet, see estimate_input_bytes.
+    Returns (bins, bin_totals)."""
+    order = sorted(range(len(datasets)), key=lambda i: (-weights[datasets[i]["name"]], i))
+    totals = [0] * shard_n
+    bins = [[] for _ in range(shard_n)]
+    for i in order:
+        b = min(range(shard_n), key=lambda b: (totals[b], b))
+        bins[b].append(datasets[i])
+        totals[b] += weights[datasets[i]["name"]]
+    # Re-sort each shard's members back into their original relative order
+    # -- purely cosmetic (readable --dry-run/log output), doesn't affect
+    # which dataset ended up in which shard.
+    order_index = {id(d): idx for idx, d in enumerate(datasets)}
+    for b in bins:
+        b.sort(key=lambda d: order_index[id(d)])
+    return bins, totals
+
+
 def already_done(out_csv: Path) -> set:
     if not out_csv.exists():
         return set()
@@ -400,16 +500,27 @@ def main():
                           "than just hiding I/O wait. Default 1 (sequential, unchanged "
                           "from before this flag existed).")
     ap.add_argument("--shard", default=None, metavar="I/N",
-                     help="process only the datasets at index i where i %% N == I (0-based "
-                          "I, e.g. --shard 0/4 .. --shard 3/4 for four cluster array "
-                          "tasks). Splits by dataset, not by row, so each dataset's "
-                          "fetch/generate + gzip cost is paid once total, not once per "
-                          "shard -- combine with --jobs for finer-grained parallelism "
-                          "within one shard. Filters AFTER --only-category/--only-dataset, "
-                          "over whatever's left. Each shard needs its own --out (see "
-                          "--out's default); concatenate the resulting CSVs afterward "
-                          "(same header on every shard, so `head -1 s0.csv > merged.csv "
-                          "&& tail -n +2 -q s*.csv >> merged.csv` works) -- see README.")
+                     help="process only shard I of N (0-based I, e.g. --shard 0/4 .. "
+                          "--shard 3/4 for four cluster array tasks). Datasets are "
+                          "balanced across the N shards by estimated input size (greedy "
+                          "longest-processing-time-first bin packing -- see "
+                          "estimate_input_bytes/balance_shards), NOT split round-robin by "
+                          "index, so one shard doesn't get stuck with every large dataset "
+                          "while the others finish early and idle. Every --shard I/N "
+                          "invocation recomputes the same partition independently and "
+                          "deterministically -- no coordination between cluster tasks "
+                          "needed. Estimates for fetched/provided datasets come from "
+                          "stat()-ing the cached file, so run ./fetch_data.py first for "
+                          "balancing to reflect real sizes (unfetched ones weigh 0 and "
+                          "may land anywhere). Splits by dataset, not by row, so each "
+                          "dataset's fetch/generate + gzip cost is paid once total, not "
+                          "once per shard -- combine with --jobs for finer-grained "
+                          "parallelism within one shard. Filters AFTER --only-category/"
+                          "--only-dataset, over whatever's left. Each shard needs its own "
+                          "--out (see --out's default); concatenate the resulting CSVs "
+                          "afterward (same header on every shard, so `head -1 s0.csv > "
+                          "merged.csv && tail -n +2 -q s*.csv >> merged.csv` works) -- "
+                          "see README.")
     args = ap.parse_args()
 
     extra_env = {}
@@ -474,9 +585,22 @@ def main():
     if args.only_dataset:
         names = set(args.only_dataset)
         datasets = [d for d in datasets if d["name"] in names]
+    # Estimated input size per dataset (bytes), used to balance --shard
+    # partitions by workload -- see estimate_input_bytes's docstring for
+    # what "estimated" means per dataset kind and its one caveat (fetched/
+    # provided datasets not yet on disk weigh 0). Computed unconditionally
+    # (cheap -- filesystem stat()s and arithmetic, no subprocess calls) so
+    # --dry-run can show it too, not just --shard.
+    size_cache = {}
+    weights = {d["name"]: estimate_input_bytes(d["name"], by_name, data_dir, size_cache)
+               for d in datasets}
+
+    shard_bytes = None
     if args.shard is not None:
         assert shard_i is not None and shard_n is not None  # set together, above
-        datasets = [d for idx, d in enumerate(datasets) if idx % shard_n == shard_i]
+        shard_bins, shard_totals = balance_shards(datasets, weights, shard_n)
+        datasets = shard_bins[shard_i]
+        shard_bytes = shard_totals[shard_i]
 
     def log(msg):
         print(msg, file=sys.stderr)
@@ -484,10 +608,16 @@ def main():
     phase2_label = "off" if args.disable_phase2 else "on"
     log(f"bin-dir={bin_dir}  data-dir={data_dir}  tmp-dir={tmp_dir}  out={out_csv}  "
         f"(run 'python3 config.py' to see where each came from)")
+    shard_log_suffix = ""
+    if args.shard is not None:
+        assert shard_bytes is not None  # set together with shard_i/shard_n, above
+        shard_log_suffix = (f"  shard={shard_i}/{shard_n} ({len(datasets)} dataset(s), "
+                             f"~{shard_bytes / 1e6:.1f} MB estimated input -- balanced by "
+                             f"size, not by dataset count)")
     log(f"phase2={phase2_label}"
         + (f"  log-dir={log_dir}" if log_dir is not None else "  log-dir=(disabled)")
         + f"  jobs={args.jobs}"
-        + (f"  shard={shard_i}/{shard_n} ({len(datasets)} dataset(s))" if args.shard is not None else ""))
+        + shard_log_suffix)
     if extra_env:
         log("extra env: " + " ".join(f"{k}={v}" for k, v in extra_env.items())
             + "  (also GCSA_SKIP_SELFTEST=1 automatically on inputs over "
@@ -498,7 +628,9 @@ def main():
               f"{len(args.algos)} algos x {len(args.max_adds)} max_adds = "
               f"{len(datasets) * len(args.shapes) * len(args.algos) * len(args.max_adds)} rows")
         for d in datasets:
-            print(f"  {d['name']:<28} category={d['category']:<12} kind={d['kind']}")
+            mb = weights[d["name"]] / 1e6
+            print(f"  {d['name']:<28} category={d['category']:<12} kind={d['kind']:<10} "
+                  f"~{mb:.2f} MB")
         return
 
     if args.resume:

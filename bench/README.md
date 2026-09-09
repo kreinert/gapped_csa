@@ -87,17 +87,29 @@ Useful flags:
   same behavior as before this flag existed). Output is identical to a
   sequential run either way (same rows, same `--log-dir` files, same
   `--resume` behavior) -- only the wall-clock time and row order change.
-- `--shard I/N` -- process only the datasets at index i where `i % N == I`
-  (0-based I), e.g. `--shard 0/4` .. `--shard 3/4` to split one run across
-  four independent cluster array tasks. Splits by dataset, not by row, so
-  every `(shape, algo, max_add)` combination for a given dataset lands in
-  the same shard. Filters *after* `--only-category`/`--only-dataset`, over
-  whatever's left. Each shard needs its own `--out` so parallel jobs don't
-  clobber each other's file -- if you don't pass `--out` explicitly while
-  using `--shard`, one is picked for you (`results/suite.shard<I>of<N>.csv`).
-  Combine `--shard` with `--jobs` for a two-level cluster setup (N array
-  tasks, each running up to `--jobs` invocations at once) -- for example, a
-  SLURM array job:
+- `--shard I/N` -- process only shard I of N (0-based I), e.g. `--shard 0/4`
+  .. `--shard 3/4` to split one run across four independent cluster array
+  tasks. Datasets are balanced across the N shards by *estimated input
+  size* (greedy longest-processing-time-first bin packing over each
+  dataset's resolved FASTA byte count -- see `estimate_input_bytes`/
+  `balance_shards` in `run_suite.py`), not split round-robin by index --
+  so a shard with a `pangenome_ecoli_real_n100`-sized dataset in it isn't
+  stuck running for hours after every other shard has already finished
+  (this used to happen with the old index-based split). `--dry-run` prints
+  each dataset's estimated size, and a `--shard` run logs its shard's
+  total. Every `--shard I/N` invocation recomputes the same partition
+  independently and deterministically, so cluster array tasks don't need
+  to coordinate. One caveat: size estimates for `fetched`/`provided`
+  datasets come from stat-ing the cached file, so run `./fetch_data.py`
+  first -- anything not yet on disk weighs 0 and can land in any shard.
+  Splits by dataset, not by row, so every `(shape, algo, max_add)`
+  combination for a given dataset lands in the same shard. Filters *after*
+  `--only-category`/`--only-dataset`, over whatever's left. Each shard
+  needs its own `--out` so parallel jobs don't clobber each other's file --
+  if you don't pass `--out` explicitly while using `--shard`, one is
+  picked for you (`results/suite.shard<I>of<N>.csv`). Combine `--shard`
+  with `--jobs` for a two-level cluster setup (N array tasks, each running
+  up to `--jobs` invocations at once) -- for example, a SLURM array job:
   ```bash
   ./run_suite.py --shard $SLURM_ARRAY_TASK_ID/$SLURM_ARRAY_TASK_COUNT \
                   --jobs $SLURM_CPUS_PER_TASK
