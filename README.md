@@ -190,7 +190,22 @@ compression on a 180 kb repetitive input: `####.####` → **40% of the full SA**
   Candidate/preference enumeration in `greedy-degree`, `dep-order`, and
   `pseudoforest-dp`/`pseudoforest-dp-iterate` is parallelized via
   `std::thread` (`GCSA_THREADS=N`, default=`hardware_concurrency`), as is
-  Phase II's dirty-set re-enumeration for every algorithm. Set
+  Phase II's dirty-set re-enumeration for every algorithm, and as is
+  `pseudoforest-dp`'s leftover greedy sweep -- that sweep re-enumerates each
+  still-unresolved word's best *available* candidate, which dominates its
+  cost (~43-54us/word, and ~30% of a `pseudoforest-dp` run's wall clock on
+  the pangenome / frequent-k-mer inputs) and is independent per word, so it
+  is enumerated in parallel and then accepted sequentially in the same
+  size-descending order as before. This is exact rather than approximate:
+  within the sweep `accept_` only ever raises `removed_`/`pin_count_`, so
+  availability shrinks monotonically and a precomputed candidate that is
+  still available is still that word's best; one that has gone is simply
+  re-enumerated, exactly as the old sequential loop did for every word.
+  `GCSA_LEFTOVER_PARALLEL=0` restores the original one-word-at-a-time sweep
+  (for A/B timing), and `GCSA_LEFTOVER_CHUNK=N` (default 1048576) sets how
+  many words are enumerated per batch, bounding the extra memory. With
+  `GCSA_TIMING=1` the sweep reports `words=`, `accepted=` and `rechecked=`
+  so the fast-path hit rate is visible. Set
   `GCSA_TIMING=1` for per-phase ms (Phase I / accept / Phase II; Phase II
   also prints the generation it reached out of the budget and why it
   stopped, as `gen X/Y (<budget source>, stop=<reason>)` with `reason` one
@@ -255,7 +270,55 @@ compression on a 180 kb repetitive input: `####.####` → **40% of the full SA**
   best candidate for every still-unresolved name over the shrunk residual
   instance — before ever falling back to the leftover sweep (the doc's
   "Iterative DP" idea, `GCSA_PFDP_MAX_ROUNDS` caps the round count if ever
-  needed, unbounded by default). Kept as its own algorithm rather than a
+  needed, unbounded by default).
+  Those later rounds pick from round 0's cached, availability-agnostic
+  top-`kCandCacheDefaultCap` (64) list per word, so once accepts have consumed
+  a word's whole cached list it leaves the DP for good even though the SA may
+  still hold available lower-coverage candidates for it — which is exactly
+  what the leftover sweep afterwards picks up, and why `pfdpi`'s leftover gain
+  is small but never zero. `GCSA_PFDP_REENUM=1` (off by default) repairs
+  exactly that case. Later rounds still read the cache first; a word whose
+  cached list yields nothing available *and* was truncated by the cap then
+  re-enumerates from the SA with the availability filter on, recovering the
+  candidates the cap hid. Both conditions matter -- a word whose list was
+  never capped already has its whole universe cached, so if none of it is
+  available then none exists, and re-enumerating it would be pure waste.
+  That targeting is what keeps this cheap: on `t_big`/`#####`/`--max-add
+  1024` the repair fires for one word and adds +101ms / +134ms on rounds 1
+  and 2 (1.08x the candidate-enumeration total), where blanket
+  re-enumeration of every unresolved word cost +1494ms / +1450ms for the
+  identical result (1.95x). Rounds enumerate over *intervals*, not over DP
+  nodes, which is why the blanket form is so expensive: accepting a few
+  hundred words barely shrinks the population walked next round, so round 1
+  re-enumerates almost as many words as round 0 to discover that only a
+  handful still have a usable candidate. The cache is never written with a
+  filtered list: Phase II still reads round 0's unfiltered universe and
+  filters it for itself. `GCSA_TIMING=1` reports how many words each round's
+  repair recovered. Measured on 70 synthetic configurations it moved the
+  leftover sweep's work into the exact DP (`n_leftover` dropping to 0
+  wherever it had been non-zero) with final `|C|` unchanged in every one --
+  i.e. it fixes the blindness, but on those inputs the greedy sweep was
+  already reaching the same solution the DP does.
+  The point of that is structural: if per-round re-enumeration means the
+  leftover sweep can never accept anything, the pipeline collapses from four
+  stages (DP / leftover / retarget / LNS) to three, which is materially easier
+  to describe. That redundancy is *checked, not assumed*. It does not follow by
+  construction -- a candidate whose source name is absent from the graph's
+  `by_name` is dropped, and the round loop stops on "the DP chose nothing"
+  rather than "no candidate remains" -- so an iterating, re-enumerating run
+  that reaches its own fixed point and *then* sees the sweep accept a word
+  prints a loud `[INVARIANT-VIOLATION]` line, and `GCSA_TIMING=1` records
+  `invariant=held|VIOLATED|n/a` on every run (`n/a` when the premise does not
+  apply: single-fire, re-enumeration off, or `GCSA_PFDP_MAX_ROUNDS` cutting
+  the loop short). Across the 70 configurations the invariant held on all 70;
+  the warning path itself was exercised by disabling the repair in a throwaway
+  build, which correctly reported 37 surviving words. Note the synthetic set is
+  a weak test -- 62 of those 70 already had `n_leftover == 0` without the
+  change, so only 8 genuinely exercised it. The pangenome and frequent-k-mer
+  inputs, where the sweep resolves thousands of words, are the real check. Worth re-measuring on the pangenome
+  and frequent-k-mer inputs, where the leftover sweep resolves far more words
+  (67k on `pangenome_ecoli_real_n10`, 10k on `kestrel_freq_kmers`) and so has
+  more chance to be beaten by an exact solve. Kept as its own algorithm rather than a
   hidden env-var toggle so it can be swept and compared on equal footing
   with the rest. This is not a strict win despite every round being an exact
   solve: each round commits, in one batch snapshot, to one candidate per

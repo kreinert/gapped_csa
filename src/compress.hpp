@@ -2643,6 +2643,13 @@ private:
             bool require_avail,
             std::unordered_map<uint64_t, std::vector<Candidate>>& cand_cache,
             bool rank_aware = true,
+            // Rounds after the first normally reuse round 0's cached,
+            // availability-agnostic top-kCandCacheDefaultCap list per word.
+            // With reenum=true they re-enumerate with the availability filter
+            // on instead, so a word whose whole cached list has been consumed
+            // still offers its best *surviving* candidate to the DP rather than
+            // dropping out of the graph for good. See GCSA_PFDP_REENUM.
+            bool reenum = false,
             // Set (if non-null) right after the per-interval candidate-scoring
             // loop below, before the dependency/cycle-detection pass -- lets
             // callers split "cand" (independent per interval, parallelized via
@@ -2668,6 +2675,10 @@ private:
         // though every interval's own key is unique, because emplace can
         // trigger a rehash that invalidates every other thread's read.
         std::mutex cand_mu;
+        // Same cap enumerate_candidates_ applies, so we can tell a truncated
+        // cached list (may hide candidates) from a complete one (cannot).
+        const int cand_cap = gcsa_env_int("GCSA_CAND_CACHE_CAP", kCandCacheDefaultCap);
+        std::atomic<size_t> repaired_n{0};
         gcsa_parallel_for(intervals.size(), [&](size_t i) {
             const Interval& iv = intervals[i];
             // |I|<=2 can never meet kMinCoverage (coverage is a subset of the
@@ -2707,6 +2718,25 @@ private:
 
             Candidate best = best_from_sorted_cache_(fresh, require_avail);
 
+            // Cache-miss repair (reenum). The cached list is round 0's top-`cap`
+            // by coverage, chosen with no regard to availability. Once accepts
+            // have consumed all `cap` of them this word leaves the DP for good,
+            // even though the SA may still hold available lower-coverage
+            // candidates for it -- which is exactly what the leftover sweep
+            // picks up afterwards. Re-enumerate for precisely those words:
+            //   * `best` empty         -> nothing in the cache is usable now, and
+            //   * fresh.size() >= cap  -> the list was truncated, so the SA may
+            //                             still hold candidates the cache omits.
+            // A word whose list was *not* capped already has its whole universe
+            // cached, so if none of it is available none exists -- re-enumerating
+            // it would be pure waste, and skipping it is what keeps this cheap.
+            if (reenum && require_avail && best.coverage() < kMinCoverage
+                && (int)fresh.size() >= cand_cap) {
+                best = best_candidate_(iv.name, iv.lo, iv.hi, /*require_avail=*/true);
+                if (best.coverage() >= kMinCoverage)
+                    repaired_n.fetch_add(1, std::memory_order_relaxed);
+            }
+
             std::lock_guard<std::mutex> lock(cand_mu);
             if (best.coverage() >= 2) {
                 uint64_t src = name_of_rank_(best.src_lo);
@@ -2720,6 +2750,9 @@ private:
             if (!cached) cand_cache.emplace(iv.name, std::move(fresh));
         });
         if (t_cand_end) *t_cand_end = std::chrono::steady_clock::now();
+        if (reenum && require_avail && std::getenv("GCSA_TIMING"))
+            gcsa_log("[timing] reenum: %zu word(s) recovered by re-enumerating a"
+                     " fully-consumed capped cache\n", repaired_n.load());
 
         // ---- which nodes have a REAL (rank-level conflict) dependency -----
         // v has a real dependency on src = name_of_rank_(v's candidate's
@@ -3050,9 +3083,20 @@ private:
     // sweep does. Processed size-descending, same bias as the DP's own root
     // order. Returns how many intervals it resolved, so the caller can tell
     // whether a round made progress.
+    // expect_none: the caller ran an iterating DP with per-round re-enumeration
+    // (GCSA_PFDP_REENUM=1) through to its own fixed point, so every word with an
+    // available candidate should already have been taken by the DP and this
+    // sweep should accept nothing -- i.e. it is a redundant fourth stage on such
+    // runs. That is a property worth checking rather than assuming: it is not
+    // guaranteed by construction (a candidate whose source name is absent from
+    // the graph's by_name is dropped, and the round loop stops on "the DP chose
+    // nothing" rather than "no candidate remains"), so a violation is reported
+    // loudly instead of silently changing the result. Passed false whenever the
+    // premise does not hold: single-fire runs, re-enumeration off, or a round
+    // budget that cut the loop short.
     size_t run_pseudoforest_leftover_(const std::vector<Interval>& intervals,
                                       std::unordered_map<uint64_t, Candidate>& accepted,
-                                      bool trace) {
+                                      bool trace, bool expect_none = false) {
         std::vector<const Interval*> leftover;
         for (const auto& iv : intervals) {
             if (iv.hi - iv.lo <= 1) continue;
@@ -3063,19 +3107,91 @@ private:
                   [](const Interval* a, const Interval* b) {
                       return (a->hi - a->lo) > (b->hi - b->lo);
                   });
-        size_t n = 0;
-        for (const Interval* ivp : leftover) {
-            Candidate c = best_candidate_(ivp->name, ivp->lo, ivp->hi, /*avail=*/true);
-            if (c.coverage() < 2) continue;
-            if (trace) {
-                std::fprintf(stderr, "  LEFTOVER-ACCEPT %s <- %s add=%d cov=%d\n",
-                    name_to_string(G_.shape, ivp->name).c_str(),
-                    name_to_string(G_.shape, name_of_rank_(c.src_lo)).c_str(),
-                    c.add, c.coverage());
+
+        // Enumeration dominates this pass and is independent per word, but
+        // accept_() is inherently sequential -- each acceptance removes rows and
+        // pins others, changing what later words may still use. So enumerate in
+        // parallel, then accept in the same size order as before, re-deriving a
+        // word's candidate only when the precomputed one has since gone away.
+        //
+        // Exact, not approximate. During this pass accept_() only ever raises
+        // removed_/pin_count_ (revoke_ runs in Phase II, never here), so the set
+        // of available candidates shrinks monotonically. A candidate that was
+        // coverage-best over the pre-pass available set and is *still* available
+        // is therefore still best over the current (subset) set; if it is gone we
+        // re-enumerate, which is exactly what the old sequential loop did for
+        // every word. And a word with no available candidate up front can never
+        // acquire one, so it needs no recheck -- which is the common case: on
+        // pangenome_ecoli_real_n10 about 7.3M of 7.4M words resolve to "nothing
+        // available", and after pseudoforest-dp-iterate only ~231 are accepted.
+        //
+        // Chunked, so peak extra memory is bounded by the chunk rather than by
+        // |leftover| (~7.4M words on that input), and so later chunks enumerate
+        // against fresher state and recheck less.
+        // GCSA_LEFTOVER_PARALLEL=0 restores the original one-word-at-a-time
+        // sweep, for A/B timing; GCSA_LEFTOVER_CHUNK overrides the chunk size.
+        const bool timing = (std::getenv("GCSA_TIMING") != nullptr);
+        const bool parallel = [] {
+            const char* e = std::getenv("GCSA_LEFTOVER_PARALLEL");
+            return !e || std::atoi(e) != 0;
+        }();
+        const size_t chunk =
+            parallel ? (size_t)gcsa_env_int("GCSA_LEFTOVER_CHUNK", 1 << 20) : 1;
+
+        std::vector<Candidate> pre;
+        size_t n = 0, rechecked = 0, recheck_empty = 0;
+        for (size_t base = 0; base < leftover.size(); base += chunk) {
+            const size_t stop = std::min(base + chunk, leftover.size());
+            if (parallel) {
+                // Distinct elements, no reallocation: safe to fill concurrently.
+                pre.assign(stop - base, Candidate{});
+                gcsa_parallel_for(stop - base, [&](size_t j) {
+                    const Interval* ivp = leftover[base + j];
+                    pre[j] = best_candidate_(ivp->name, ivp->lo, ivp->hi,
+                                             /*require_avail=*/true);
+                });
             }
-            accept_(c, accepted);
-            ++n;
+            for (size_t i = base; i < stop; ++i) {
+                const Interval* ivp = leftover[i];
+                Candidate c;
+                if (parallel) {
+                    c = std::move(pre[i - base]);
+                    if (c.coverage() >= 2 && !cand_available_(c)) {
+                        ++rechecked;
+                        c = best_candidate_(ivp->name, ivp->lo, ivp->hi,
+                                            /*require_avail=*/true);
+                        if (c.coverage() < 2) ++recheck_empty;
+                    }
+                } else {
+                    c = best_candidate_(ivp->name, ivp->lo, ivp->hi,
+                                        /*require_avail=*/true);
+                }
+                if (c.coverage() < 2) continue;
+                if (trace) {
+                    std::fprintf(stderr, "  LEFTOVER-ACCEPT %s <- %s add=%d cov=%d\n",
+                        name_to_string(G_.shape, ivp->name).c_str(),
+                        name_to_string(G_.shape, name_of_rank_(c.src_lo)).c_str(),
+                        c.add, c.coverage());
+                }
+                accept_(c, accepted);
+                ++n;
+            }
         }
+        if (expect_none && n > 0)
+            gcsa_log("[INVARIANT-VIOLATION] leftover sweep accepted %zu word(s) after an"
+                     " iterating DP with per-round re-enumeration reached its fixed"
+                     " point. Every remaining acceptable candidate was expected to have"
+                     " been absorbed by the DP, i.e. this sweep should be redundant --"
+                     " on this input it is not. Re-run with GCSA_TRACE_PFDP=1 to see"
+                     " which words survived.\n", n);
+        if (timing)
+            gcsa_log("[timing] leftover sweep (%s): words=%zu accepted=%zu"
+                     " rechecked=%zu (empty after recheck=%zu) chunk=%zu threads=%d"
+                     " invariant=%s\n",
+                     parallel ? "parallel" : "sequential",
+                     leftover.size(), n, rechecked, recheck_empty,
+                     chunk, gcsa_num_threads(),
+                     !expect_none ? "n/a" : (n == 0 ? "held" : "VIOLATED"));
         return n;
     }
 
@@ -3130,6 +3246,12 @@ private:
             const char* e = std::getenv("GCSA_PFDP_RANK_AWARE");
             return !e || std::atoi(e) != 0;
         }();
+        // Opt-in: re-enumerate every still-unresolved word's candidates at the
+        // start of each round after the first, instead of reusing round 0's
+        // cached list. Off by default so the existing benchmark baseline is
+        // unchanged; only affects the iterating variants (single-fire never
+        // runs a round with require_avail=true).
+        const bool reenum = (gcsa_env_int("GCSA_PFDP_REENUM", 0) != 0);
         // Iteration is primarily selected via --algo pseudoforest-dp-iterate
         // (CompressAlgo::PseudoforestDpIterate); GCSA_PFDP_ITERATE=1 remains
         // as a legacy override that also turns iteration on for plain
@@ -3168,6 +3290,7 @@ private:
         double cand_ms = 0.0, graph_ms = 0.0, dp_ms = 0.0, accept_ms = 0.0;
         size_t total_dp_nodes = 0, total_cycles = 0, total_chosen = 0;
         size_t rounds = 0;
+        bool budget_capped = false;   // loop cut short by GCSA_PFDP_MAX_ROUNDS
 
         for (;;) {
             // Round 0 matches the original algorithm's single pass exactly
@@ -3178,12 +3301,13 @@ private:
             // "extract a second set of preferences that do not conflict
             // with the fixed solution" step from the doc.
             const bool require_avail = (rounds > 0);
-            gcsa_log("[%s] round %zu: preference graph build...\n", label, rounds);
+            gcsa_log("[%s] round %zu: preference graph build%s...\n", label, rounds,
+                     (require_avail && reenum) ? " (re-enumerating)" : "");
             auto t_graph0 = Clock::now();
             Clock::time_point t_cand_end = t_graph0;
             ConflictGraph graph = build_pseudoforest_graph_(intervals, accepted,
                                                         require_avail, cand_cache,
-                                                        rank_aware, &t_cand_end);
+                                                        rank_aware, reenum, &t_cand_end);
             auto t_graph1 = Clock::now();
             if (trace) trace_pseudoforest_graph_(graph, rounds);
             cand_ms += std::chrono::duration<double, std::milli>(t_cand_end - t_graph0).count();
@@ -3220,6 +3344,7 @@ private:
             if (n_chosen == 0) break;           // fixed point: nothing left for another round to find
             if (max_rounds && rounds >= max_rounds) {
                 gcsa_log("[%s] GCSA_PFDP_MAX_ROUNDS=%zu reached, stopping\n", label, max_rounds);
+                budget_capped = true;
                 break;
             }
         }
@@ -3231,7 +3356,11 @@ private:
 
         gcsa_log("[%s] leftover greedy...\n", label);
         auto t_left0 = Clock::now();
-        size_t n_leftover = run_pseudoforest_leftover_(intervals, accepted, trace);
+        // Only an iterating, re-enumerating run that reached its own fixed point
+        // is expected to leave this sweep with nothing to do.
+        size_t n_leftover = run_pseudoforest_leftover_(
+            intervals, accepted, trace,
+            /*expect_none=*/iterate && reenum && !budget_capped);
         auto t_left1 = Clock::now();
         const size_t after_leftover = kept_count_;
         gcsa_log(
