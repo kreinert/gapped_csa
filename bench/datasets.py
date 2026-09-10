@@ -674,8 +674,8 @@ DATASETS = [
 SHAPES = [
     "#" * 21,                        # k=21 contiguous
     "#" * 30,                        # 30cont
-    "#" * 20 + "." * 4 + "#" * 10,    # 20+g4+10
-    "#" * 10 + "." * 4 + "#" * 20,    # 10+g4+20
+    # "#" * 20 + "." * 4 + "#" * 10,    # 20+g4+10
+    # "#" * 10 + "." * 4 + "#" * 20,    # 10+g4+20
 
     # Canonical spaced seeds from the literature (Sep-8; see the design doc
     # for the literature survey these were pulled from). Each comment gives
