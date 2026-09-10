@@ -27,21 +27,24 @@ Usage:
                                                     # stdout+stderr for
                                                     # inspection (see --out's
                                                     # log_path column)
-  ./run_suite.py --disable-phase2                  # GCSA_DISABLE_PHASE2=1 for
-                                                    # every run (Phase I /
-                                                    # leftover only)
+  ./run_suite.py --disable-retarget                # skip the unpin/retarget
+                                                    # sweep (the LNS still
+                                                    # runs)
+  ./run_suite.py --disable-lns                     # skip the cluster LNS (the
+                                                    # retarget sweep still
+                                                    # runs)
+  ./run_suite.py --disable-retarget --disable-lns  # Phase I / leftover only.
+                                                    # All four combinations
+                                                    # land in the 'phase2'
+                                                    # column as on /
+                                                    # no-retarget / no-lns /
+                                                    # off
   ./run_suite.py --env GCSA_PHASE2_MAX_ITERS=50 GCSA_QUIET=1
                                                     # arbitrary extra env vars
                                                     # for every ./gcsa call --
                                                     # see compress.hpp for the
                                                     # full GCSA_PHASE2_* knob
-                                                    # list. See --env's and
-                                                    # --disable-phase2's --help
-                                                    # for a real gotcha:
-                                                    # GCSA_DISABLE_PHASE2 is
-                                                    # presence-checked, not
-                                                    # value-checked, so --env
-                                                    # can't force it back off.
+                                                    # list.
 
 Two ways to run this concurrently on a cluster -- combine them freely:
 
@@ -106,11 +109,32 @@ CSV_FIELDS = [
 _SHAPE_FILENAME_SAFE = re.compile(r"^[#.]+$")
 
 
+# The two Phase II passes -- the greedy unpin/retarget sweep and the exact
+# cluster LNS -- switch on and off independently, so a run is one of four
+# configurations rather than "phase2 on/off". One table maps that choice to
+# the CSV label, the env ./gcsa actually sees, and the log-filename suffix, so
+# the three can never drift apart.
+#
+# Note for anyone comparing against a CSV written before this existed: the old
+# --disable-phase2 set GCSA_DISABLE_PHASE2, which only ever skipped the
+# retarget pass -- the LNS still ran. So a historical phase2="off" row is what
+# is now labelled "no-retarget", not "off".
+PHASE2_LABEL = {(False, False): "on",     (True, False): "no-retarget",
+                 (False, True):  "no-lns", (True, True):  "off"}
+PHASE2_ENV = {
+    "on":          {},
+    "no-retarget": {"GCSA_DISABLE_RETARGET": "1"},
+    "no-lns":      {"GCSA_DISABLE_LNS": "1"},
+    "off":         {"GCSA_DISABLE_RETARGET": "1", "GCSA_DISABLE_LNS": "1"},
+}
+PHASE2_SUFFIX = {"on": "", "no-retarget": "__noretarget",
+                 "no-lns": "__nolns", "off": "__nophase2"}
+
+
 def log_filename(dataset: str, shape: str, algo: str, max_add: int,
-                  disable_phase2: bool) -> str:
+                  phase2_label: str) -> str:
     shape_part = shape if _SHAPE_FILENAME_SAFE.match(shape) else re.sub(r"[^\w.-]", "_", shape)
-    suffix = "__nophase2" if disable_phase2 else ""
-    return f"{dataset}__{shape_part}__{algo}__ma{max_add}{suffix}.log"
+    return f"{dataset}__{shape_part}__{algo}__ma{max_add}{PHASE2_SUFFIX[phase2_label]}.log"
 
 GCSA_RE = {
     "span": re.compile(r"\bspan=(\d+)"),
@@ -349,9 +373,12 @@ def already_done(out_csv: Path) -> set:
     done = set()
     with open(out_csv, newline="") as f:
         for row in csv.DictReader(f):
-            # row.get("phase2", "on"): a CSV written before --disable-phase2
-            # existed has no "phase2" column at all -- treat every row in it
-            # as a phase2-on run, which is what it actually was.
+            # row.get("phase2", "on"): a CSV written before the Phase II
+            # switches existed has no "phase2" column at all -- treat every row
+            # in it as a both-passes-on run, which is what it actually was. A
+            # CSV written by the old --disable-phase2 says "off" where this
+            # version would now say "no-retarget"; --resume will re-run those
+            # rather than treat them as done, which is the safe direction.
             done.add((row["dataset"], row["shape"], row["algo"], row["max_add"],
                        row.get("phase2") or "on"))
     return done
@@ -379,8 +406,7 @@ def check_resumable_schema(out_csv: Path) -> None:
 
 
 def run_experiment(bin_dir, path, ds, raw, gz, ratio, shape, algo, max_add,
-                    phase2_label, skip_selftest, disable_phase2, extra_env,
-                    log_dir):
+                    phase2_label, skip_selftest, extra_env, log_dir):
     """Run one (shape, algo, max_add) experiment for an already-resolved
     dataset and return (row, log_path, log_text, fail_msg) -- pure aside
     from the ./gcsa subprocess call itself, so it's safe to run concurrently
@@ -394,13 +420,12 @@ def run_experiment(bin_dir, path, ds, raw, gz, ratio, shape, algo, max_add,
         max_add=max_add, phase2=phase2_label, status="ok",
         log_path="")
     # Precedence: inherited shell env, then the automatic size-based skip,
-    # then --disable-phase2, then --env -- each step can override the one
+    # then the Phase II switches, then --env -- each step can override the one
     # before it, so --env is the final word if it names the same var.
     overrides = {}
     if skip_selftest:
         overrides["GCSA_SKIP_SELFTEST"] = "1"
-    if disable_phase2:
-        overrides["GCSA_DISABLE_PHASE2"] = "1"
+    overrides.update(PHASE2_ENV[phase2_label])
     overrides.update(extra_env)
     env = dict(os.environ)
     env.update(overrides)
@@ -426,7 +451,7 @@ def run_experiment(bin_dir, path, ds, raw, gz, ratio, shape, algo, max_add,
 
     log_path, log_text = None, None
     if log_dir is not None:
-        log_path = log_dir / log_filename(ds["name"], shape, algo, max_add, disable_phase2)
+        log_path = log_dir / log_filename(ds["name"], shape, algo, max_add, phase2_label)
         env_note = " ".join(f"{k}={v}" for k, v in overrides.items()) or "(none)"
         log_text = (
             f"$ {' '.join(cmd)}\n"
@@ -470,25 +495,36 @@ def main():
                           "for the naming scheme. Off by default (nothing extra is kept "
                           "beyond the parsed CSV row and, on failure, a 200-char stderr "
                           "snippet in the 'status' column).")
+    ap.add_argument("--disable-retarget", action="store_true",
+                     help="set GCSA_DISABLE_RETARGET=1 for every ./gcsa invocation, "
+                          "skipping the greedy unpin/retarget sweep. The cluster LNS "
+                          "still runs -- combine with --disable-lns to skip both and see "
+                          "Phase I's output on its own. Recorded in the 'phase2' CSV "
+                          "column (on / no-retarget / no-lns / off) and in the log "
+                          "filename, so all four configurations for the same (dataset, "
+                          "shape, algo, max_add) coexist in one --out without colliding. "
+                          "Use this flag rather than '--env GCSA_DISABLE_RETARGET=1': the "
+                          "env route has the same effect on ./gcsa but is NOT reflected "
+                          "in the column or the filename.")
+    ap.add_argument("--disable-lns", action="store_true",
+                     help="set GCSA_DISABLE_LNS=1 for every ./gcsa invocation, skipping "
+                          "the exact bounded-cluster LNS. The retarget sweep still runs. "
+                          "Same CSV/filename bookkeeping as --disable-retarget.")
     ap.add_argument("--disable-phase2", action="store_true",
-                     help="set GCSA_DISABLE_PHASE2=1 for every ./gcsa invocation (Phase I "
-                          "/ leftover-DP output only, no Phase II local-search pass). "
-                          "Recorded in the 'phase2' CSV column so phase2-on and "
-                          "phase2-off rows for the same (dataset, shape, algo, max_add) "
-                          "can coexist in one --out without colliding. This is the flag "
-                          "to use for that specific variable -- setting it instead via "
-                          "'--env GCSA_DISABLE_PHASE2=1' has the same effect on ./gcsa but "
-                          "will NOT be reflected in the 'phase2' column or the log filename. "
-                          "Note ./gcsa checks this var for *presence*, not value (see "
-                          "compress.hpp) -- GCSA_DISABLE_PHASE2=0 still disables Phase II, "
-                          "so --env can't be used to force it back on; just omit this flag.")
+                     help="DEPRECATED alias for --disable-retarget. Despite the name it "
+                          "never disabled all of Phase II: it set GCSA_DISABLE_PHASE2, "
+                          "which skips the retarget sweep and leaves the LNS running. "
+                          "Kept so existing scripts keep working; new runs should say "
+                          "--disable-retarget (and add --disable-lns for what the old "
+                          "name suggests).")
     ap.add_argument("--env", nargs="*", default=[], metavar="KEY=VALUE",
                      help="extra environment variables for every ./gcsa invocation, e.g. "
                           "--env GCSA_PHASE2_MAX_ITERS=50 GCSA_QUIET=1 (see compress.hpp "
                           "for the full GCSA_PHASE2_* / GCSA_QUIET knob list). Applied "
-                          "after, and so overrides, the automatic GCSA_SKIP_SELFTEST if "
-                          "you name that same variable -- but NOT a reliable way to "
-                          "override --disable-phase2 back off (see that flag's help). Not "
+                          "after, and so overrides, the automatic GCSA_SKIP_SELFTEST and "
+                          "the Phase II switches if you name those same variables -- but "
+                          "going that route leaves the 'phase2' CSV column and the log "
+                          "filename saying otherwise, so prefer the dedicated flags. Not "
                           "a CSV column (arbitrary keys don't fit a fixed schema); use "
                           "--log-dir to keep a per-row record of exactly what was set.")
     ap.add_argument("--jobs", type=int, default=1, metavar="N",
@@ -605,7 +641,12 @@ def main():
     def log(msg):
         print(msg, file=sys.stderr)
 
-    phase2_label = "off" if args.disable_phase2 else "on"
+    if args.disable_phase2 and not args.disable_retarget:
+        print("note: --disable-phase2 is deprecated; it means --disable-retarget "
+              "(the LNS still runs). Add --disable-lns to skip both passes.",
+              file=sys.stderr)
+    phase2_label = PHASE2_LABEL[(args.disable_retarget or args.disable_phase2,
+                                  args.disable_lns)]
     log(f"bin-dir={bin_dir}  data-dir={data_dir}  tmp-dir={tmp_dir}  out={out_csv}  "
         f"(run 'python3 config.py' to see where each came from)")
     shard_log_suffix = ""
@@ -677,7 +718,7 @@ def main():
                 for shape, algo, max_add in todo_jobs:
                     emit(run_experiment(bin_dir, path, ds, raw, gz, ratio, shape, algo,
                                          max_add, phase2_label, skip_selftest,
-                                         args.disable_phase2, extra_env, log_dir))
+                                         extra_env, log_dir))
             else:
                 # Concurrent subprocess dispatch; all file writes (CSV row,
                 # log file) still happen only here on the main thread, in
@@ -687,7 +728,7 @@ def main():
                     futures = [
                         pool.submit(run_experiment, bin_dir, path, ds, raw, gz, ratio,
                                     shape, algo, max_add, phase2_label, skip_selftest,
-                                    args.disable_phase2, extra_env, log_dir)
+                                    extra_env, log_dir)
                         for shape, algo, max_add in todo_jobs
                     ]
                     for fut in concurrent.futures.as_completed(futures):

@@ -57,25 +57,32 @@ Useful flags:
 - `--keep-synthetic` -- don't delete generated FASTAs from `--tmp-dir`
   afterward, if you want to inspect one.
 - `--log-dir DIR` -- keep every `./gcsa` invocation's full stdout+stderr as
-  `DIR/<dataset>__<shape>__<algo>__ma<max_add>[__nophase2].log` (command,
+  `DIR/<dataset>__<shape>__<algo>__ma<max_add>[__noretarget|__nolns|__nophase2].log`
+  (command,
   env overrides, exit code, wall time, then the raw output). Off by default
   -- without it you only get the parsed CSV row plus, on failure, a 200-char
   stderr snippet in `status`. Written on both success and failure, so this
   is the first place to look when a run errors or fails `self_test`/
   `roundtrip`; the row's own `log_path` column points straight at its file.
-- `--disable-phase2` -- set `GCSA_DISABLE_PHASE2=1` for every invocation
-  (Phase I / leftover-DP output only, no Phase II local-search pass).
-  Recorded in the `phase2` CSV column (`on`/`off`), so a phase2-on and a
-  phase2-off run of the same `(dataset, shape, algo, max_add)` can sit in
-  the same `--out` without one being mistaken for a rerun of the other.
+- `--disable-retarget` / `--disable-lns` -- set `GCSA_DISABLE_RETARGET=1` /
+  `GCSA_DISABLE_LNS=1` for every invocation, independently, so all four Phase
+  II configurations are reachable. The choice lands in the `phase2` CSV column
+  (`on` / `no-retarget` / `no-lns` / `off`) and in the log filename, so the
+  four can share one `--out`. `--disable-phase2` is a deprecated alias for
+  `--disable-retarget`: despite the name it never disabled the LNS, so a
+  `phase2=off` row in a CSV written before this change is what is now labelled
+  `no-retarget`. `--resume` re-runs such a row rather than treating it as
+  done, which is the safe direction.
 - `--env KEY=VALUE [KEY=VALUE ...]` -- any other environment variable for
   every `./gcsa` invocation, e.g. `--env GCSA_PHASE2_MAX_ITERS=50
   GCSA_QUIET=1` (see `compress.hpp` for the full `GCSA_PHASE2_*` /
   `GCSA_QUIET` knob list). Applied after, and so overrides, the automatic
   `GCSA_SKIP_SELFTEST`. Not its own CSV column (arbitrary keys don't fit a
   fixed schema) -- pair it with `--log-dir` if you want a per-row record of
-  exactly what was set. One gotcha: `./gcsa` checks `GCSA_DISABLE_PHASE2`
-  for *presence*, not value, so `--env GCSA_DISABLE_PHASE2=0` does NOT
+  exactly what was set. The current switches are value-checked, so
+  `--env GCSA_DISABLE_LNS=0` really does leave the LNS running; the
+  deprecated `GCSA_DISABLE_PHASE2` keeps its old *presence* test, so
+  `--env GCSA_DISABLE_PHASE2=0` does NOT
   re-enable Phase II if `--disable-phase2` was also passed -- for that one
   variable, just omit `--disable-phase2` instead of trying to override it.
 - `--jobs N` -- run up to N `./gcsa` invocations concurrently (within the

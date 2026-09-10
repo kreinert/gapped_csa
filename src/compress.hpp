@@ -69,11 +69,12 @@
 //   replacing it (retargeting reaches links -- composite adds -- the static
 //   candidate cache does not hold, which is exactly where the LNS alone
 //   gives ground on long repeats), so every algorithm gets both by default.
-//   GCSA_LNS_ONLY=1 skips the greedy pass and measures the LNS alone;
-//   GCSA_DISABLE_PHASE2=1 skips the greedy pass the same way, but the LNS
-//   pass still runs regardless -- it isn't gated by that flag. What differs
-//   between algorithms below is only Phase I: how the initial accepted set
-//   gets built.
+//   Each pass has its own switch: GCSA_DISABLE_RETARGET=1 runs the LNS
+//   alone, GCSA_DISABLE_LNS=1 runs the retarget pass alone, and setting both
+//   leaves Phase I's output untouched. (GCSA_LNS_ONLY and GCSA_DISABLE_PHASE2
+//   are deprecated spellings of GCSA_DISABLE_RETARGET.) What differs between
+//   algorithms below is only Phase I: how the initial accepted set gets
+//   built.
 //
 //   GreedySize   – size-order availability-aware greedy; pins sources forever.
 //   GreedyDegree – richer-graph greedy MWIS: instead of sparsifying to one
@@ -154,6 +155,7 @@
 #include <mutex>
 #include <cstring>
 #include <cmath>
+#include <cctype>
 #include <map>
 
 namespace gcsa {
@@ -359,6 +361,21 @@ inline int gcsa_env_int(const char* name, int def) {
         if (v > 0) return v;
     }
     return def;
+}
+
+// Boolean env override, `def` when unset or empty. Accepts 0/1, false/true,
+// no/yes and off/on in any case, so GCSA_DISABLE_LNS=0 really does leave the
+// LNS running. This is deliberately unlike the older presence-tested flags
+// (GCSA_TIMING, GCSA_QUIET, the deprecated GCSA_DISABLE_PHASE2), where any
+// value at all -- "0" included -- turns the switch on. New toggles use this.
+inline bool gcsa_env_bool(const char* name, bool def) {
+    const char* e = std::getenv(name);
+    if (!e || !*e) return def;
+    std::string v(e);
+    for (char& c : v) c = (char)std::tolower((unsigned char)c);
+    if (v == "0" || v == "false" || v == "no"  || v == "off") return false;
+    if (v == "1" || v == "true"  || v == "yes" || v == "on")  return true;
+    return std::atoi(e) != 0;
 }
 
 struct HashEntry {
@@ -1621,10 +1638,9 @@ private:
     //   GCSA_PHASE2_MIN_GAIN=G  – min total kept-drop (|C| reduction) per dirty
     //                             generation to count as progress (default 1).
     //
-    // Env GCSA_DISABLE_PHASE2 (optional): skip the greedy retarget pass (the
-    // LNS pass in run_phase2_and_lns_ still runs regardless), so any
-    // algorithm can be compared on its Phase I / DP output alone, without
-    // the shared retarget sweep smoothing over differences between them.
+    // Skipping this pass is decided by the caller (run_phase2_and_lns_,
+    // GCSA_DISABLE_RETARGET), not here, so that the retarget and LNS toggles
+    // read as one pair in one place.
     void run_phase2_(const std::vector<Interval>& intervals,
                      std::unordered_map<uint64_t, Candidate>& accepted,
                      const char* label,
@@ -1633,10 +1649,6 @@ private:
                      std::unordered_map<uint64_t, std::vector<Candidate>>* precomputed = nullptr,
                      double phase1_ms = 0.0) {
         using Clock = std::chrono::steady_clock;
-        if (std::getenv("GCSA_DISABLE_PHASE2") != nullptr) {
-            std::fprintf(stderr, "[%s] Phase II: disabled (GCSA_DISABLE_PHASE2)\n", label);
-            return;
-        }
         const char* iters_src = "default";
         const int max_iters = phase2_budget_(iters_src);
         int min_gain = 1;
@@ -2059,6 +2071,28 @@ private:
         }
     }
 
+    // Which env var, if any, switched the retarget pass off -- nullptr when
+    // it runs. GCSA_DISABLE_RETARGET is the canonical name and wins outright
+    // when set, so an explicit =0 overrides a stale legacy setting inherited
+    // from the environment. Both older spellings still work: GCSA_LNS_ONLY=1
+    // means exactly "disable the retarget pass", and GCSA_DISABLE_PHASE2
+    // keeps its historical presence-only test -- any value, "0" included,
+    // disables -- so scripts and archived logs from before this change stay
+    // reproducible. Prefer the canonical name in anything new.
+    static const char* retarget_disabled_by_() {
+        if (std::getenv("GCSA_DISABLE_RETARGET") != nullptr)
+            return gcsa_env_bool("GCSA_DISABLE_RETARGET", false)
+                       ? "GCSA_DISABLE_RETARGET" : nullptr;
+        if (std::getenv("GCSA_DISABLE_PHASE2") != nullptr) return "GCSA_DISABLE_PHASE2";
+        return gcsa_env_bool("GCSA_LNS_ONLY", false) ? "GCSA_LNS_ONLY" : nullptr;
+    }
+
+    // Same for the LNS pass. There is no legacy spelling: before
+    // GCSA_DISABLE_LNS the LNS could not be switched off at all.
+    static const char* lns_disabled_by_() {
+        return gcsa_env_bool("GCSA_DISABLE_LNS", false) ? "GCSA_DISABLE_LNS" : nullptr;
+    }
+
     // Phase II, generalized to every remaining algorithm: the dirty-set
     // greedy unpin/retarget (run_phase2_) followed by the exact bounded-
     // cluster LNS (run_phase2_local_). This used to be tree-dp3's pipeline
@@ -2066,18 +2100,33 @@ private:
     // lowers |C| and composes with the retarget loop rather than replacing
     // it (retargeting reaches links -- composite adds -- that the static
     // candidate cache does not hold, which is exactly where the LNS alone
-    // gives ground on long repeats). GCSA_LNS_ONLY=1 skips the greedy pass
-    // and measures the LNS alone; GCSA_DISABLE_PHASE2=1 (checked inside
-    // run_phase2_) skips the greedy pass the same way, but the LNS pass
-    // still runs regardless -- it isn't gated by that flag.
+    // gives ground on long repeats).
+    //
+    // Each pass has its own switch -- GCSA_DISABLE_RETARGET and
+    // GCSA_DISABLE_LNS -- so all four combinations are reachable and each
+    // pass's contribution can be isolated. Disabling a pass here rather than
+    // inside it also skips that pass's setup: for the LNS that is the whole
+    // dependency-graph build, which is the expensive part on large inputs.
     void run_phase2_and_lns_(const std::vector<Interval>& intervals,
                              std::unordered_map<uint64_t, Candidate>& accepted,
                              const char* label, bool trace, bool timing,
                              std::unordered_map<uint64_t, std::vector<Candidate>>* cand_cache,
                              double phase1_ms) {
-        if (gcsa_env_int("GCSA_LNS_ONLY", 0) == 0)
+        auto announce = [&](const char* what, const char* why, const char* canonical) {
+            gcsa_log("[%s] Phase II (%s): disabled (%s)\n", label, what, why);
+            if (std::strcmp(why, canonical) != 0)
+                gcsa_log("[%s] Phase II (%s): note -- %s is deprecated, prefer %s=1\n",
+                         label, what, why, canonical);
+        };
+        if (const char* why = retarget_disabled_by_())
+            announce("retarget", why, "GCSA_DISABLE_RETARGET");
+        else
             run_phase2_(intervals, accepted, label, trace, timing, cand_cache, phase1_ms);
-        run_phase2_local_(intervals, accepted, label, timing, cand_cache);
+
+        if (const char* why = lns_disabled_by_())
+            announce("LNS", why, "GCSA_DISABLE_LNS");
+        else
+            run_phase2_local_(intervals, accepted, label, timing, cand_cache);
     }
 
     // ---- algorithms -------------------------------------------------------

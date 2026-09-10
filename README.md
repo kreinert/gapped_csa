@@ -62,12 +62,18 @@ make
 ./gcsa --algo pseudoforest-dp             # exact DP on the preference pseudoforest (single-fire) + Phase II
 ./gcsa --algo pseudoforest-dp-iterate     # same DP, iterated to a fixed point, + Phase II
 # Phase II (dirty-set unpin/retarget, then the exact cluster LNS) runs after
-# every algorithm's Phase I, unconditionally -- see run_phase2_and_lns_ in
-# compress.hpp. GCSA_DISABLE_PHASE2 only skips the retarget half; the LNS
-# still runs. GCSA_LNS_ONLY does the opposite: skip the retarget pass, keep
-# the LNS, to measure the LNS alone.
-GCSA_DISABLE_PHASE2=1 ./gcsa --algo dep-order -g /tmp/ex.fa -s "#.#"
-GCSA_LNS_ONLY=1  ./gcsa -g /tmp/ex.fa -s "#.#" --algo pseudoforest-dp
+# every algorithm's Phase I -- see run_phase2_and_lns_ in compress.hpp. Each
+# pass has its own switch, so all four combinations are reachable and each
+# pass's contribution can be isolated:
+GCSA_DISABLE_RETARGET=1 ./gcsa --algo dep-order -g /tmp/ex.fa -s "#.#"   # LNS alone
+GCSA_DISABLE_LNS=1      ./gcsa --algo dep-order -g /tmp/ex.fa -s "#.#"   # retarget alone
+GCSA_DISABLE_RETARGET=1 GCSA_DISABLE_LNS=1 ./gcsa --algo dep-order -g /tmp/ex.fa -s "#.#"
+                                                                          # Phase I output as-is
+# Both are value-checked: =0, =false, =no and =off all mean "run this pass",
+# so they can be forced back on from an inherited environment. GCSA_LNS_ONLY
+# and GCSA_DISABLE_PHASE2 are deprecated spellings of GCSA_DISABLE_RETARGET
+# (neither ever disabled the LNS); they still work, print a note, and keep
+# their old presence-only semantics, and GCSA_DISABLE_RETARGET overrides both.
 GCSA_TRACE_PFDP=1 ./gcsa -g /tmp/ex.fa -s "#.#" --algo pseudoforest-dp
 GCSA_TIMING=1    ./gcsa -g genome.fasta -s "#####" --algo pseudoforest-dp   # stage timings
 GCSA_THREADS=8   ./gcsa -g genome.fasta -s "#####" --algo pseudoforest-dp   # parallel pref/DP (default=hw)
@@ -180,12 +186,16 @@ compression on a 180 kb repetitive input: `####.####` → **40% of the full SA**
   (exact DP on the full preference pseudoforest, below, single-fire), and
   `pseudoforest-dp-iterate` (the same DP, iterated to a fixed point, below).
   Every one of these builds its own initial accepted set (its "Phase I"),
-  then hands it to the same shared Phase II unconditionally: the dirty-set
-  unpin/retarget pass followed by the exact cluster LNS (see
-  `run_phase2_and_lns_` in `compress.hpp`). `GCSA_DISABLE_PHASE2=1` skips
-  just the retarget half (the LNS still runs) so any algorithm's Phase I /
-  DP output can be inspected on its own; `GCSA_LNS_ONLY=1` does the reverse,
-  skipping the retarget pass and running the LNS alone. Use
+  then hands it to the same shared Phase II: the dirty-set unpin/retarget
+  pass followed by the exact cluster LNS (see `run_phase2_and_lns_` in
+  `compress.hpp`). Both run by default and each can be switched off on its
+  own -- `GCSA_DISABLE_RETARGET=1` runs the LNS alone, `GCSA_DISABLE_LNS=1`
+  runs the retarget pass alone, and setting both exposes any algorithm's
+  Phase I / DP output as-is. Disabling a pass skips its setup too, so
+  `GCSA_DISABLE_LNS=1` also avoids building the LNS dependency graph, which
+  is the bulk of that pass's cost on large inputs. (`GCSA_LNS_ONLY` and
+  `GCSA_DISABLE_PHASE2` are deprecated spellings of `GCSA_DISABLE_RETARGET`
+  -- despite its name the latter never disabled the LNS.) Use
   `./gcsa --algo <name>` or `./compare_algos`.
   Candidate/preference enumeration in `greedy-degree`, `dep-order`, and
   `pseudoforest-dp`/`pseudoforest-dp-iterate` is parallelized via
@@ -233,8 +243,9 @@ compression on a 180 kb repetitive input: `####.####` → **40% of the full SA**
   `GCSA_LNS_CLUSTER` (max names per cluster, default 8), `GCSA_LNS_OPTS`
   (candidates considered per name, 12), `GCSA_LNS_DEGREE` (dependency-graph
   degree cap, 16), `GCSA_LNS_NODES` (enumeration budget per cluster, 20000;
-  clusters that exceed it retry at size 4), `GCSA_LNS_ONLY=1` (skip the retarget
-  loop and run the LNS alone), `GCSA_TRACE_LNS=1`. The payoff grows with
+  clusters that exceed it retry at size 4), `GCSA_DISABLE_RETARGET=1` (skip
+  the retarget loop and run the LNS alone), `GCSA_DISABLE_LNS=1` (skip this
+  pass entirely, graph build included), `GCSA_TRACE_LNS=1`. The payoff grows with
   `--max-add`; on a `--max-add 16` sweep the LNS beat the retarget loop alone
   on the large majority of configs and never lost.
   `GCSA_LNS_CLUSTER` and `GCSA_LNS_NODES` bind *jointly*, and raising them
