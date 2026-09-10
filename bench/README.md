@@ -96,27 +96,36 @@ Useful flags:
   `--resume` behavior) -- only the wall-clock time and row order change.
 - `--shard I/N` -- process only shard I of N (0-based I), e.g. `--shard 0/4`
   .. `--shard 3/4` to split one run across four independent cluster array
-  tasks. Datasets are balanced across the N shards by *estimated input
-  size* (greedy longest-processing-time-first bin packing over each
-  dataset's resolved FASTA byte count -- see `estimate_input_bytes`/
-  `balance_shards` in `run_suite.py`), not split round-robin by index --
-  so a shard with a `pangenome_ecoli_real_n100`-sized dataset in it isn't
-  stuck running for hours after every other shard has already finished
-  (this used to happen with the old index-based split). `--dry-run` prints
-  each dataset's estimated size, and a `--shard` run logs its shard's
-  total. Every `--shard I/N` invocation recomputes the same partition
-  independently and deterministically, so cluster array tasks don't need
-  to coordinate. One caveat: size estimates for `fetched`/`provided`
-  datasets come from stat-ing the cached file, so run `./fetch_data.py`
-  first -- anything not yet on disk weighs 0 and can land in any shard.
-  Splits by dataset, not by row, so every `(shape, algo, max_add)`
-  combination for a given dataset lands in the same shard. Filters *after*
-  `--only-category`/`--only-dataset`, over whatever's left. Each shard
-  needs its own `--out` so parallel jobs don't clobber each other's file --
-  if you don't pass `--out` explicitly while using `--shard`, one is
-  picked for you (`results/suite.shard<I>of<N>.csv`). Combine `--shard`
-  with `--jobs` for a two-level cluster setup (N array tasks, each running
-  up to `--jobs` invocations at once) -- for example, a SLURM array job:
+  tasks. Balances at the **row** level: every `(dataset, shape, algo,
+  max_add)` experiment is weighted by its dataset's *estimated input size*
+  and packed into the N shards with a greedy longest-processing-time-first
+  bin packing (see `estimate_input_bytes`/`balance_rows` in
+  `run_suite.py`), not split round-robin by index and not kept as whole
+  per-dataset blocks -- so a dataset as large as `pangenome_ecoli_real_n100`
+  or `human_freq_kmers` has its experiments spread across, and run
+  concurrently on, several shards instead of stranding one shard with every
+  one of that dataset's rows while the others finish early and idle (this
+  is what a dataset-level split would still do, and what the older
+  index-based split did before that). `--dry-run` prints each dataset's
+  estimated size, and with `--shard` also prints how many of this shard's
+  rows come from each dataset. A `--shard` run logs its shard's row count
+  and total estimated row-weight. Every `--shard I/N` invocation recomputes
+  the same partition independently and deterministically, so cluster array
+  tasks don't need to coordinate. One caveat: size estimates for `fetched`/
+  `provided` datasets come from stat-ing the cached file, so run
+  `./fetch_data.py` first -- anything not yet on disk weighs 0 and can land
+  in any shard. Trade-off of row-level splitting: a dataset whose rows land
+  in more than one shard has its resolve/fetch/generate + gzip cost paid
+  once *per shard it appears in*, not once total across the whole run --
+  usually a good trade for the load balancing it buys, but worth knowing
+  for an expensive `concat`/`fetched` dataset split across many shards.
+  Filters *after* `--only-category`/`--only-dataset`, over whatever's left.
+  Each shard needs its own `--out` so parallel jobs don't clobber each
+  other's file -- if you don't pass `--out` explicitly while using `--shard`,
+  one is picked for you (`results/suite.shard<I>of<N>.csv`). Combine
+  `--shard` with `--jobs` for a two-level cluster setup (N array tasks, each
+  running up to `--jobs` invocations at once) -- for example, a SLURM array
+  job:
   ```bash
   ./run_suite.py --shard $SLURM_ARRAY_TASK_ID/$SLURM_ARRAY_TASK_COUNT \
                   --jobs $SLURM_CPUS_PER_TASK

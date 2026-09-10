@@ -62,21 +62,23 @@ Two ways to run this concurrently on a cluster -- combine them freely:
   ...                                               # separate cluster
                                                     # jobs/array tasks, then
                                                     # concatenate the CSVs
-                                                    # (see README). Shards
-                                                    # are balanced by
-                                                    # estimated input size
+                                                    # (see README). Balanced
+                                                    # by estimated input size
+                                                    # at the ROW level
                                                     # (fetch_data.py first
-                                                    # for accurate weights),
+                                                    # for accurate weights) --
                                                     # not split round-robin
-                                                    # by index, so one
-                                                    # shard doesn't get
-                                                    # stuck with every big
-                                                    # dataset. Splits by
-                                                    # dataset (not by row) so
-                                                    # each dataset's fetch/
-                                                    # generate + gzip cost is
-                                                    # paid once total, not
-                                                    # once per shard.
+                                                    # by index, and not kept
+                                                    # as whole per-dataset
+                                                    # blocks, so a single big
+                                                    # dataset's experiments
+                                                    # can run across several
+                                                    # shards at once instead
+                                                    # of stalling just one.
+                                                    # A dataset split across
+                                                    # shards pays its fetch/
+                                                    # generate + gzip cost
+                                                    # once per shard it's in.
   # a SLURM array job putting both together:
   #   --shard $SLURM_ARRAY_TASK_ID/$SLURM_ARRAY_TASK_COUNT --jobs $SLURM_CPUS_PER_TASK
 """
@@ -339,32 +341,46 @@ def estimate_input_bytes(name: str, by_name: dict, data_dir: Path, cache: dict) 
     return size
 
 
-def balance_shards(datasets: list, weights: dict, shard_n: int) -> "tuple[list, list]":
-    """Greedy longest-processing-time-first bin packing: process datasets
-    heaviest (by `weights`) first, always adding the next one to whichever
-    of the `shard_n` bins currently has the smallest total weight.
-    Deterministic given the same (datasets, weights, shard_n), so every
+def balance_rows(rows: list, weights: dict, shard_n: int) -> "tuple[list, list]":
+    """Greedy longest-processing-time-first bin packing at ROW granularity:
+    `rows` is a flat list of (dataset, shape, algo, max_add) tuples -- one
+    per experiment in the sweep, not one per dataset. Every row is weighted
+    by its OWN dataset's estimated size (`weights[dataset["name"]]`, see
+    estimate_input_bytes), so a dataset with many rows (many shapes x algos
+    x max_adds) contributes that size once per row, not once total -- which
+    is what actually determines a shard's wall-clock time. Rows -- not
+    whole datasets -- are then packed heaviest-first into whichever of the
+    `shard_n` bins currently has the smallest total weight, so a single
+    large dataset's experiments can spread across multiple shards running
+    concurrently instead of piling every one of them into a single shard
+    (a dataset-level split would still stick one shard with e.g. all of
+    human_freq_kmers's rows, making it the last shard to finish no matter
+    how the *other* datasets were distributed).
+    Deterministic given the same (rows, weights, shard_n), so every
     independently-launched `--shard I/N` cluster task computes the
     identical partition on its own -- no coordination between tasks
     needed. Not optimal bin-packing (that's NP-hard) but a well-known
     good-enough heuristic, and simple enough to audit. Degrades to
     (unbalanced, but still deterministic) grouping if every weight is 0 --
     e.g. nothing has been fetched yet, see estimate_input_bytes.
-    Returns (bins, bin_totals)."""
-    order = sorted(range(len(datasets)), key=lambda i: (-weights[datasets[i]["name"]], i))
+    Trade-off vs. whole-dataset sharding: a dataset whose rows land in more
+    than one shard now has its resolve/fetch/generate + gzip cost paid
+    once per shard it appears in, not once total across the whole run.
+    Returns (bins, bin_totals) where each bin is a list of
+    (dataset, shape, algo, max_add) tuples in original relative order."""
+    order = sorted(range(len(rows)), key=lambda i: (-weights[rows[i][0]["name"]], i))
     totals = [0] * shard_n
     bins = [[] for _ in range(shard_n)]
     for i in order:
         b = min(range(shard_n), key=lambda b: (totals[b], b))
-        bins[b].append(datasets[i])
-        totals[b] += weights[datasets[i]["name"]]
+        bins[b].append(i)
+        totals[b] += weights[rows[i][0]["name"]]
     # Re-sort each shard's members back into their original relative order
-    # -- purely cosmetic (readable --dry-run/log output), doesn't affect
-    # which dataset ended up in which shard.
-    order_index = {id(d): idx for idx, d in enumerate(datasets)}
+    # -- purely cosmetic (readable --dry-run output), doesn't affect which
+    # row ended up in which shard.
     for b in bins:
-        b.sort(key=lambda d: order_index[id(d)])
-    return bins, totals
+        b.sort()
+    return [[rows[i] for i in b] for b in bins], totals
 
 
 def already_done(out_csv: Path) -> set:
@@ -537,26 +553,29 @@ def main():
                           "from before this flag existed).")
     ap.add_argument("--shard", default=None, metavar="I/N",
                      help="process only shard I of N (0-based I, e.g. --shard 0/4 .. "
-                          "--shard 3/4 for four cluster array tasks). Datasets are "
-                          "balanced across the N shards by estimated input size (greedy "
-                          "longest-processing-time-first bin packing -- see "
-                          "estimate_input_bytes/balance_shards), NOT split round-robin by "
-                          "index, so one shard doesn't get stuck with every large dataset "
-                          "while the others finish early and idle. Every --shard I/N "
-                          "invocation recomputes the same partition independently and "
+                          "--shard 3/4 for four cluster array tasks). Balances at the "
+                          "ROW level: every (dataset, shape, algo, max_add) experiment is "
+                          "weighted by its dataset's estimated input size and packed into "
+                          "the N shards with a greedy longest-processing-time-first bin "
+                          "packing (see estimate_input_bytes/balance_rows), NOT split "
+                          "round-robin by index and NOT kept as whole per-dataset blocks -- "
+                          "so a single large dataset's experiments can be spread across, "
+                          "and run concurrently on, several shards instead of one shard "
+                          "being stuck with all of them. Every --shard I/N invocation "
+                          "recomputes the same partition independently and "
                           "deterministically -- no coordination between cluster tasks "
                           "needed. Estimates for fetched/provided datasets come from "
                           "stat()-ing the cached file, so run ./fetch_data.py first for "
                           "balancing to reflect real sizes (unfetched ones weigh 0 and "
-                          "may land anywhere). Splits by dataset, not by row, so each "
-                          "dataset's fetch/generate + gzip cost is paid once total, not "
-                          "once per shard -- combine with --jobs for finer-grained "
-                          "parallelism within one shard. Filters AFTER --only-category/"
-                          "--only-dataset, over whatever's left. Each shard needs its own "
-                          "--out (see --out's default); concatenate the resulting CSVs "
-                          "afterward (same header on every shard, so `head -1 s0.csv > "
-                          "merged.csv && tail -n +2 -q s*.csv >> merged.csv` works) -- "
-                          "see README.")
+                          "may land anywhere). Trade-off: a dataset split across multiple "
+                          "shards has its fetch/generate + gzip cost paid once per shard "
+                          "it appears in, not once total -- combine with --jobs for "
+                          "finer-grained parallelism within one shard. Filters AFTER "
+                          "--only-category/--only-dataset, over whatever's left. Each "
+                          "shard needs its own --out (see --out's default); concatenate "
+                          "the resulting CSVs afterward (same header on every shard, so "
+                          "`head -1 s0.csv > merged.csv && tail -n +2 -q s*.csv >> "
+                          "merged.csv` works) -- see README.")
     args = ap.parse_args()
 
     extra_env = {}
@@ -631,12 +650,28 @@ def main():
     weights = {d["name"]: estimate_input_bytes(d["name"], by_name, data_dir, size_cache)
                for d in datasets}
 
+    # Flat row-level job list across the full (unsharded) sweep -- one
+    # (dataset, shape, algo, max_add) tuple per experiment. This is what
+    # --shard actually partitions (see balance_rows): splitting by row
+    # rather than by whole dataset is what lets a single big dataset's
+    # experiments run across several shards concurrently instead of all
+    # piling into one.
+    all_rows = [
+        (d, shape, algo, max_add)
+        for d in datasets
+        for shape in args.shapes
+        for algo in args.algos
+        for max_add in args.max_adds
+    ]
+
     shard_bytes = None
     if args.shard is not None:
         assert shard_i is not None and shard_n is not None  # set together, above
-        shard_bins, shard_totals = balance_shards(datasets, weights, shard_n)
-        datasets = shard_bins[shard_i]
+        row_bins, shard_totals = balance_rows(all_rows, weights, shard_n)
+        rows = row_bins[shard_i]
         shard_bytes = shard_totals[shard_i]
+    else:
+        rows = all_rows
 
     def log(msg):
         print(msg, file=sys.stderr)
@@ -652,9 +687,11 @@ def main():
     shard_log_suffix = ""
     if args.shard is not None:
         assert shard_bytes is not None  # set together with shard_i/shard_n, above
-        shard_log_suffix = (f"  shard={shard_i}/{shard_n} ({len(datasets)} dataset(s), "
-                             f"~{shard_bytes / 1e6:.1f} MB estimated input -- balanced by "
-                             f"size, not by dataset count)")
+        shard_datasets = len({d["name"] for d, _, _, _ in rows})
+        shard_log_suffix = (f"  shard={shard_i}/{shard_n} ({len(rows)}/{len(all_rows)} rows "
+                             f"across {shard_datasets} dataset(s), "
+                             f"~{shard_bytes / 1e6:.1f} MB total row-weight -- balanced by "
+                             f"row, not by whole dataset)")
     log(f"phase2={phase2_label}"
         + (f"  log-dir={log_dir}" if log_dir is not None else "  log-dir=(disabled)")
         + f"  jobs={args.jobs}"
@@ -667,11 +704,22 @@ def main():
     if args.dry_run:
         print(f"{len(datasets)} datasets x {len(args.shapes)} shapes x "
               f"{len(args.algos)} algos x {len(args.max_adds)} max_adds = "
-              f"{len(datasets) * len(args.shapes) * len(args.algos) * len(args.max_adds)} rows")
+              f"{len(all_rows)} rows")
         for d in datasets:
             mb = weights[d["name"]] / 1e6
             print(f"  {d['name']:<28} category={d['category']:<12} kind={d['kind']:<10} "
                   f"~{mb:.2f} MB")
+        if args.shard is not None:
+            assert shard_bytes is not None  # set together with shard_i/shard_n, above
+            print(f"\nshard {shard_i}/{shard_n}: {len(rows)}/{len(all_rows)} rows, "
+                  f"~{shard_bytes / 1e6:.1f} MB total row-weight")
+            row_counts = {}
+            for d, _shape, _algo, _max_add in rows:
+                row_counts[d["name"]] = row_counts.get(d["name"], 0) + 1
+            for d in datasets:
+                cnt = row_counts.get(d["name"], 0)
+                if cnt:
+                    print(f"    {d['name']:<28} {cnt} row(s) in this shard")
         return
 
     if args.resume:
@@ -686,22 +734,32 @@ def main():
             writer.writeheader()
             fcsv.flush()
 
-        for ds in datasets:
-            path = resolve_path(ds["name"], by_name, bin_dir, data_dir, tmp_dir,
+        # Group this shard's rows by dataset, preserving each dataset's
+        # first-appearance order in `datasets` -- so resolve_path/
+        # gzip_ratio still run once per dataset actually needed by *this*
+        # shard (not once per row), while the (shape, algo, max_add)
+        # combinations run for that dataset come from this shard's row
+        # assignment rather than the full args.shapes/algos/max_adds cross
+        # product (which is what `rows`/`all_rows` already expanded).
+        rows_by_dataset = {}
+        for d, shape, algo, max_add in rows:
+            rows_by_dataset.setdefault(d["name"], []).append((shape, algo, max_add))
+
+        for ds_name, combos in rows_by_dataset.items():
+            ds = by_name[ds_name]
+            path = resolve_path(ds_name, by_name, bin_dir, data_dir, tmp_dir,
                                  resolved_cache, log)
             if path is None:
                 continue
 
             raw, gz, ratio = gzip_ratio(path)
-            log(f"[ok] {ds['name']}: {path}  {raw} bytes, gzip_ratio={ratio:.3f}")
+            log(f"[ok] {ds_name}: {path}  {raw} bytes, gzip_ratio={ratio:.3f}")
             skip_selftest = raw > SKIP_SELFTEST_ABOVE_BYTES
 
             todo_jobs = [
                 (shape, algo, max_add)
-                for shape in args.shapes
-                for algo in args.algos
-                for max_add in args.max_adds
-                if (ds["name"], shape, algo, str(max_add), phase2_label) not in skip_done
+                for shape, algo, max_add in combos
+                if (ds_name, shape, algo, str(max_add), phase2_label) not in skip_done
             ]
 
             def emit(result):
