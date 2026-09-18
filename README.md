@@ -77,11 +77,33 @@ GCSA_DISABLE_RETARGET=1 GCSA_DISABLE_LNS=1 ./gcsa --algo dep-order -g /tmp/ex.fa
 GCSA_TRACE_PFDP=1 ./gcsa -g /tmp/ex.fa -s "#.#" --algo pseudoforest-dp
 GCSA_TIMING=1    ./gcsa -g genome.fasta -s "#####" --algo pseudoforest-dp   # stage timings
 GCSA_THREADS=8   ./gcsa -g genome.fasta -s "#####" --algo pseudoforest-dp   # parallel pref/DP (default=hw)
+
+# The gapped SA depends only on (text, shape), so every --algo / --max-add run
+# of one pair rebuilds the identical array. On the 2026-09 sweeps that was 47.9h
+# of 130.2h total. --sa-cache builds it once and reuses it (content-addressed on
+# the cleaned text + shape, so a regenerated-but-identical input still hits):
+./gcsa -g genome.fasta -s "##.##" --sa-cache /scratch/sa --prepare-only   # build the blob
+./gcsa -g genome.fasta -s "##.##" --sa-cache /scratch/sa --algo dep-order # reuse it
+# --sa-load names a blob outright and needs no -g at all -- the blob carries the
+# text -- so a benchmark sweep never has to open (or generate, or delete) the
+# genome. A missing or wrong-shape blob is refused, never silently rebuilt:
+./gcsa -s "##.##" --sa-load /scratch/sa/<hash>.gsa --algo dep-order
 # Phase II runs a fixed 100 dirty generations (or fewer, if it reaches a fixed
-# point first). Precedence: --phase2-iters > GCSA_PHASE2_MAX_ITERS > default.
-# A budget below the fixed point may increase |C|:
+# point first). A budget below the fixed point may increase |C|:
 ./gcsa -g genome.fasta -s "#####" --algo pseudoforest-dp --phase2-iters 25
 GCSA_PHASE2_MAX_ITERS=2 ./gcsa -g genome.fasta -s "#####" --algo pseudoforest-dp
+# Those set BOTH Phase II passes. The two cost very differently -- a retarget
+# generation is one sweep of the dirty set, an LNS generation is a pass of exact
+# cluster solves -- so each has its own override, which wins over the shared
+# ones. Give the retarget sweep room to reach its fixed point without paying
+# for 100 LNS generations to find out:
+GCSA_RETARGET_ITERS=100 GCSA_LNS_ITERS=1 ./gcsa -g genome.fasta -s "#####" --algo dep-order
+# The retarget sweep is ALSO capped by wall clock (~Phase I's duration), which
+# makes |C| depend on how fast and how loaded the machine was -- on one input,
+# 10 identical runs with the cap landing mid-work gave 10 different |C| between
+# 26188 and 37858; with the cap off, 7000 every time. Drop it whenever a number
+# has to be comparable across machines (the LNS has no wall-clock cap):
+GCSA_DISABLE_RETARGET_TIMEOUT=1 ./gcsa -g genome.fasta -s "#####" --algo dep-order
 # Optional adaptive early-stop, disabled by default (STALL=0). Stops when
 # consecutive dirty generations each reduce |C| by < MIN_GAIN kept positions;
 # the iteration budget still applies:
@@ -168,11 +190,131 @@ select-supported bitvector `S_H` marks entry starts; `select(i)` locates entry
 names, i.e. the note's rank/EF-bitvector lookup). The marker byte reproduces the
 note's worked example: `(2000000,16,300),(3000000000,24) → 10100100`, 13 bytes.
 
+### What the size report compares against
+
+Every build prints three lines of size accounting:
+
+```
+pb(bytes/pos)=4  |C|*pb=...  H=...  S_H=...  names=...  total=...  (full SA would be ... bytes; 126.7%)
+baseline (full SA + rest-only H): pb=4  m*pb=...  H=...  S_H=...  names=...  total=...
+vs. baseline: 88.4%  (C -...  H +...  S_H +0  names +0  total -...)
+```
+
+The **"full SA"** percentage on the first line compares the index against a bare
+uncompressed suffix array. Keep it for continuity with archived logs, but do not
+quote it as the compression ratio: a bare SA does not answer our query. It has
+no k-mer → interval map at all, so locating a k-mer in it is a binary search
+over the text, not a constant-time lookup. Against that yardstick the index
+looks *bigger* than what it replaces (126.7% on the human frequent-k-mer input)
+purely because the hash table has no counterpart on the other side.
+
+The **baseline** line is the like-for-like competitor — the *uncompressed* index
+with the same query interface:
+
+- the full suffix array (all `m` positions, nothing shared between k-mers), plus
+- a hash table in which every k-mer's entry is a single `H_rest = (pos, num)`
+  pointing at that k-mer's own interval `I_c`. No `H_offset` ever appears,
+  because nothing is reconstructed from anything else.
+
+Everything else is held fixed on purpose — same marker-byte layout, same
+variable-width count fields, same EF cost model for `S_H` and the name index,
+same `pb` rule — so the `vs. baseline` delta isolates exactly what differential
+compression buys and costs: `C` shrinks from `m` to `|C|` positions, while `H`
+grows by one `H_offset` (`pb + add + num` bytes) per compressed k-mer. `S_H` and
+`names` are the same on both sides by construction.
+
+The correction is large whenever the hash table is a large fraction of the
+structure, i.e. for high-weight shapes with many distinct k-mers: the human
+`#####################` frequent-k-mer run reads 126.7% against a bare SA and
+**88.4%** against the baseline, and a single E. coli genome at the same shape
+(where nearly every 21-mer is unique, so there is almost nothing to compress)
+reads 371.1% against a bare SA and 99.8% against the baseline.
+
+### Component-wise: what H is made of
+
+Three further lines break the single `H=` figure down on both sides:
+
+```
+entry mix: rest-only=4815234  offset-only=11653  both=595  empty=0  (K=4827482)
+H bytes  : marker=4827482  off(pos/add/num)=36744/12248/12248  rest(pos/num)=14447487/4815829   [baseline: marker=4827482  rest(pos/num)=14482446/4827482]
+links    : 12248 offsets covering 50200 positions (avg coverage 4.10; |C| holds 4984635)
+```
+
+`entry mix` says how much of the table compression actually touched;
+`links` gives the realized coverage distribution's mean, which is what
+`--min-coverage` is trading against. The line to watch is `rest_pos` in
+`H bytes`: SA intervals are contiguous **and in name order**, and so are the
+per-name kept runs in `C`, so on both sides the i-th entry's position is
+derivable rather than stored. EF-coding the K run boundaries gives
+`pos = select(i)` and `num = select(i+1) - select(i)`, which removes the marker
+bytes, `rest_pos`, `rest_num` *and* `S_H` (what remains of H is a fixed-width
+array needing no entry index). `bench/baseline_from_log.py --project-implicit`
+costs that out from a log; on E. coli at `-s 14` it takes both sides down 55%,
+from 46.6/46.7 MB to 21.2/21.3 MB, leaving the ratio at 99.6% vs 99.7%.
+
+That is worth internalizing: on low-repetition inputs the structural redundancy
+in the *encoding* is far larger than anything the source-selection algorithms
+are fighting over. The projection is deliberately not printed by `gcsa` itself,
+so it cannot be mistaken for a measurement of something that exists.
+
+The invariants behind these numbers are checked in the self-test path: the
+breakdown sums to `bytes_H()` on both sides, `rest_positions == |C|`, and
+`offset_positions == m - |C|` (every SA position is either kept in C, named by
+exactly one rest run, or reconstructed by exactly one offset).
+
+### The EF cost model
+
+`S_H` and the name index are both priced as Elias-Fano (`ef_bits()` in
+`serialize.hpp`), which is what makes them cheap enough to be worth having:
+`names` maps a ~42-bit k-mer name to its rank in ~17 bits/name, where a plain
+sorted array of 8-byte names would cost 892 MB on the human run, and `S_H`
+locates an entry's bytes in H in ~4.6 bits/entry against 446 MB for a flat
+4-byte pointer array.
+
+EF splits each value of a monotone sequence at bit `ell`: the low `ell` bits go
+into a fixed-width array (`n*ell` bits), and the high parts go into a bucket
+bitvector with one 1 per value and one 0 per bucket (`n + ceil(u/2^ell)` bits).
+That is what buys O(1) `select(i) = x_i`, via
+`x_i = ((select1(high,i) - i) << ell) | low[i]`. Total space lands within about
+half a bit per value of `log2(C(u,n))`, the information-theoretic floor.
+
+Two caveats worth carrying into any write-up:
+
+- **Priced, not implemented.** `SelectBitvector::starts` is a plain
+  `std::vector<uint64_t>` and `name_rank()` is a `std::lower_bound` (O(log K)).
+  The size report projects the EF structure; the code does not build it. The
+  project's *constant-time* lookup claim rests on EF's O(1) `select` and its
+  O(1)-**expected** predecessor search, not on that binary search.
+- **Select support is not counted**, on either side: the o(n) rank/select
+  structure over the bucket bitvector costs ~0.1-0.25 bits/value in practice.
+
+`ef_bits()` was corrected on Sep 18 2026 — it previously assumed the bucket
+array was exactly `2n` bits, which understated `S_H` by 14% on the human run.
+**Absolute `S_H`/`names` byte counts from logs written before that date are not
+comparable with ones printed after it**; ratios are, since both sides of the
+baseline comparison moved together (88.45% → 88.51% on that run).
+
+Implementation is in `serialize.hpp`: `uncompressed_baseline_sizes()` is
+size-only (one pass over the hash table — a k-mer's `|I_c|` is recoverable from
+its entry as `off_num + rest_num`) and never materializes the 2.2 GB baseline
+position array, so it is free to print on every run.
+`serialize_uncompressed_baseline()` builds the baseline for real and is checked
+in the self-test path. To re-score a log written before this existed without
+re-running the build, use `bench/baseline_from_log.py` — it brackets the
+baseline from `m`, `K` and `pb` alone (the only unknown is the `|I_c|`
+distribution, and `sum_c |I_c| = m` pins the count-field widths to within a few
+parts in 10^4). It reads the baseline straight back out of any log that already
+carries one, and falls back to the estimate — under the legacy EF cost model,
+to stay consistent with that log's own `total` — only for older logs.
+
 ## Validation
 
 `./gcsa` runs, on every build:
 - brute-force check: `positions_of(c)` equals the true position set for every `c`;
 - serialized round-trip: decoding straight from the packed bytes gives the same;
+- baseline round-trip: the uncompressed baseline, built for real, answers the
+  same queries, *and* the size-only accounting used for the report agrees with
+  the encoder byte for byte (so the baseline can't quietly become a strawman);
 - the marker-byte check against the note's example.
 
 All pass for contiguous and gapped shapes on the bundled genomes. Example
@@ -221,9 +363,27 @@ compression on a 180 kb repetitive input: `####.####` → **40% of the full SA**
   stopped, as `gen X/Y (<budget source>, stop=<reason>)` with `reason` one
   of `fixed-point|max-iters|adaptive-stall`).
   Phase II runs a fixed budget of 100 dirty generations
-  (`kPhase2DefaultIters`), stopping earlier if it reaches a fixed point. The
-  budget comes from `--phase2-iters N`, else `GCSA_PHASE2_MAX_ITERS`, else the
-  default; `GCSA_TIMING=1` reports the effective value and its source. The
+  (`kPhase2DefaultIters`), stopping earlier if it reaches a fixed point. A
+  generation here is one sweep of the dirty set: retargeting a word frees the
+  source ranks it had pinned, which can make a better candidate legal for some
+  *other* word, and those get queued for the next generation. So a budget of 1
+  does the initial sweep and discards the queue it just built -- which is what
+  `auto-large-m` does on every input with `m >= 1e6`.
+  Budget precedence, most specific first: `GCSA_RETARGET_ITERS` (this pass
+  alone), else `--phase2-iters N`, else `GCSA_PHASE2_MAX_ITERS`, else
+  `GCSA_PHASE2_FAST`/`auto-large-m`, else the default; `GCSA_TIMING=1` reports
+  the effective value and its source. Everything from `--phase2-iters` down
+  sets the LNS too, so use `GCSA_RETARGET_ITERS` / `GCSA_LNS_ITERS` to move one
+  without the other.
+  This pass is additionally capped by wall clock at roughly Phase I's duration
+  (`GCSA_PHASE2_TIME_RATIO`, `GCSA_PHASE2_MIN_MS`), reported as
+  `stop=phase1-time-budget`. That makes `|C|` a function of machine speed and
+  load: with the cap landing mid-work, 10 identical runs of one config gave 10
+  different `|C|` spanning 26188-37858, against 7000 every time with the cap
+  off. `GCSA_DISABLE_RETARGET_TIMEOUT=1` removes elapsed time from the stopping
+  rule entirely, leaving the generation budget and the fixed point -- use it
+  for any number that has to be comparable across machines. The LNS has no
+  wall-clock cap. The
   adaptive early-stop
   (`GCSA_PHASE2_MIN_GAIN`, `GCSA_PHASE2_STALL`) ends generations when kept-drop
   plateaus, but is disabled by default (`GCSA_PHASE2_STALL=0`).

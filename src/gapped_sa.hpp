@@ -31,6 +31,9 @@
 #include <vector>
 #include <algorithm>
 #include <chrono>
+#include <cstring>
+#include <fstream>
+#include <unistd.h>
 
 namespace gcsa {
 
@@ -183,6 +186,207 @@ inline GappedSA build_gapped_sa(const Shape& shape, std::string text) {
             ms(t0, t1), ms(t1, t2), ms(t2, t3), ms(t3, t4), m, G.alphabet_size);
     }
     return G;
+}
+
+// ---------------------------------------------------------------------------
+// Serializing a built GappedSA ("blob")
+//
+// Why: building the SA is 37% of a benchmark sweep's total compute and depends
+// only on (text, shape) -- not on --algo, --max-add or --min-coverage -- so the
+// 15 runs of one (dataset, shape) cell rebuild the identical array 15 times.
+// Dumping it once and loading it back removes that, and removes the SA's
+// machine-to-machine timing variance from the running-time comparison.
+//
+// This is a same-machine cache, not an interchange format: the arrays go down
+// in host byte order and native widths. The header records enough to refuse
+// anything it does not recognize, which matters more here than portability --
+// silently loading the wrong SA would corrupt every downstream number without
+// crashing anything.
+//
+// Layout:
+//   magic       8   "GCSAGSA\0"
+//   version     u32 format version; a bump invalidates every existing blob
+//   endian      u32 0x01020304, refuses a foreign byte order
+//   shape_len   u32 followed by that many bytes of the shape pattern
+//   n           u64 text length
+//   m           u64 lex/sa/lcp length (== n+1)
+//   alphabet    i64 alphabet_size
+//   text_hash   u64 FNV-1a over the cleaned text
+//   text        n bytes
+//   lex         m * 8   (uint64)
+//   lex2orig    m * 8   (int64)
+//   sa          m * 4   (int32)
+//   lcp         m * 4   (int32)
+static constexpr uint32_t kGsaBlobVersion = 1;
+static constexpr uint32_t kGsaBlobEndian  = 0x01020304u;
+
+// FNV-1a. Used to name a blob after the text it was built from, so a cache
+// entry follows the content rather than a filename -- the concat inputs are
+// regenerated (fresh mtime, same bytes) before every sweep, so anything keyed
+// on the path or timestamp would miss exactly where the cache is worth most.
+inline uint64_t gcsa_fnv1a(const void* data, size_t len) {
+    const unsigned char* p = (const unsigned char*)data;
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < len; ++i) { h ^= p[i]; h *= 1099511628211ull; }
+    return h;
+}
+inline uint64_t gcsa_text_hash(const std::string& t) {
+    return gcsa_fnv1a(t.data(), t.size());
+}
+
+// Blob filename for a (text, shape) pair. Both are folded in, so two shapes
+// over one genome are different entries and can coexist in one directory.
+inline std::string gsa_blob_name(uint64_t text_hash, const std::string& shape_pattern) {
+    char buf[64];
+    std::snprintf(buf, sizeof buf, "%016llx_%016llx.gsa",
+                  (unsigned long long)text_hash,
+                  (unsigned long long)gcsa_fnv1a(shape_pattern.data(), shape_pattern.size()));
+    return std::string(buf);
+}
+
+namespace detail {
+template <class T>
+inline void gsa_put_vec(std::ostream& o, const std::vector<T>& v) {
+    if (!v.empty()) o.write((const char*)v.data(), (std::streamsize)(v.size() * sizeof(T)));
+}
+template <class T>
+inline bool gsa_get_vec(std::istream& i, std::vector<T>& v, size_t count) {
+    v.resize(count);
+    if (!count) return true;
+    i.read((char*)v.data(), (std::streamsize)(count * sizeof(T)));
+    return (size_t)i.gcount() == count * sizeof(T);
+}
+inline void gsa_put(std::ostream& o, const void* p, size_t n) { o.write((const char*)p, (std::streamsize)n); }
+inline bool gsa_get(std::istream& i, void* p, size_t n) {
+    i.read((char*)p, (std::streamsize)n);
+    return (size_t)i.gcount() == n;
+}
+}  // namespace detail
+
+// Bytes a blob for this SA will occupy -- for sizing a cache directory before
+// filling it, and to validate a file's length on load.
+inline uint64_t gsa_blob_bytes(uint64_t n, uint64_t m, uint32_t shape_len) {
+    return 8 + 4 + 4 + 4 + (uint64_t)shape_len + 8 + 8 + 8 + 8
+           + n + m * 8 + m * 8 + m * 4 + m * 4;
+}
+
+// Write `G` to `path`. The bytes go to a process-unique temp name in the same
+// directory and are renamed into place, so a blob at `path` is always whole:
+// a killed or out-of-disk writer leaves a .part behind rather than a truncated
+// SA that the next run would load and silently compute against.
+inline bool gsa_save(const GappedSA& G, const std::string& path, std::string* err) {
+    const std::string tmp = path + "." + std::to_string((long)::getpid()) + ".part";
+    {
+        std::ofstream o(tmp, std::ios::binary);
+        if (!o) { if (err) *err = "cannot open " + tmp + " for writing"; return false; }
+        const uint32_t ver = kGsaBlobVersion, endian = kGsaBlobEndian;
+        const uint32_t slen = (uint32_t)G.shape.pattern.size();
+        const uint64_t n = G.n, m = G.lex.size(), th = gcsa_text_hash(G.text);
+        const int64_t alpha = G.alphabet_size;
+        detail::gsa_put(o, "GCSAGSA\0", 8);
+        detail::gsa_put(o, &ver, 4);
+        detail::gsa_put(o, &endian, 4);
+        detail::gsa_put(o, &slen, 4);
+        detail::gsa_put(o, G.shape.pattern.data(), slen);
+        detail::gsa_put(o, &n, 8);
+        detail::gsa_put(o, &m, 8);
+        detail::gsa_put(o, &alpha, 8);
+        detail::gsa_put(o, &th, 8);
+        detail::gsa_put(o, G.text.data(), G.text.size());
+        detail::gsa_put_vec(o, G.lex);
+        detail::gsa_put_vec(o, G.lex2orig);
+        detail::gsa_put_vec(o, G.sa);
+        detail::gsa_put_vec(o, G.lcp);
+        o.flush();
+        if (!o) { if (err) *err = "write failed (disk full?): " + tmp; std::remove(tmp.c_str()); return false; }
+    }
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+        if (err) *err = "cannot rename " + tmp + " -> " + path;
+        std::remove(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+// Read a blob into `G`. Every header field is checked, and the file's length
+// must equal exactly what the header implies -- a short file means a truncated
+// or interrupted write, which must fail loudly rather than load a partial SA.
+// `expect_shape`, when non-null, additionally requires the blob to have been
+// built for that shape; that is the check that stops a stale or mismatched
+// cache entry from being compressed against the wrong pattern.
+inline bool gsa_load(GappedSA& G, const std::string& path,
+                     const std::string* expect_shape, std::string* err) {
+    std::ifstream i(path, std::ios::binary);
+    if (!i) { if (err) *err = "cannot open " + path; return false; }
+    char magic[8];
+    uint32_t ver = 0, endian = 0, slen = 0;
+    if (!detail::gsa_get(i, magic, 8) || std::memcmp(magic, "GCSAGSA\0", 8) != 0) {
+        { if (err) *err = path + ": not a gapped-SA blob";
+          return false; }
+    }
+    if (!detail::gsa_get(i, &ver, 4) || ver != kGsaBlobVersion) {
+        if (err) *err = path + ": format version " + std::to_string(ver) + ", this build writes "
+                       + std::to_string(kGsaBlobVersion) + " -- rebuild the cache";
+        return false;
+    }
+    if (!detail::gsa_get(i, &endian, 4) || endian != kGsaBlobEndian) {
+        { if (err) *err = path + ": built on a machine with a different byte order";
+          return false; }
+    }
+    if (!detail::gsa_get(i, &slen, 4) || slen == 0 || slen > 4096) {
+        { if (err) *err = path + ": bad shape length";
+          return false; }
+    }
+    std::string pattern(slen, '\0');
+    if (!detail::gsa_get(i, &pattern[0], slen)) {
+        { if (err) *err = path + ": truncated header";
+          return false; }
+    }
+    if (expect_shape && pattern != *expect_shape) {
+        if (err) *err = path + ": blob was built for shape " + pattern + ", not " + *expect_shape;
+        return false;
+    }
+    uint64_t n = 0, m = 0, th = 0; int64_t alpha = 0;
+    if (!detail::gsa_get(i, &n, 8) || !detail::gsa_get(i, &m, 8)
+        || !detail::gsa_get(i, &alpha, 8) || !detail::gsa_get(i, &th, 8)) {
+        { if (err) *err = path + ": truncated header";
+          return false; }
+    }
+    if (m != n + 1) {
+        { if (err) *err = path + ": inconsistent header (m != n+1)";
+          return false; }
+    }
+    {   // a blob shorter than its own header describes is a partial write
+        std::ifstream sz(path, std::ios::binary | std::ios::ate);
+        const uint64_t actual = (uint64_t)sz.tellg();
+        const uint64_t want = gsa_blob_bytes(n, m, slen);
+        if (actual != want) {
+            if (err) *err = path + ": size " + std::to_string(actual) + " bytes, header implies "
+                           + std::to_string(want) + " -- truncated or corrupt";
+            return false;
+        }
+    }
+    G = GappedSA{};
+    G.shape = Shape::parse(pattern);
+    G.n = (size_t)n;
+    G.alphabet_size = (int)alpha;
+    G.text.resize((size_t)n);
+    if (n && !detail::gsa_get(i, &G.text[0], (size_t)n)) {
+        { if (err) *err = path + ": truncated text";
+          return false; }
+    }
+    if (!detail::gsa_get_vec(i, G.lex, (size_t)m)
+        || !detail::gsa_get_vec(i, G.lex2orig, (size_t)m)
+        || !detail::gsa_get_vec(i, G.sa, (size_t)m)
+        || !detail::gsa_get_vec(i, G.lcp, (size_t)m)) {
+        { if (err) *err = path + ": truncated arrays";
+          return false; }
+    }
+    if (gcsa_text_hash(G.text) != th) {
+        { if (err) *err = path + ": text hash mismatch -- the blob is corrupt";
+          return false; }
+    }
+    return true;
 }
 
 } // namespace gcsa

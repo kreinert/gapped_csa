@@ -55,7 +55,54 @@ Useful flags:
   older run_suite.py (different columns) fails loudly rather than silently
   misaligning the CSV -- point `--out` at a new file in that case.
 - `--keep-synthetic` -- don't delete generated FASTAs from `--tmp-dir`
-  afterward, if you want to inspect one.
+  afterward, if you want to inspect one. A kept file is reused rather than
+  regenerated on the next run into the same scratch dir, so this doubles as a
+  cache; that is safe because generated inputs are written to a temp name and
+  `os.replace`d into position, making a file at the final path always
+  complete.
+- `--sa-cache DIR` / `--prepare-run` -- prepared gapped-SA blobs. The SA
+  depends only on `(text, shape)`, so the ~15 runs of one cell otherwise
+  rebuild it ~15 times; across the 2026-09-09/10 sweeps that was 47.9 h of
+  130.2 h total, and on the two large datasets it is 40-49% of every run's wall
+  time. `--prepare-run` materializes each dataset once, builds one blob per
+  shape, records the dataset's raw/gzip sizes in a JSON sidecar beside it, and
+  exits without running any experiment. The sweep then loads the blob and
+  **never opens the genome at all** -- which also takes the
+  generate/gzip/delete of a `concat` input out of the parallel path entirely,
+  removing the failure mode that corrupted the 2026-09-10 run. Budget ~25 bytes
+  per SA entry (~174 GB for the full 90-blob grid; 94% of that is
+  `human_freq_kmers` and `pangenome_ecoli_real_n100`). A cell with no blob
+  falls back to building from the genome, with a `[prepare-miss]` note; a blob
+  that is corrupt or built for another shape is refused loudly rather than
+  silently rebuilt.
+
+  **Preparation parallelizes too**, and shards on its own axis: over the
+  distinct `(dataset, shape)` pairs of the whole run, not over rows. Row
+  sharding deliberately scatters one dataset's experiments across every task,
+  which is right for the sweep and exactly wrong here -- each task would see
+  most shapes of most datasets and rebuild most of the cache (8.0x the total
+  work on the default 96-pair grid). Pair sharding builds each blob exactly
+  once, weighted by input size so the two huge datasets spread across tasks
+  rather than landing together (measured imbalance 1.22x heaviest:lightest over
+  8 shards). Already-present entries are skipped and every write is atomic, so
+  re-running or overlapping is safe.
+
+  ```bash
+  # prepare, in parallel -- same --array as the sweep
+  ./run_suite.py --sa-cache /scratch/sa --prepare-run --shard $I/$N
+  # then the sweep, also in parallel
+  ./run_suite.py --sa-cache /scratch/sa --shard $I/$N ...
+  ```
+
+  The two must not overlap in time: a sweep task that starts before its blobs
+  exist falls back to building from the genome. Sequence them with a SLURM
+  dependency (`--dependency=afterok:<prepare job id>`), which also gives the
+  prepare array its own, larger `--mem`.
+- `--tmp-tag NAME` -- put this run's generated inputs in `--tmp-dir/NAME`
+  instead of the automatic per-shard subdirectory. Needed whenever the shard
+  index isn't unique across the processes running at once: several unsharded
+  runs together, or two array jobs whose task indices coincide
+  (`--tmp-tag $SLURM_ARRAY_JOB_ID.$SLURM_ARRAY_TASK_ID` covers that).
 - `--log-dir DIR` -- keep every `./gcsa` invocation's full stdout+stderr as
   `DIR/<dataset>__<shape>__<algo>__ma<max_add>[__noretarget|__nolns|__nophase2].log`
   (command,
@@ -119,6 +166,17 @@ Useful flags:
   once *per shard it appears in*, not once total across the whole run --
   usually a good trade for the load balancing it buys, but worth knowing
   for an expensive `concat`/`fetched` dataset split across many shards.
+  Each shard also gets its own scratch directory for generated inputs,
+  `--tmp-dir/shard<I>of<N>/`, and removes it on the way out. This is not
+  optional bookkeeping: the path a generated input is written to derives from
+  the dataset name alone, so shards sharing one scratch dir truncate and
+  delete each other's inputs mid-read. That shows up as `cannot open <fasta>`
+  from `./gcsa`, as `OSError: [Errno 16] Device or resource busy` from
+  `gzip_ratio` (on NFS an unlinked-but-open file is silly-renamed, and reads
+  of it then fail), and -- worst, because it is silent -- as a run that exits
+  0 having compressed a partly-written file. Budget the disk: a `concat`
+  dataset split across N shards is materialized N times over. `--tmp-tag`
+  overrides the subdirectory name when the shard index isn't unique enough.
   Filters *after* `--only-category`/`--only-dataset`, over whatever's left.
   Each shard needs its own `--out` so parallel jobs don't clobber each
   other's file -- if you don't pass `--out` explicitly while using `--shard`,

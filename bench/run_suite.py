@@ -79,13 +79,20 @@ Two ways to run this concurrently on a cluster -- combine them freely:
                                                     # shards pays its fetch/
                                                     # generate + gzip cost
                                                     # once per shard it's in.
-  # a SLURM array job putting both together:
+  # a SLURM array job putting both together (note --array is 0-based, to
+  # match --shard's 0-based I):
+  #   #SBATCH --array=0-7
   #   --shard $SLURM_ARRAY_TASK_ID/$SLURM_ARRAY_TASK_COUNT --jobs $SLURM_CPUS_PER_TASK
+  # Each shard generates its inputs in its own --tmp-dir/shard<I>of<N>/, so
+  # concurrent tasks cannot truncate or delete each other's; see
+  # run_scratch_dir. Use --tmp-tag when the shard index alone isn't unique
+  # across everything running at once.
 """
 import argparse
 import concurrent.futures
 import csv
 import gzip
+import json
 import os
 import re
 import subprocess
@@ -101,8 +108,26 @@ CSV_FIELDS = [
     "dataset", "category", "path", "raw_bytes", "gzip_bytes", "gzip_ratio",
     "shape", "span", "weight", "algo", "max_add", "phase2",
     "distinct_kmers", "m", "C", "keep_pct",
-    "bytes_total", "full_sa_bytes", "size_pct",
-    "self_test", "roundtrip", "wall_ms", "status", "log_path",
+    # the serialized index, component by component
+    "pb", "bytes_C", "bytes_H", "bytes_SH", "bytes_names", "bytes_total",
+    # the bare-SA comparison: historical, and not like-for-like (a bare suffix
+    # array has no k-mer -> interval map, so it does not answer our query).
+    # Kept because older CSVs have it; quote baseline_pct instead.
+    "full_sa_bytes", "size_pct",
+    # the like-for-like uncompressed baseline: full SA + a hash table whose
+    # every entry is one H_rest pointing at that k-mer's own interval
+    "baseline_C", "baseline_H", "baseline_SH", "baseline_names",
+    "baseline_total", "baseline_pct",
+    # hash-table composition, and where H's bytes actually go. rest_pos is the
+    # line item to watch: SA intervals are contiguous and in name order, so
+    # those bytes are derivable rather than stored, on both sides.
+    "entries_rest_only", "entries_offset_only", "entries_both", "entries_empty",
+    "h_marker_bytes", "h_off_pos_bytes", "h_off_add_bytes", "h_off_num_bytes",
+    "h_rest_pos_bytes", "h_rest_num_bytes",
+    "baseline_h_marker_bytes", "baseline_h_rest_pos_bytes", "baseline_h_rest_num_bytes",
+    "offsets", "offset_positions", "avg_coverage",
+    "self_test", "roundtrip", "baseline_roundtrip",
+    "wall_ms", "status", "log_path",
 ]
 
 # Characters a shape string may legitimately contain (see main.cpp) --
@@ -146,7 +171,22 @@ GCSA_RE = {
     "c_keep": re.compile(r"stored positions \(\|C\|\):\s*(\d+)\s*\(([\d.]+)% of full SA\)"),
     "self_test": re.compile(r"self-test \(vs brute force\):\s*(\S+)"),
     "roundtrip": re.compile(r"serialized round-trip\s*:\s*(\S+)"),
-    "size": re.compile(r"total=(\d+)\s*\(full SA would be (\d+) bytes; ([\d.]+)%\)"),
+    "baseline_roundtrip": re.compile(r"baseline round-trip\s*:\s*(\S+)"),
+    "size": re.compile(
+        r"pb\(bytes/pos\)=(\d+)\s+\|C\|\*pb=(\d+)\s+H=(\d+)\s+S_H=(\d+)"
+        r"\s+names=(\d+)\s+total=(\d+)\s+\(full SA would be (\d+) bytes; ([\d.]+)%\)"),
+    "baseline": re.compile(
+        r"baseline \(full SA \+ rest-only H\): pb=(\d+)\s+m\*pb=(\d+)\s+H=(\d+)"
+        r"\s+S_H=(\d+)\s+names=(\d+)\s+total=(\d+)"),
+    "baseline_pct": re.compile(r"vs\. baseline:\s*([\d.]+)%"),
+    "entry_mix": re.compile(
+        r"entry mix: rest-only=(\d+)\s+offset-only=(\d+)\s+both=(\d+)\s+empty=(\d+)"),
+    "h_bytes": re.compile(
+        r"H bytes\s*: marker=(\d+)\s+off\(pos/add/num\)=(\d+)/(\d+)/(\d+)"
+        r"\s+rest\(pos/num\)=(\d+)/(\d+)"
+        r"\s+\[baseline: marker=(\d+)\s+rest\(pos/num\)=(\d+)/(\d+)\]"),
+    "links": re.compile(
+        r"links\s*: (\d+) offsets covering (\d+) positions \(avg coverage ([\d.]+)"),
 }
 
 
@@ -160,10 +200,35 @@ def parse_gcsa_stdout(text: str) -> dict:
         out["C"] = int(m.group(1)); out["keep_pct"] = float(m.group(2))
     if (m := GCSA_RE["self_test"].search(text)): out["self_test"] = m.group(1)
     if (m := GCSA_RE["roundtrip"].search(text)): out["roundtrip"] = m.group(1)
+    if (m := GCSA_RE["baseline_roundtrip"].search(text)):
+        out["baseline_roundtrip"] = m.group(1)
     if (m := GCSA_RE["size"].search(text)):
-        out["bytes_total"] = int(m.group(1))
-        out["full_sa_bytes"] = int(m.group(2))
-        out["size_pct"] = float(m.group(3))
+        (out["pb"], out["bytes_C"], out["bytes_H"], out["bytes_SH"],
+         out["bytes_names"], out["bytes_total"], out["full_sa_bytes"]) = (
+            int(g) for g in m.groups()[:7])
+        out["size_pct"] = float(m.group(8))
+    if (m := GCSA_RE["baseline"].search(text)):
+        # group(1) is the baseline's own pb; it equals the index's pb except in
+        # the corner case where compression drops |C| into a smaller byte
+        # bracket, so it is not stored separately -- bytes_C/baseline_C already
+        # carry the effect.
+        (out["baseline_C"], out["baseline_H"], out["baseline_SH"],
+         out["baseline_names"], out["baseline_total"]) = (
+            int(g) for g in m.groups()[1:6])
+    if (m := GCSA_RE["baseline_pct"].search(text)):
+        out["baseline_pct"] = float(m.group(1))
+    if (m := GCSA_RE["entry_mix"].search(text)):
+        (out["entries_rest_only"], out["entries_offset_only"],
+         out["entries_both"], out["entries_empty"]) = (int(g) for g in m.groups())
+    if (m := GCSA_RE["h_bytes"].search(text)):
+        (out["h_marker_bytes"], out["h_off_pos_bytes"], out["h_off_add_bytes"],
+         out["h_off_num_bytes"], out["h_rest_pos_bytes"], out["h_rest_num_bytes"],
+         out["baseline_h_marker_bytes"], out["baseline_h_rest_pos_bytes"],
+         out["baseline_h_rest_num_bytes"]) = (int(g) for g in m.groups())
+    if (m := GCSA_RE["links"].search(text)):
+        out["offsets"] = int(m.group(1))
+        out["offset_positions"] = int(m.group(2))
+        out["avg_coverage"] = float(m.group(3))
     return out
 
 
@@ -189,6 +254,115 @@ def gzip_ratio(path: Path) -> "tuple[int, int, float]":
     gz_bytes = counter.n
     ratio = raw / gz_bytes if gz_bytes else float("inf")
     return raw, gz_bytes, ratio
+
+
+# --- prepared gapped-SA cache ------------------------------------------------
+# The gapped SA depends only on (text, shape) -- never on --algo, --max-add or
+# --min-coverage -- so the ~15 runs of one (dataset, shape) cell rebuild the
+# identical array ~15 times. Across the 2026-09-09/10 sweeps that was 47.9 h of
+# 130.2 h total. --prepare-run builds each one once; the sweep then loads it.
+#
+# Each blob gets a small JSON sidecar keyed on (dataset, shape), holding the
+# blob's name and the dataset's raw/gzip sizes. The sizes matter as much as the
+# blob: computing them is what forced every task to materialize, stream and
+# then DELETE the generated FASTA, which is the race that corrupted the
+# 2026-09-10 run. With the sidecar present the sweep never opens the genome at
+# all -- the blob carries the text -- so the whole class of failure leaves the
+# hot path.
+def sa_meta_path(cache_dir: Path, ds_name: str, shape: str) -> Path:
+    shape_part = shape if _SHAPE_FILENAME_SAFE.match(shape) else re.sub(r"[^\w.-]", "_", shape)
+    return cache_dir / "meta" / f"{ds_name}__{shape_part}.json"
+
+
+def read_sa_meta(cache_dir: "Path | None", ds_name: str, shape: str) -> "dict | None":
+    """The sidecar for one (dataset, shape), or None if it isn't prepared.
+    Anything unreadable or missing a field counts as not prepared: falling back
+    to building is always correct, whereas trusting a half-written sidecar is
+    not."""
+    if cache_dir is None:
+        return None
+    p = sa_meta_path(cache_dir, ds_name, shape)
+    try:
+        with open(p) as f:
+            m = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not all(k in m for k in ("blob", "raw_bytes", "gzip_bytes", "gzip_ratio")):
+        return None
+    return m if (cache_dir / m["blob"]).exists() else None
+
+
+def write_sa_meta(cache_dir: Path, ds_name: str, shape: str, meta: dict) -> None:
+    p = sa_meta_path(cache_dir, ds_name, shape)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(f".{p.name}.{os.getpid()}.part")
+    with open(tmp, "w") as f:
+        json.dump(meta, f, indent=1)
+    os.replace(tmp, p)
+
+
+def run_scratch_dir(base: Path, shard_i, shard_n, tag: "str | None") -> Path:
+    """Where THIS process writes the inputs it generates ("synthetic") or
+    concatenates ("concat").
+
+    These are built under --tmp-dir at a path derived from the dataset name
+    alone, so every process pointed at the same --tmp-dir builds, reads and
+    then deletes the very same file. One process is fine; several are not.
+    Two run_suite.py processes sharing a scratch dir will truncate each
+    other's input mid-read (`cannot open <fasta>` from ./gcsa) and delete it
+    out from under each other's gzip_ratio (on NFS the unlinked-but-open file
+    is silly-renamed and further reads fail with EBUSY, "Device or resource
+    busy"). Row-balanced sharding makes this near-certain: a big concat
+    dataset is normally split across every shard, so every array task wants
+    to materialize it at the same moment.
+
+    So each shard gets its own subdirectory. --tmp-tag overrides, for the
+    cases the shard index does not cover: several unsharded runs at once, or
+    two array jobs whose task indices coincide (pass e.g.
+    --tmp-tag $SLURM_ARRAY_JOB_ID.$SLURM_ARRAY_TASK_ID). A plain unsharded
+    run keeps using --tmp-dir itself, as before.
+
+    Note --jobs needs nothing here: it parallelizes ./gcsa invocations within
+    one process, while resolve_path/gzip_ratio/unlink all stay on the main
+    thread, so a generated input is materialized once and never concurrently.
+
+    Shard balancing is unaffected: estimate_input_bytes derives "synthetic"
+    sizes from the generator's args and "concat" sizes from their refs, and
+    never stat()s anything under tmp_dir -- so every independently-launched
+    --shard I/N still computes the same partition no matter how its own
+    scratch dir is named."""
+    if tag:
+        return base / tag
+    if shard_i is not None:
+        return base / f"shard{shard_i}of{shard_n}"
+    return base
+
+
+def materialize(out_path: Path, produce, log) -> "Path | None":
+    """Produce `out_path` via `produce(tmp)`, which must write the file at the
+    temp path it is handed, and return True on success.
+
+    The write goes to a process-unique temp name in the same directory and is
+    then os.replace()d into position. That rename is atomic, so a file sitting
+    at out_path is always complete: an interrupted run leaves a .part behind
+    rather than a truncated FASTA that the next run would happily compress and
+    feed to ./gcsa. It also means an existing file can simply be reused, which
+    is what makes --keep-synthetic usable as a cache across runs."""
+    if out_path.exists() and out_path.stat().st_size > 0:
+        return out_path
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out_path.with_name(f".{out_path.name}.{os.getpid()}.part")
+    try:
+        if not produce(tmp):
+            return None
+        os.replace(tmp, out_path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError as e:
+                log(f"[warn] could not remove partial file {tmp}: {e}")
+    return out_path
 
 
 def resolve_path(name: str, by_name: dict, bin_dir: Path, data_dir: Path,
@@ -243,13 +417,14 @@ def resolve_path(name: str, by_name: dict, bin_dir: Path, data_dir: Path,
                 else:
                     resolved_args.append(a)
             if ok:
-                out_path = tmp_dir / f"{name}.fasta"
-                cmd = [str(gen_bin), *resolved_args, "-o", str(out_path)]
-                r = subprocess.run(cmd, capture_output=True, text=True)
-                if r.returncode != 0:
-                    log(f"[skip] {name}: generator failed: {r.stderr.strip()}")
-                else:
-                    path = out_path
+                def gen(tmp, _args=resolved_args, _bin=gen_bin, _n=name):
+                    cmd = [str(_bin), *_args, "-o", str(tmp)]
+                    r = subprocess.run(cmd, capture_output=True, text=True)
+                    if r.returncode != 0:
+                        log(f"[skip] {_n}: generator failed: {r.stderr.strip()}")
+                        return False
+                    return True
+                path = materialize(tmp_dir / f"{name}.fasta", gen, log)
 
     elif ds["kind"] == "concat":
         parts = []
@@ -263,13 +438,14 @@ def resolve_path(name: str, by_name: dict, bin_dir: Path, data_dir: Path,
                 break
             parts.append(p)
         if ok:
-            out_path = tmp_dir / f"{name}.fasta"
-            with open(out_path, "wb") as fout:
-                for p in parts:
-                    with open(p, "rb") as fin:
-                        fout.write(fin.read())
-                    fout.write(b"\n")  # guard against a missing trailing newline
-            path = out_path
+            def cat(tmp, _parts=parts):
+                with open(tmp, "wb") as fout:
+                    for p in _parts:
+                        with open(p, "rb") as fin:
+                            fout.write(fin.read())
+                        fout.write(b"\n")  # guard a missing trailing newline
+                return True
+            path = materialize(tmp_dir / f"{name}.fasta", cat, log)
 
     else:
         log(f"[skip] {name}: unknown kind {ds['kind']!r}")
@@ -383,6 +559,35 @@ def balance_rows(rows: list, weights: dict, shard_n: int) -> "tuple[list, list]"
     return [[rows[i] for i in b] for b in bins], totals
 
 
+def balance_pairs(pairs: list, weights: dict, shard_n: int) -> "tuple[list, list]":
+    """The same greedy longest-processing-time-first packing as balance_rows,
+    but over (dataset_name, shape) PAIRS -- the granularity at which the gapped
+    SA is built and cached.
+
+    --prepare-run must not reuse the row partition. Row sharding deliberately
+    scatters one dataset's experiments across every task, which is right for
+    the sweep and exactly wrong here: each task would then see most shapes of
+    most datasets and build most of the blobs, so N tasks do far more than N
+    times one task's useful work rather than 1/N each. Splitting the distinct
+    pairs instead builds every blob exactly once, with weighting so the handful
+    of huge datasets do not all land on one task.
+
+    Deterministic given the same (pairs, weights, shard_n) -- pairs are sorted
+    first -- so every independently-launched --shard I/N task computes the same
+    partition with no coordination."""
+    pairs = sorted(pairs)
+    order = sorted(range(len(pairs)), key=lambda i: (-weights.get(pairs[i][0], 0), i))
+    totals = [0] * shard_n
+    bins = [[] for _ in range(shard_n)]
+    for i in order:
+        b = min(range(shard_n), key=lambda b: (totals[b], b))
+        bins[b].append(i)
+        totals[b] += weights.get(pairs[i][0], 0)
+    for b in bins:
+        b.sort()
+    return [[pairs[i] for i in b] for b in bins], totals
+
+
 def already_done(out_csv: Path) -> set:
     if not out_csv.exists():
         return set()
@@ -422,7 +627,7 @@ def check_resumable_schema(out_csv: Path) -> None:
 
 
 def run_experiment(bin_dir, path, ds, raw, gz, ratio, shape, algo, max_add,
-                    phase2_label, skip_selftest, extra_env, log_dir):
+                    phase2_label, skip_selftest, extra_env, log_dir, sa_blob=None):
     """Run one (shape, algo, max_add) experiment for an already-resolved
     dataset and return (row, log_path, log_text, fail_msg) -- pure aside
     from the ./gcsa subprocess call itself, so it's safe to run concurrently
@@ -446,8 +651,13 @@ def run_experiment(bin_dir, path, ds, raw, gz, ratio, shape, algo, max_add,
     env = dict(os.environ)
     env.update(overrides)
 
-    cmd = [str(bin_dir / "gcsa"), "-g", str(path), "-s", shape,
-           "--algo", algo, "--max-add", str(max_add)]
+    # With a prepared blob the SA is loaded rather than rebuilt, and the genome
+    # is not opened at all -- the blob carries the text. --sa-load refuses a
+    # missing or shape-mismatched blob rather than silently rebuilding, so a
+    # stale cache fails loudly instead of costing 1000s per run in silence.
+    cmd = [str(bin_dir / "gcsa")]
+    cmd += (["--sa-load", str(sa_blob)] if sa_blob else ["-g", str(path)])
+    cmd += ["-s", shape, "--algo", algo, "--max-add", str(max_add)]
     t0 = time.perf_counter()
     r = subprocess.run(cmd, capture_output=True, text=True, env=env)
     row["wall_ms"] = round((time.perf_counter() - t0) * 1000, 1)
@@ -458,12 +668,20 @@ def run_experiment(bin_dir, path, ds, raw, gz, ratio, shape, algo, max_add,
         fail_msg = f"  [FAIL] {ds['name']} {shape} {algo} ma={max_add}: {row['status']}"
     else:
         row.update(parse_gcsa_stdout(r.stdout))
-        bad = row.get("self_test") == "FAIL" or row.get("roundtrip") == "FAIL"
+        # The baseline round-trip also covers the H-breakdown invariants (the
+        # per-component bytes adding back up to H, and the rest/offset position
+        # counts partitioning the SA), so a FAIL there is a real correctness
+        # failure, not just a reporting one. Its value starts with "FAIL" and
+        # carries a reason in parentheses, hence startswith rather than ==.
+        bad = (row.get("self_test") == "FAIL"
+               or row.get("roundtrip") == "FAIL"
+               or str(row.get("baseline_roundtrip") or "").startswith("FAIL"))
         if bad:
             row["status"] = "correctness_fail"
             fail_msg = (f"  [FAIL] {ds['name']} {shape} {algo} ma={max_add}: "
                         f"self_test={row.get('self_test')} "
-                        f"roundtrip={row.get('roundtrip')}")
+                        f"roundtrip={row.get('roundtrip')} "
+                        f"baseline_roundtrip={row.get('baseline_roundtrip')}")
 
     log_path, log_text = None, None
     if log_dir is not None:
@@ -490,7 +708,19 @@ def main():
     ap.add_argument("--data-dir", default=None,
                      help="fetched/provided FASTAs (default: see config.py)")
     ap.add_argument("--tmp-dir", default=None,
-                     help="synthetic-input scratch dir (default: see config.py)")
+                     help="scratch dir for generated inputs -- the synthetic ones and the "
+                          "concatenated ones (default: see config.py). With --shard, each "
+                          "shard writes into its own shard<I>of<N>/ subdirectory of this, "
+                          "since concurrent processes sharing one scratch dir delete and "
+                          "truncate each other's inputs. See --tmp-tag.")
+    ap.add_argument("--tmp-tag", default=None, metavar="NAME",
+                     help="put this run's generated inputs in --tmp-dir/NAME instead of the "
+                          "automatic per-shard subdirectory. Needed whenever the shard index "
+                          "isn't unique across the processes running at once: several "
+                          "unsharded runs together, or two array jobs whose task indices "
+                          "coincide (--tmp-tag $SLURM_ARRAY_JOB_ID.$SLURM_ARRAY_TASK_ID "
+                          "covers that). --jobs needs nothing: it parallelizes ./gcsa calls "
+                          "inside one process, which still materializes each input once.")
     ap.add_argument("--out", default=None,
                      help="default: results/suite.csv, or results/suite.shard<I>of<N>.csv "
                           "if --shard is given without an explicit --out (so parallel "
@@ -504,6 +734,26 @@ def main():
                      help="don't delete generated synthetic FASTAs from --tmp-dir afterward")
     ap.add_argument("--resume", action="store_true",
                      help="skip (dataset, shape, algo, max_add, phase2) rows already in --out")
+    ap.add_argument("--sa-cache", default=None, metavar="DIR",
+                     help="directory of prepared gapped-SA blobs. The SA depends only on "
+                          "(text, shape), so the ~15 runs of one cell otherwise rebuild it "
+                          "~15 times -- 37%% of a sweep's compute in the 2026-09 runs. With "
+                          "a blob present the run loads it and never opens the genome, "
+                          "which also keeps the generate/gzip/delete of a concat input out "
+                          "of the parallel path entirely. Build the blobs with "
+                          "--prepare-run; a cell with no blob falls back to building.")
+    ap.add_argument("--prepare-run", action="store_true",
+                     help="build the --sa-cache entries for this run's (dataset, shape) "
+                          "pairs and exit, running no experiments -- the analogue of "
+                          "--dry-run for the SA cache. Each dataset is materialized and "
+                          "gzip-measured once, and those sizes are recorded alongside the "
+                          "blob so the sweep needs neither. Parallelize it with --shard: "
+                          "preparation is split over (dataset, shape) PAIRS rather than "
+                          "over rows, so each blob is built by exactly one task -- reusing "
+                          "the row partition would have every task see most shapes and "
+                          "rebuild most of the cache (8x the work on the default grid). "
+                          "Already-present entries are skipped, and blobs and sidecars are "
+                          "written atomically, so re-running or overlapping is safe.")
     ap.add_argument("--dry-run", action="store_true", help="print the plan, run nothing")
     ap.add_argument("--log-dir", default=None,
                      help="write each ./gcsa invocation's full stdout+stderr here, one "
@@ -567,9 +817,13 @@ def main():
                           "needed. Estimates for fetched/provided datasets come from "
                           "stat()-ing the cached file, so run ./fetch_data.py first for "
                           "balancing to reflect real sizes (unfetched ones weigh 0 and "
-                          "may land anywhere). Trade-off: a dataset split across multiple "
-                          "shards has its fetch/generate + gzip cost paid once per shard "
-                          "it appears in, not once total -- combine with --jobs for "
+                          "may land anywhere). Each shard generates its inputs in its own "
+                          "--tmp-dir/shard<I>of<N>/ and removes it afterward, since shards "
+                          "sharing one scratch dir truncate and delete each other's inputs "
+                          "mid-read (see run_scratch_dir); --tmp-tag overrides that name. "
+                          "Trade-off: a dataset split across multiple shards has its "
+                          "fetch/generate + gzip cost -- and now its disk footprint -- paid "
+                          "once per shard it appears in, not once total. Combine with --jobs for "
                           "finer-grained parallelism within one shard. Filters AFTER "
                           "--only-category/--only-dataset, over whatever's left. Each "
                           "shard needs its own --out (see --out's default); concatenate "
@@ -607,7 +861,10 @@ def main():
 
     bin_dir = config.resolve("BIN_DIR", args.bin_dir)
     data_dir = config.resolve("DATA_DIR", args.data_dir)
-    tmp_dir = config.resolve("TMP_DIR", args.tmp_dir)
+    tmp_base = config.resolve("TMP_DIR", args.tmp_dir)
+    sa_cache = Path(args.sa_cache) if args.sa_cache else None
+    tmp_dir = run_scratch_dir(tmp_base, shard_i, shard_n, args.tmp_tag)
+    tmp_scoped = tmp_dir != tmp_base
     out_csv = Path(out_path_str)
     tmp_dir.mkdir(parents=True, exist_ok=True)
     out_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -676,14 +933,19 @@ def main():
     def log(msg):
         print(msg, file=sys.stderr)
 
+    def blob_for(meta):
+        """Absolute path of a prepared blob, or None to build from the genome."""
+        return (sa_cache / meta["blob"]) if (sa_cache is not None and meta) else None
+
     if args.disable_phase2 and not args.disable_retarget:
         print("note: --disable-phase2 is deprecated; it means --disable-retarget "
               "(the LNS still runs). Add --disable-lns to skip both passes.",
               file=sys.stderr)
     phase2_label = PHASE2_LABEL[(args.disable_retarget or args.disable_phase2,
                                   args.disable_lns)]
-    log(f"bin-dir={bin_dir}  data-dir={data_dir}  tmp-dir={tmp_dir}  out={out_csv}  "
-        f"(run 'python3 config.py' to see where each came from)")
+    log(f"bin-dir={bin_dir}  data-dir={data_dir}  tmp-dir={tmp_dir}"
+        + (f" (own scratch dir under {tmp_base})" if tmp_scoped else "")
+        + f"  out={out_csv}  (run 'python3 config.py' to see where each came from)")
     shard_log_suffix = ""
     if args.shard is not None:
         assert shard_bytes is not None  # set together with shard_i/shard_n, above
@@ -700,6 +962,78 @@ def main():
         log("extra env: " + " ".join(f"{k}={v}" for k, v in extra_env.items())
             + "  (also GCSA_SKIP_SELFTEST=1 automatically on inputs over "
               f"{SKIP_SELFTEST_ABOVE_BYTES} bytes, unless overridden above)")
+
+    if args.prepare_run:
+        if sa_cache is None:
+            sys.exit("[error] --prepare-run needs --sa-cache DIR to write into")
+        sa_cache.mkdir(parents=True, exist_ok=True)
+        # Local to this pass: the sweep below keeps its own, and the two never
+        # run in the same invocation.
+        resolved_cache = {}
+        # Note all_rows, not rows: the pairs to prepare are a property of the
+        # whole sweep, and are then split across shards in their own right.
+        want = sorted({(d["name"], shape) for d, shape, _a, _m in all_rows})
+        if shard_n is not None:
+            pair_bins, pair_totals = balance_pairs(want, weights, shard_n)
+            mine, my_weight = pair_bins[shard_i], pair_totals[shard_i]
+            log(f"prepare shard {shard_i}/{shard_n}: {len(mine)}/{len(want)} "
+                f"(dataset, shape) pair(s), ~{my_weight / 1e6:.1f} MB of input weight")
+        else:
+            mine = want
+        pairs = {}
+        for ds_name, shape in mine:
+            pairs.setdefault(ds_name, set()).add(shape)
+        n_have = n_new = n_fail = 0
+        for ds_name, shapes in pairs.items():
+            todo = sorted(sh for sh in shapes if not read_sa_meta(sa_cache, ds_name, sh))
+            n_have += len(shapes) - len(todo)
+            if not todo:
+                log(f"[have] {ds_name}: all {len(shapes)} shape(s) already prepared")
+                continue
+            # One materialization and one gzip pass for the whole dataset, not
+            # one per shape and emphatically not one per run.
+            path = resolve_path(ds_name, by_name, bin_dir, data_dir, tmp_dir,
+                                 resolved_cache, log)
+            if path is None:
+                n_fail += len(todo)
+                continue
+            raw, gz, ratio = gzip_ratio(path)
+            log(f"[ok] {ds_name}: {path}  {raw} bytes, gzip_ratio={ratio:.3f}"
+                f"  -- preparing {len(todo)} shape(s)")
+            for shape in todo:
+                cmd = [str(bin_dir / "gcsa"), "-g", str(path), "-s", shape,
+                       "--sa-cache", str(sa_cache), "--prepare-only"]
+                env = dict(os.environ); env.update(extra_env)
+                t0 = time.perf_counter()
+                r = subprocess.run(cmd, capture_output=True, text=True, env=env)
+                dt = time.perf_counter() - t0
+                mo = re.search(r"prepared (\S+)\s+m=(\d+)\s+bytes=(\d+)", r.stdout)
+                if r.returncode != 0 or not mo:
+                    n_fail += 1
+                    log(f"  [FAIL] {shape}: {(r.stderr or r.stdout).strip()[:200]}")
+                    continue
+                blob, m, nbytes = Path(mo.group(1)).name, int(mo.group(2)), int(mo.group(3))
+                write_sa_meta(sa_cache, ds_name, shape, {
+                    "blob": blob, "dataset": ds_name, "shape": shape, "m": m,
+                    "blob_bytes": nbytes, "raw_bytes": raw, "gzip_bytes": gz,
+                    "gzip_ratio": round(ratio, 6),
+                })
+                n_new += 1
+                log(f"  [prepared] {shape}  m={m:,}  {nbytes/1e9:.2f} GB  in {dt:.1f}s")
+            if (by_name[ds_name]["kind"] in ("synthetic", "concat")
+                    and not args.keep_synthetic):
+                path.unlink(missing_ok=True)
+        if tmp_scoped:
+            try:
+                tmp_dir.rmdir()
+            except OSError:
+                pass
+        total = sum(len(v) for v in pairs.values())
+        log(f"prepared {n_new} new, {n_have} already present, {n_fail} failed "
+            f"({total} (dataset, shape) pair(s) assigned to this invocation)")
+        on_disk = sum(p.stat().st_size for p in sa_cache.glob("*.gsa"))
+        log(f"cache now holds {len(list(sa_cache.glob('*.gsa')))} blob(s), {on_disk/1e9:.1f} GB")
+        return 1 if n_fail else 0
 
     if args.dry_run:
         print(f"{len(datasets)} datasets x {len(args.shapes)} shapes x "
@@ -747,13 +1081,30 @@ def main():
 
         for ds_name, combos in rows_by_dataset.items():
             ds = by_name[ds_name]
-            path = resolve_path(ds_name, by_name, bin_dir, data_dir, tmp_dir,
-                                 resolved_cache, log)
-            if path is None:
-                continue
-
-            raw, gz, ratio = gzip_ratio(path)
-            log(f"[ok] {ds_name}: {path}  {raw} bytes, gzip_ratio={ratio:.3f}")
+            # Every shape this shard needs for this dataset must be prepared
+            # before we can skip the genome entirely -- one missing blob and we
+            # have to materialize the FASTA anyway, so there is nothing to gain
+            # from a partial skip.
+            shapes_needed = {shape for shape, _, _ in combos}
+            metas = {sh: read_sa_meta(sa_cache, ds_name, sh) for sh in shapes_needed}
+            path = None
+            if sa_cache is not None and all(metas.values()):
+                m0 = metas[next(iter(shapes_needed))]
+                raw, gz, ratio = m0["raw_bytes"], m0["gzip_bytes"], m0["gzip_ratio"]
+                log(f"[prepared] {ds_name}: {len(shapes_needed)} SA blob(s) in {sa_cache}"
+                    f"  {raw} bytes, gzip_ratio={ratio:.3f}  (genome not opened)")
+            else:
+                if sa_cache is not None:
+                    missing = sorted(sh for sh, m in metas.items() if not m)
+                    log(f"[prepare-miss] {ds_name}: no blob for {len(missing)} shape(s) "
+                        f"({', '.join(missing[:3])}{'...' if len(missing) > 3 else ''}) "
+                        f"-- building from the genome; run --prepare-run to avoid this")
+                path = resolve_path(ds_name, by_name, bin_dir, data_dir, tmp_dir,
+                                     resolved_cache, log)
+                if path is None:
+                    continue
+                raw, gz, ratio = gzip_ratio(path)
+                log(f"[ok] {ds_name}: {path}  {raw} bytes, gzip_ratio={ratio:.3f}")
             skip_selftest = raw > SKIP_SELFTEST_ABOVE_BYTES
 
             todo_jobs = [
@@ -776,7 +1127,8 @@ def main():
                 for shape, algo, max_add in todo_jobs:
                     emit(run_experiment(bin_dir, path, ds, raw, gz, ratio, shape, algo,
                                          max_add, phase2_label, skip_selftest,
-                                         extra_env, log_dir))
+                                         extra_env, log_dir,
+                                         blob_for(metas.get(shape))))
             else:
                 # Concurrent subprocess dispatch; all file writes (CSV row,
                 # log file) still happen only here on the main thread, in
@@ -786,17 +1138,35 @@ def main():
                     futures = [
                         pool.submit(run_experiment, bin_dir, path, ds, raw, gz, ratio,
                                     shape, algo, max_add, phase2_label, skip_selftest,
-                                    extra_env, log_dir)
+                                    extra_env, log_dir, blob_for(metas.get(shape)))
                         for shape, algo, max_add in todo_jobs
                     ]
                     for fut in concurrent.futures.as_completed(futures):
                         emit(fut.result())
 
-            if by_name[ds["name"]]["kind"] in ("synthetic", "concat") and not args.keep_synthetic:
+            if (path is not None
+                    and by_name[ds["name"]]["kind"] in ("synthetic", "concat")
+                    and not args.keep_synthetic):
                 path.unlink(missing_ok=True)
+
+    # A per-shard scratch dir is this run's alone, so take it with us when it
+    # is empty -- including under --keep-synthetic, where an empty one means
+    # this shard drew no rows that needed a generated input and so has nothing
+    # to keep. rmdir (not rmtree) on purpose: it fails harmlessly the moment
+    # anything is still in there, and what would be in there is a kept input
+    # or a .part from a crash -- silently deleting either would be worse than
+    # leaving the directory behind.
+    if tmp_scoped:
+        try:
+            tmp_dir.rmdir()
+        except OSError:
+            pass
 
     print(f"wrote {out_csv}")
 
 
 if __name__ == "__main__":
-    main()
+    # main() returns an exit code only from --prepare-run (non-zero if any
+    # blob failed to build), so a prepare step in a job script can be gated on
+    # it; every other path returns None, which sys.exit treats as success.
+    sys.exit(main())

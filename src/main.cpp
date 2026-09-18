@@ -145,6 +145,77 @@ static void print_hash_table(const CompressedIndex& idx) {
     }
 }
 
+// Size accounting, printed after every build. Two comparisons, both of the same
+// serialized index:
+//
+//   "full SA"  -- the historical figure: a bare uncompressed suffix array.
+//                 Kept for continuity with archived logs, but it undersells
+//                 this index, because a bare SA does not answer our query: it
+//                 has no k-mer -> interval map at all, so locating a k-mer in
+//                 it is a binary search over the text, not a constant-time
+//                 lookup.
+//   "baseline" -- the like-for-like competitor: the full SA plus a hash table
+//                 whose every entry is a single H_rest pointing at that k-mer's
+//                 own interval. Same query interface, same byte encoding, same
+//                 EF cost model, same pb rule; the only difference is that it
+//                 shares no position between k-mers. This is the ratio to
+//                 quote for "what does differential compression actually buy".
+//                 See serialize.hpp's uncompressed-baseline block.
+static void print_size_report(const SerializedIndex& S, const CompressedIndex& idx) {
+    const double full_sa = (double)idx.total_positions() * S.pb;
+    std::cout << "pb(bytes/pos)=" << S.pb
+              << "  |C|*pb=" << S.bytes_C()
+              << "  H=" << S.bytes_H()
+              << "  S_H=" << S.bytes_SH()
+              << "  names=" << S.bytes_names()
+              << "  total=" << S.total_bytes()
+              << "  (full SA would be " << (size_t)full_sa << " bytes; "
+              << std::fixed << std::setprecision(1)
+              << 100.0 * S.total_bytes() / std::max(1.0, full_sa) << "%)\n";
+
+    const BaselineSizes B = uncompressed_baseline_sizes(idx);
+    std::cout << "baseline (full SA + rest-only H): pb=" << B.pb
+              << "  m*pb=" << B.bytes_C
+              << "  H=" << B.bytes_H
+              << "  S_H=" << B.bytes_SH
+              << "  names=" << B.bytes_names
+              << "  total=" << B.total_bytes() << "\n";
+
+    auto sgn = [](size_t a, size_t b) {   // a - b, printed with an explicit sign
+        const long long d = (long long)a - (long long)b;
+        return (d >= 0 ? "+" : "") + std::to_string(d);
+    };
+    std::cout << "vs. baseline: " << std::fixed << std::setprecision(1)
+              << 100.0 * S.total_bytes() / std::max<size_t>(1, B.total_bytes()) << "%"
+              << "  (C " << sgn(S.bytes_C(), B.bytes_C)
+              << "  H " << sgn(S.bytes_H(), B.bytes_H)
+              << "  S_H " << sgn(S.bytes_SH(), B.bytes_SH)
+              << "  names " << sgn(S.bytes_names(), B.bytes_names)
+              << "  total " << sgn(S.total_bytes(), B.total_bytes()) << ")\n";
+
+    // Component-wise: what the single H= figure is made of, on both sides.
+    // `rest_pos` is the line item to watch -- SA intervals are contiguous and
+    // in name order, so those bytes are in principle derivable rather than
+    // stored (on either side), and this says exactly how many they are.
+    const HashStats HS = hash_stats(idx, S.pb);
+    std::cout << "entry mix: rest-only=" << HS.rest_only
+              << "  offset-only=" << HS.offset_only
+              << "  both=" << HS.both
+              << "  empty=" << HS.empty
+              << "  (K=" << HS.entries << ")\n";
+    std::cout << "H bytes  : marker=" << HS.marker_bytes
+              << "  off(pos/add/num)=" << HS.off_pos_bytes
+              << "/" << HS.off_add_bytes << "/" << HS.off_num_bytes
+              << "  rest(pos/num)=" << HS.rest_pos_bytes << "/" << HS.rest_num_bytes
+              << "   [baseline: marker=" << B.stats.marker_bytes
+              << "  rest(pos/num)=" << B.stats.rest_pos_bytes
+              << "/" << B.stats.rest_num_bytes << "]\n";
+    std::cout << "links    : " << HS.offsets() << " offsets covering "
+              << HS.offset_positions << " positions (avg coverage "
+              << std::fixed << std::setprecision(2) << HS.avg_coverage()
+              << "; |C| holds " << HS.rest_positions << ")\n";
+}
+
 static void print_usage(const char* argv0) {
     std::cout
         << "Usage:\n"
@@ -167,11 +238,35 @@ static void print_usage(const char* argv0) {
         << "  --algo <name>       greedy-size|greedy-degree|dep-order|pseudoforest-dp|\n"
         << "                      pseudoforest-dp-iterate (default: greedy-size)\n"
         << "  --max-add N         max differential offset (default: 8)\n"
+        << "  --sa-cache DIR      reuse a prepared gapped SA from DIR, building and\n"
+        << "                      storing it there on a miss. The SA depends only on\n"
+        << "                      (text, shape) -- never on --algo/--max-add/\n"
+        << "                      --min-coverage -- so one blob serves every run of\n"
+        << "                      that pair. Content-addressed: the key is a hash of\n"
+        << "                      the cleaned text plus the shape, so a regenerated\n"
+        << "                      but byte-identical input still hits.\n"
+        << "  --sa-load FILE      load exactly this blob and do not build on failure.\n"
+        << "                      Needs no -g at all: the blob carries the text. -s is\n"
+        << "                      still required, and a blob built for another shape is\n"
+        << "                      refused rather than used.\n"
+        << "  --prepare-only      with --sa-cache, build and store the SA, then exit\n"
+        << "                      without compressing.\n"
         << "  --phase2-iters N    Phase II dirty-generation budget (default: "
         << kPhase2DefaultIters << ").\n"
         << "                      Phase II stops earlier at a fixed point. Applies to\n"
-        << "                      every --algo. Precedence: this flag >\n"
-        << "                      GCSA_PHASE2_MAX_ITERS > default.\n"
+        << "                      every --algo, and to BOTH Phase II passes. Set one\n"
+        << "                      pass on its own with GCSA_RETARGET_ITERS /\n"
+        << "                      GCSA_LNS_ITERS -- useful because a retarget\n"
+        << "                      generation (one sweep of the dirty set) is far\n"
+        << "                      cheaper than an LNS generation, so raising both at\n"
+        << "                      once mostly buys LNS time. Precedence, most specific\n"
+        << "                      first: GCSA_RETARGET_ITERS / GCSA_LNS_ITERS >\n"
+        << "                      this flag > GCSA_PHASE2_MAX_ITERS >\n"
+        << "                      GCSA_PHASE2_FAST / auto-large-m > default.\n"
+        << "                      GCSA_DISABLE_RETARGET_TIMEOUT=1 drops the retarget\n"
+        << "                      sweep's wall-clock cap, which otherwise makes |C|\n"
+        << "                      depend on how fast the machine was. The LNS has no\n"
+        << "                      such cap.\n"
         << "                      Phase II's two passes switch off independently, for\n"
         << "                      any --algo: GCSA_DISABLE_RETARGET=1 skips the greedy\n"
         << "                      unpin/retarget sweep, GCSA_DISABLE_LNS=1 skips the\n"
@@ -200,6 +295,8 @@ static void print_usage(const char* argv0) {
 
 int main(int argc, char** argv) {
     std::string genome_path, shape_str = "#.#", query, reads_path;
+    std::string sa_cache_dir, sa_load_path;
+    bool prepare_only = false;
     bool want_table = false, want_sa = false, want_bound = false;
     int max_add = 8;
     int phase2_iters = 0;  // 0 = unset: GCSA_PHASE2_MAX_ITERS, else the default
@@ -214,6 +311,9 @@ int main(int argc, char** argv) {
         else if (k.rfind("--shape=", 0) == 0) shape_str = k.substr(8);
         else if (k == "-q") query       = need("-q");
         else if (k == "-r") reads_path  = need("-r");
+        else if (k == "--sa-cache") sa_cache_dir = need("--sa-cache");
+        else if (k == "--sa-load")  sa_load_path  = need("--sa-load");
+        else if (k == "--prepare-only") prepare_only = true;
         else if (k == "--table") want_table = true;
         else if (k == "--sa") want_sa = true;
         else if (k == "--bound") want_bound = true;
@@ -242,7 +342,21 @@ int main(int argc, char** argv) {
         else { std::cerr << "unknown arg: " << k << "\n"; print_usage(argv[0]); return 1; }
     }
 
-    bool is_example = genome_path.empty();
+    // --sa-load names a blob outright and needs no genome at all; --sa-cache
+    // is content-addressed, so it must read the genome to derive the key (a
+    // few seconds against the ~1000 s build it saves) but is self-validating.
+    if (!sa_cache_dir.empty() && !sa_load_path.empty()) {
+        std::cerr << "--sa-cache and --sa-load are alternatives; pass one\n";
+        return 1;
+    }
+    if (prepare_only && sa_cache_dir.empty()) {
+        std::cerr << "--prepare-only needs --sa-cache DIR to write into\n";
+        return 1;
+    }
+    if (!sa_load_path.empty() && !genome_path.empty())
+        std::cerr << "[note] --sa-load supplies the text; -g is ignored\n";
+
+    bool is_example = genome_path.empty() && sa_load_path.empty();
     std::string text;
     if (is_example) {
         text = "aCGTCTTAAACCCtCGTCTTAAACCCaaCGTCTTAAACCC";
@@ -263,7 +377,7 @@ int main(int argc, char** argv) {
             for (int b = 7; b >= 0; --b) std::cout << ((marker>>b)&1);
             std::cout << (marker == 0b10100100 ? "  (== 10100100, OK)\n" : "  (MISMATCH!)\n");
         }
-    } else {
+    } else if (sa_load_path.empty()) {
         text = load_dna(genome_path);
     }
 
@@ -274,6 +388,11 @@ int main(int argc, char** argv) {
     // gapped_sa.hpp). The Shape below is only used for naming/self-test here
     // -- it's the same contiguous shape build(int,...) uses internally, so
     // it's consistent with the index by construction.
+    if (!sa_load_path.empty() && shape_str.empty()) {
+        std::cerr << "--sa-load still needs -s/--shape, so the blob can be checked "
+                     "against the shape you asked for\n";
+        return 1;
+    }
     bool regular = !shape_str.empty() &&
         shape_str.find_first_not_of("0123456789") == std::string::npos;
     int regular_k = 0;
@@ -289,9 +408,63 @@ int main(int argc, char** argv) {
     if (regular)
         std::cout << "mode=regular (no LexText) k=" << regular_k
                   << " n=" << text.size() << "  algo=" << algo_name(algo) << "\n";
+    else if (!sa_load_path.empty())
+        // n comes from the blob, which has not been opened yet -- printing
+        // text.size() here would report a confident 0.
+        std::cout << "shape=" << shape_str << " span=" << sh.span << " weight=" << sh.weight
+                  << "  algo=" << algo_name(algo) << "\n";
     else
         std::cout << "shape=" << shape_str << " span=" << sh.span << " weight=" << sh.weight
                   << " n=" << text.size() << "  algo=" << algo_name(algo) << "\n";
+
+    // The gapped SA depends only on (text, shape), so it is worth building once
+    // and reusing across every --algo / --max-add run of that pair. Acquired
+    // here, before --min-coverage is resolved, because "auto" derives the
+    // break-even coverage from the input length -- and under --sa-load the
+    // length is only known once the blob has been read.
+    GappedSA cached_G;
+    bool have_cached = false, cached_from_disk = false;
+    double cached_sa_ms = 0.0;
+    if (!sa_load_path.empty() || !sa_cache_dir.empty()) {
+        if (regular) {
+            std::cerr << "--sa-cache/--sa-load apply to gapped shapes; regular (integer -s) "
+                         "mode builds a plain SA and is not cached\n";
+            return 1;
+        }
+        using Clock = std::chrono::steady_clock;
+        std::string blob = sa_load_path, err;
+        if (blob.empty())
+            blob = sa_cache_dir + "/" + gsa_blob_name(gcsa_text_hash(text), sh.pattern);
+        auto t0 = Clock::now();
+        cached_from_disk = gsa_load(cached_G, blob, &sh.pattern, &err);
+        cached_sa_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+        if (!cached_from_disk && !sa_load_path.empty()) {
+            // An explicit --sa-load that cannot be honoured is an error, never a
+            // silent rebuild: the caller asked for that blob, and quietly
+            // recomputing would hide a stale or missing cache behind a slow run.
+            std::cerr << "--sa-load: " << err << "\n";
+            return 1;
+        }
+        if (!cached_from_disk) {
+            if (std::getenv("GCSA_TIMING"))
+                std::cerr << "[cache] miss (" << err << "), building\n";
+            t0 = Clock::now();
+            cached_G = build_gapped_sa(sh, text);
+            cached_sa_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+            std::string werr;
+            if (!gsa_save(cached_G, blob, &werr)) std::cerr << "[cache] not written: " << werr << "\n";
+            else if (std::getenv("GCSA_TIMING")) std::cerr << "[cache] wrote " << blob << "\n";
+        } else if (std::getenv("GCSA_TIMING")) {
+            std::cerr << "[cache] hit " << blob << "\n";
+        }
+        if (prepare_only) {
+            std::cout << "prepared " << blob << "  m=" << cached_G.lex.size()
+                      << "  bytes=" << gsa_blob_bytes(cached_G.n, cached_G.lex.size(),
+                                                      (uint32_t)sh.pattern.size()) << "\n";
+            return 0;
+        }
+        have_cached = true;
+    }
 
     // Resolve the min-coverage floor before building: it gates candidate
     // enumeration inside idx.build(), so it must be set first. Precedence:
@@ -307,7 +480,8 @@ int main(int argc, char** argv) {
         }
         if (!src.empty()) {
             if (src == "auto") {
-                const int pb_est = estimate_pb(text.size());
+                const int pb_est =
+                    estimate_pb(have_cached ? cached_G.n : text.size());
                 const int mc = min_coverage_breakeven(pb_est, max_add);
                 std::cout << "min-coverage: auto (" << origin << ") pb_estimate=" << pb_est
                           << " max_add=" << max_add << " -> min_coverage=" << mc << "\n";
@@ -325,8 +499,17 @@ int main(int argc, char** argv) {
     }
 
     CompressedIndex idx;
-    if (regular) idx.build(regular_k, text, max_add, algo, phase2_iters);
-    else         idx.build(sh, text, max_add, algo, phase2_iters);
+    if (have_cached)
+        idx.build_from_gsa(std::move(cached_G), max_add, algo, phase2_iters,
+                           cached_sa_ms, cached_from_disk);
+    else if (regular) idx.build(regular_k, text, max_add, algo, phase2_iters);
+    else              idx.build(sh, text, max_add, algo, phase2_iters);
+
+    // From here on the INDEX owns the authoritative text: under --sa-load it
+    // came out of the blob and the local `text` was never populated, so the
+    // self-test and the brute-force checks must read it from the index or they
+    // would verify against an empty string and "fail" a perfectly good build.
+    const std::string& text_ref = idx.gsa().text;
 
     std::cout << "distinct k-mers      : " << idx.num_kmers() << "\n";
     std::cout << "SA entries (m)       : " << idx.total_positions() << "\n";
@@ -381,25 +564,17 @@ int main(int argc, char** argv) {
         std::cout << "self-test (vs brute force): SKIPPED (GCSA_SKIP_SELFTEST)\n";
         std::cout << "serialized round-trip     : SKIPPED (GCSA_SKIP_SELFTEST)\n";
         SerializedIndex S = serialize_index(idx);
-        double full_sa = (double)idx.total_positions() * S.pb;
-        std::cout << "pb(bytes/pos)=" << S.pb
-                  << "  |C|*pb=" << S.bytes_C()
-                  << "  H=" << S.bytes_H()
-                  << "  S_H=" << S.bytes_SH()
-                  << "  names=" << S.bytes_names()
-                  << "  total=" << S.total_bytes()
-                  << "  (full SA would be " << (size_t)full_sa << " bytes; "
-                  << std::fixed << std::setprecision(1)
-                  << 100.0 * S.total_bytes() / std::max(1.0, full_sa) << "%)\n";
+        std::cout << "baseline round-trip       : SKIPPED (GCSA_SKIP_SELFTEST)\n";
+        print_size_report(S, idx);
     } else {
-        bool ok = self_test(idx, sh, text, is_example);
+        bool ok = self_test(idx, sh, text_ref, is_example);
         std::cout << "self-test (vs brute force): " << (ok ? "PASS" : "FAIL") << "\n";
 
         // Byte-level serialization + round-trip check + size accounting.
         SerializedIndex S = serialize_index(idx);
         bool rt_ok = true;
         {
-            auto truth = brute_positions(sh, text);
+            auto truth = brute_positions(sh, text_ref);
             for (auto& kv : truth) {
                 auto got = S.positions_of(kv.first);
                 std::sort(got.begin(), got.end());
@@ -408,16 +583,45 @@ int main(int argc, char** argv) {
             }
         }
         std::cout << "serialized round-trip     : " << (rt_ok ? "PASS" : "FAIL") << "\n";
-        double full_sa = (double)idx.total_positions() * S.pb;   // uncompressed SA bytes
-        std::cout << "pb(bytes/pos)=" << S.pb
-                  << "  |C|*pb=" << S.bytes_C()
-                  << "  H=" << S.bytes_H()
-                  << "  S_H=" << S.bytes_SH()
-                  << "  names=" << S.bytes_names()
-                  << "  total=" << S.total_bytes()
-                  << "  (full SA would be " << (size_t)full_sa << " bytes; "
-                  << std::fixed << std::setprecision(1)
-                  << 100.0 * S.total_bytes() / std::max(1.0, full_sa) << "%)\n";
+
+        // The uncompressed baseline has to be a real competitor, not a
+        // strawman: build it for real, check it answers exactly the same
+        // queries, and check that the size-only accounting used on large
+        // inputs (uncompressed_baseline_sizes, which never materializes it)
+        // agrees with the encoder byte for byte.
+        {
+            SerializedIndex Sb = serialize_uncompressed_baseline(idx);
+            bool base_ok = true;
+            auto truth = brute_positions(sh, text_ref);
+            for (auto& kv : truth) {
+                auto got = Sb.positions_of(kv.first);
+                std::sort(got.begin(), got.end());
+                auto exp = kv.second; std::sort(exp.begin(), exp.end());
+                if (got != exp) { base_ok = false; break; }
+            }
+            const BaselineSizes B = uncompressed_baseline_sizes(idx);
+            const bool sizes_ok = B.pb == Sb.pb
+                               && B.bytes_C == Sb.bytes_C()
+                               && B.bytes_H == Sb.bytes_H()
+                               && B.bytes_SH == Sb.bytes_SH()
+                               && B.bytes_names == Sb.bytes_names();
+            // The H breakdown must add back up to H, and the two position
+            // classes must partition the SA: every position is either kept in
+            // C (named by exactly one rest run) or reconstructed by an offset.
+            const HashStats HS = hash_stats(idx, S.pb);
+            const bool stats_ok = HS.total_bytes() == S.bytes_H()
+                               && B.stats.total_bytes() == B.bytes_H
+                               && HS.rest_positions == idx.stored_positions()
+                               && HS.offset_positions ==
+                                      idx.total_positions() - idx.stored_positions()
+                               && HS.entries == idx.num_kmers();
+            std::cout << "baseline round-trip       : "
+                      << (base_ok ? (sizes_ok ? (stats_ok ? "PASS"
+                                                          : "FAIL (H breakdown)")
+                                              : "FAIL (size accounting)")
+                                  : "FAIL (queries)") << "\n";
+        }
+        print_size_report(S, idx);
     }
 
     if (want_sa) print_sa_tables(idx);

@@ -398,12 +398,30 @@ public:
                int max_add = 8, CompressAlgo algo = CompressAlgo::GreedySize,
                int phase2_iters = 0) {
         using Clock = std::chrono::steady_clock;
-        const bool timing = (std::getenv("GCSA_TIMING") != nullptr);
         auto t0 = Clock::now();
-        G_ = build_gapped_sa(shape, std::move(text));
+        GappedSA G = build_gapped_sa(shape, std::move(text));
+        const double sa_ms =
+            std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+        build_from_gsa(std::move(G), max_add, algo, phase2_iters, sa_ms, /*cached=*/false);
+    }
+
+    // Same pipeline, starting from an already-built gapped SA rather than
+    // building one -- from a cache blob, typically (gsa_load in gapped_sa.hpp).
+    // Nothing downstream can tell the difference: the SA depends only on
+    // (text, shape), never on --algo / --max-add / --min-coverage, so a blob is
+    // reusable across every run of one (dataset, shape) cell. `sa_ms` and
+    // `cached` exist only so the timing line distinguishes a loaded SA from a
+    // suspiciously fast build -- without that, a cached sweep looks like SA
+    // construction suddenly got two orders of magnitude faster.
+    void build_from_gsa(GappedSA&& G, int max_add = 8,
+                        CompressAlgo algo = CompressAlgo::GreedySize,
+                        int phase2_iters = 0, double sa_ms = 0.0, bool cached = true) {
+        using Clock = std::chrono::steady_clock;
+        const bool timing = (std::getenv("GCSA_TIMING") != nullptr);
         auto t1 = Clock::now();
+        G_ = std::move(G);
         regular_mode_ = false;
-        span_ = shape.span;
+        span_ = G_.shape.span;
         add_stride_ = span_;
         base_depth_ = 1;
         max_add_ = std::max(1, max_add);
@@ -416,8 +434,8 @@ public:
                 return std::chrono::duration<double, std::milli>(b - a).count();
             };
             gcsa_log(
-                "[timing] gapped_sa=%.1fms  compress(%s)=%.1fms  m=%zu intervals~kmers later\n",
-                ms(t0, t1), algo_name(algo_), ms(t1, t2), G_.m());
+                "[timing] gapped_sa=%.1fms%s  compress(%s)=%.1fms  m=%zu intervals~kmers later\n",
+                sa_ms, cached ? " (cached)" : "", algo_name(algo_), ms(t1, t2), G_.m());
         }
     }
 
@@ -497,6 +515,31 @@ public:
     int64_t rank_c_index(int32_t rank) const { return rank_to_C_[rank]; }
 
     struct Interval { uint64_t name; int32_t lo, hi; };
+
+    // The SA's maximal equal-k-mer runs: one Interval I_c = [lo, hi) per
+    // distinct k-mer, in SA order (which is name order, since the DisLex
+    // suffix sort orders by first symbol = the order-preserving k-mer name).
+    // This is the single definition of the run rule -- equal first symbol in
+    // gapped mode, LCP >= k *characters* in regular mode, where a symbol is a
+    // raw character rather than a name. Requires a built index (or a preceding
+    // collect_diff_problem()).
+    std::vector<Interval> sa_intervals() const {
+        const size_t m = G_.m();
+        std::vector<Interval> intervals;
+        intervals.reserve(m / 4 + 1);
+        for (size_t r = 0; r < m; ) {
+            const uint64_t name = name_of_rank_((int32_t)r);
+            size_t r2 = r + 1;
+            if (regular_mode_) {
+                while (r2 < m && G_.lcp[r2] >= base_depth_) ++r2;
+            } else {
+                while (r2 < m && G_.first_symbol((int32_t)r2) == name) ++r2;
+            }
+            intervals.push_back({name, (int32_t)r, (int32_t)r2});
+            r = r2;
+        }
+        return intervals;
+    }
     struct Candidate {
         int32_t target_lo = 0, target_hi = 0;
         uint64_t name = 0;
@@ -542,17 +585,7 @@ public:
 
         DiffProblem P;
         P.m = m;
-        for (size_t r = 0; r < m; ) {
-            uint64_t name = name_of_rank_((int32_t)r);
-            size_t r2 = r + 1;
-            if (regular_mode_) {
-                while (r2 < m && G_.lcp[r2] >= base_depth_) ++r2;
-            } else {
-                while (r2 < m && G_.first_symbol((int32_t)r2) == name) ++r2;
-            }
-            P.intervals.push_back({name, (int32_t)r, (int32_t)r2});
-            r = r2;
-        }
+        P.intervals = sa_intervals();
         const char* env = std::getenv("GCSA_LINK_UNIVERSE");
         P.universe = env ? env : "full";
         if (P.universe == "legacy") {
@@ -654,19 +687,7 @@ public:
 
     BoundReport compute_bound_report() const {
         const size_t m = G_.m();
-        std::vector<Interval> intervals;
-        intervals.reserve(m / 4 + 1);
-        for (size_t r = 0; r < m; ) {
-            uint64_t name = name_of_rank_((int32_t)r);
-            size_t r2 = r + 1;
-            if (regular_mode_) {
-                while (r2 < m && G_.lcp[r2] >= base_depth_) ++r2;
-            } else {
-                while (r2 < m && G_.first_symbol((int32_t)r2) == name) ++r2;
-            }
-            intervals.push_back({name, (int32_t)r, (int32_t)r2});
-            r = r2;
-        }
+        const std::vector<Interval> intervals = sa_intervals();
 
         BoundReport R;
         R.m = m;
@@ -1215,11 +1236,29 @@ private:
         return true;
     }
 
-    // Phase II iteration budget, in precedence order: --phase2-iters (the
-    // caller's phase2_iters) if > 0, else GCSA_PHASE2_MAX_ITERS, else
-    // GCSA_PHASE2_FAST / auto-large-m (1 gen), else kPhase2DefaultIters.
-    // Shared by both Phase II implementations.
-    int phase2_budget_(const char*& src) const {
+    // Which of the two Phase II passes a budget is being resolved for. They
+    // are different algorithms -- the retarget sweep cascades over a dirty set
+    // of names, the LNS solves bounded clusters exactly -- and they cost very
+    // differently, so one number for both means you cannot give the retarget
+    // sweep more cascade rounds without buying the same number of (much more
+    // expensive) LNS generations.
+    enum class Phase2Pass { Retarget, Lns };
+
+    // Generation budget for one Phase II pass. In precedence order, most
+    // specific first: that pass's own GCSA_RETARGET_ITERS / GCSA_LNS_ITERS,
+    // else --phase2-iters (the caller's phase2_iters), else
+    // GCSA_PHASE2_MAX_ITERS, else GCSA_PHASE2_FAST / auto-large-m (1
+    // generation), else kPhase2DefaultIters. Everything below the per-pass
+    // vars still sets BOTH passes, so the defaults and every existing script
+    // behave exactly as before.
+    //
+    // What a "generation" is differs by pass, which is worth knowing before
+    // setting either: for the retarget sweep it is one sweep of the dirty set,
+    // where retargeting a word frees source ranks and so marks the neighbours
+    // that can now do better -- a cap of 1 does the initial sweep and then
+    // discards the queue it just built. For the LNS it is one pass of cluster
+    // solves over its own dirty set.
+    int phase2_budget_(const char*& src, Phase2Pass pass) const {
         int iters = kPhase2DefaultIters;
         src = "default";
         if (G_.m() >= kPhase2AutoFastM) {
@@ -1239,6 +1278,12 @@ private:
         if (phase2_iters_ > 0) {
             iters = phase2_iters_;
             src = "--phase2-iters";
+        }
+        const char* per_pass = (pass == Phase2Pass::Retarget) ? "GCSA_RETARGET_ITERS"
+                                                              : "GCSA_LNS_ITERS";
+        if (const char* env = std::getenv(per_pass)) {
+            int v = std::atoi(env);
+            if (v > 0) { iters = v; src = per_pass; }
         }
         return iters;
     }
@@ -1285,7 +1330,7 @@ private:
         using Clock = std::chrono::steady_clock;
         const bool trace = (std::getenv("GCSA_TRACE_LNS") != nullptr);
         const char* iters_src = "default";
-        const int max_iters = phase2_budget_(iters_src);
+        const int max_iters = phase2_budget_(iters_src, Phase2Pass::Lns);
         // 0 = pick from the measured dependency-graph density once it is built.
         int cluster_cap = gcsa_env_int("GCSA_LNS_CLUSTER", 0);
         const int opt_cap = gcsa_env_int("GCSA_LNS_OPTS", 12);
@@ -1650,7 +1695,7 @@ private:
                      double phase1_ms = 0.0) {
         using Clock = std::chrono::steady_clock;
         const char* iters_src = "default";
-        const int max_iters = phase2_budget_(iters_src);
+        const int max_iters = phase2_budget_(iters_src, Phase2Pass::Retarget);
         int min_gain = 1;
         if (const char* env = std::getenv("GCSA_PHASE2_MIN_GAIN")) {
             int v = std::atoi(env);
@@ -1681,7 +1726,18 @@ private:
 
         // Always time-budget against Phase I when its duration is known; FAST
         // alone still applies the min_ms floor. Caps Phase II ≈ Phase I wall.
-        const bool time_budgeted = (fast_mode || phase1_ms > 0.0);
+        //
+        // This cap is wall-clock, so how much retargeting happens -- and hence
+        // |C| -- depends on how fast and how loaded the machine was. 19 runs
+        // across the 2026-09-09/10 sweeps stopped here, and their results are
+        // not reproducible for that reason. GCSA_DISABLE_RETARGET_TIMEOUT=1
+        // takes elapsed time out of the stopping rule entirely, leaving only
+        // the generation budget and the fixed point -- which is what you want
+        // whenever a number has to be comparable across machines. Named for
+        // the retarget pass, not Phase II, because the LNS has no wall-clock
+        // cap: it stops on its generation budget or at a fixed point.
+        const bool timeout_off = gcsa_env_bool("GCSA_DISABLE_RETARGET_TIMEOUT", false);
+        const bool time_budgeted = !timeout_off && (fast_mode || phase1_ms > 0.0);
         const double time_limit_ms = time_budgeted
             ? std::max(min_ms, (phase1_ms > 0.0 ? phase1_ms : min_ms) * time_ratio)
             : 0.0;
@@ -1697,6 +1753,11 @@ private:
                          "(phase1=%.1fms ratio=%.2f fast=%d)\n",
                          label, time_limit_ms, phase1_ms, time_ratio,
                          (int)fast_mode);
+            } else if (timeout_off) {
+                // Recorded, so a log can be told apart from one where the cap
+                // was simply never reached.
+                gcsa_log("[timing] %s Phase II time_budget=off "
+                         "(GCSA_DISABLE_RETARGET_TIMEOUT)\n", label);
             }
         }
         auto t0 = Clock::now();
@@ -3470,18 +3531,7 @@ private:
 
         gcsa_log("[%s] compressing...\n", algo_name(algo_));
 
-        std::vector<Interval> intervals;
-        for (size_t r = 0; r < m; ) {
-            uint64_t name = name_of_rank_((int32_t)r);
-            size_t r2 = r + 1;
-            if (regular_mode_) {
-                while (r2 < m && G_.lcp[r2] >= base_depth_) ++r2;
-            } else {
-                while (r2 < m && G_.first_symbol((int32_t)r2) == name) ++r2;
-            }
-            intervals.push_back({name, (int32_t)r, (int32_t)r2});
-            r = r2;
-        }
+        const std::vector<Interval> intervals = sa_intervals();
 
         std::unordered_map<uint64_t, Candidate> accepted;
         if (algo_ == CompressAlgo::DepOrder)
