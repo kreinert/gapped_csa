@@ -1,0 +1,302 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[expansion=false]{microtype}
+\usepackage{array}
+\usepackage{hyperref}
+
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\theoremstyle{plain}
+\newtheorem{proposition}{Proposition}
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}
+
+\newcommand{\orig}{\operatorname{orig}}
+\newcommand{\name}{\operatorname{name}}
+\newcommand{\Links}{\mathcal{K}}
+\newcommand{\Names}{\mathcal{N}}
+\newcommand{\Runs}{\mathcal{R}}
+
+\title{A compact ILP for exact $|C|$\\
+over the full differential-link universe}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+\texttt{ilp\_baseline} solves exact $|C|$ by emitting one binary per
+valid link. The full universe of those links --- every clash-free
+sub-run of every maximal source run, as enumerated by
+\texttt{enumerate\_all\_links\_} --- has $\Theta(L^2)$ members per run of
+length $L$, so the expanded CPLEX model is unusable on tandem inputs
+(a $200\times 50$ repeat under $k{=}21$, $a_{\max}{=}8$ has $m=10001$
+ranks and about $7.7$ million sub-runs). Every such sub-run is an
+interval of a maximal run, so it is enough to decide, per run, a single
+consecutive occupancy mask. The resulting compact ILP has
+$O(m\,a_{\max})$ binaries, is equivalent to the expanded model, and is
+what one should solve when the expanded LP will not even write.
+\end{abstract}
+
+\tableofcontents
+
+\section{The expanded set-packing ILP}
+\label{sec:expanded}
+
+We use the notation of \texttt{tree\_dp3}: a valid link
+$k = (c_k, a_k, S_k, T_k)$ has target name $c_k$, shift $a_k$, contiguous
+source ranks $S_k = [s_{\mathrm{lo}}, s_{\mathrm{hi}})$ and covered ranks
+$T_k$, with $\orig(T_k[j]) = \orig(S_k[j]) + a_k\cdot s$,
+$S_k \cap T_k = \emptyset$, and $|T_k| = |S_k| \ge \kappa$
+($\kappa = 3$). A set $X$ of valid links is feasible when it satisfies
+\begin{description}
+\item[(F1)] at most one link per name, and
+\item[(F2)] $S_k \cap T_{k'} = \emptyset$ for $k \ne k'$
+  (equivalently: every source rank of a chosen link is kept).
+\end{description}
+Let $\Links$ be the full universe (\texttt{enumerate\_all\_links\_} with
+sub-runs), and write $x_r \in \{0,1\}$ for ``rank $r$ is kept in $C$''
+and $y_k \in \{0,1\}$ for ``link $k$ is accepted''. The model
+\texttt{ilp\_baseline} writes is
+\begin{align}
+  \min\quad
+    &\sum_{r=0}^{m-1} x_r
+    \label{eq:obj} \\
+  \text{s.t.}\quad
+    &\sum_{k:\,c_k=c} y_k \;\le\; 1
+      && \forall\, c \in \Names
+      \tag{F1} \label{eq:F1} \\
+    &x_r + y_k \;\le\; 1
+      && \forall\, k \in \Links,\; r \in T_k
+      \tag{drop} \label{eq:drop} \\
+    &x_r \;\ge\; y_k
+      && \forall\, k \in \Links,\; r \in S_k
+      \tag{pin} \label{eq:pin} \\
+    &x_r + \sum_{k:\,r \in T_k} y_k \;\ge\; 1
+      && \forall\, r
+      \tag{keep} \label{eq:keep} \\
+    &x_r, y_k \;\in\; \{0,1\}.
+      \nonumber
+\end{align}
+\eqref{eq:drop} and \eqref{eq:pin} together are (F2) plus the
+self-disjointness $S_k \cap T_k = \emptyset$ already required of a valid
+link. \eqref{eq:keep} forbids dropping a rank that no accepted link
+covers. The objective is exactly $|C|$.
+
+This is the right model. Its size is not: $|\Links|$ is the number of
+clash-free sub-runs, which for a maximal source run of length $L$ is
+$\Theta(L^2)$. Summing over runs of total length $O(m)$ per shift gives
+up to $\Theta(a_{\max} m^2)$ binaries $y_k$ and as many
+\eqref{eq:drop}/\eqref{eq:pin} rows. On
+\texttt{repeat\_100pct\_x200\_y50} with contiguous $k{=}21$ and
+$a_{\max}{=}8$ that is already $\approx 7.7{\times}10^6$ sub-runs; the
+LP cannot be written.
+
+\section{Maximal source runs}
+\label{sec:runs}
+
+Fix a shift $a \in \{1,\dots,a_{\max}\}$. For each gapped-SA rank $r$ let
+$\tau_a(r)$ be the rank whose lextext position is the $a$-successor of
+$r$ (\texttt{succ\_lexpos\_}), or undefined if that successor does not
+exist. Scan the ranks in order and group consecutive $r$ whose successor
+exists and carries a common target name. Each group
+$[ \alpha, \beta )$ of length $L = \beta - \alpha \ge \kappa$ is a
+\textbf{maximal source run}
+\[
+  R \;=\; \bigl( a,\; [\alpha,\beta),\; \tau_a,\; c \bigr),
+\]
+where $c = \name(\tau_a(\alpha))$ is the target. Write $\Runs$ for the
+set of all such runs over $a = 1,\dots,a_{\max}$. There are
+$O(m a_{\max})$ of them, and they partition, per $a$, the ranks that
+have an $a$-successor.
+
+Every link that \texttt{enumerate\_all\_links\_} emits is a sub-interval
+$[\alpha+p, \alpha+q] \subseteq [\alpha,\beta)$ of some $R \in \Runs$
+with length at least $\kappa$ and with no \emph{clash}: no source rank
+in the sub-interval has its successor also in the sub-interval (that is
+exactly $S \cap T = \emptyset$). Conversely every clash-free sub-interval
+of a maximal run is a valid link in $\Links$. So $\Links$ is the set of
+clash-free sub-intervals of members of $\Runs$, and it is enough to
+choose, per run, at most one such sub-interval.
+
+\section{The compact formulation}
+\label{sec:compact}
+
+For each run $R = (a,[\alpha,\beta), \tau, c)$ of length $L$ introduce
+binaries $w_{R,t}$ and $\sigma_{R,t}$ for $t = 0,\dots,L-1$:
+\begin{align*}
+  w_{R,t} &= 1 &&\text{iff source rank $\alpha+t$ lies in the selected
+                 sub-run of $R$,} \\
+  \sigma_{R,t} &= 1 &&\text{iff that sub-run \emph{starts} at $t$.}
+\end{align*}
+The selected set $\{ t : w_{R,t} = 1 \}$ is forced to be a (possibly
+empty) interval by
+\begin{align}
+  \sigma_{R,0} &= w_{R,0},
+    \label{eq:st0} \\
+  \sigma_{R,t} &= w_{R,t} \land \lnot w_{R,t-1}
+    && t = 1,\dots,L-1,
+    \label{eq:st} \\
+  w_{R,t} &\ge w_{R,t-1} + w_{R,t+1} - 1
+    && t = 1,\dots,L-2,
+    \label{eq:hole} \\
+  \sum_{t=0}^{L-1} \sigma_{R,t} &\le 1,
+    \label{eq:onestart} \\
+  \sum_{t=0}^{L-1} w_{R,t}
+    &\ge \kappa \sum_{t=0}^{L-1} \sigma_{R,t}.
+    \label{eq:len}
+\end{align}
+\eqref{eq:st} linearizes as the three inequalities
+$\sigma \le w_t$, $\sigma \le 1 - w_{t-1}$,
+$\sigma \ge w_t - w_{t-1}$. \eqref{eq:hole} forbids a hole in a
+consecutive block; together with at most one start, the occupied ranks
+form a single interval. \eqref{eq:len} is $\kappa$ whenever the run is
+used and $0$ otherwise.
+
+One link per name is one selected start among all runs targeting $c$:
+\begin{equation}
+  \sum_{\substack{R \in \Runs \\ \mathrm{target}(R)=c}}
+    \sum_{t} \sigma_{R,t}
+  \;\le\; 1
+  \qquad \forall\, c \in \Names.
+  \tag{F1$'$} \label{eq:F1c}
+\end{equation}
+Pin, drop, self-clash, and keep become, for each $R$ and each offset
+$t$ with successor $\tau(\alpha+t)$ defined,
+\begin{align}
+  x_{\alpha+t} &\ge w_{R,t},
+    \tag{pin$'$} \label{eq:pinc} \\
+  x_{\tau(\alpha+t)} + w_{R,t} &\le 1,
+    \tag{drop$'$} \label{eq:dropc} \\
+  w_{R,t} + w_{R,\, \tau(\alpha+t)-\alpha} &\le 1
+    && \text{if } \tau(\alpha+t) \in [\alpha,\beta),
+    \tag{clash} \label{eq:clash} \\
+  x_r + \sum_{\substack{R,t \\ \tau_R(\alpha_R+t)=r}} w_{R,t}
+    &\ge 1
+    && \forall\, r.
+    \tag{keep$'$} \label{eq:keepc}
+\end{align}
+The objective is still \eqref{eq:obj}. All variables are binary.
+
+\begin{proposition}[Equivalence]
+\label{prop:equiv}
+The compact ILP and the expanded ILP \eqref{eq:obj}--\eqref{eq:keep}
+have the same optimal value. There is a bijection between feasible
+$y$-supports of the expanded model and feasible $(w,\sigma)$-supports of
+the compact model that preserves the kept-set $(x_r)$.
+\end{proposition}
+
+\begin{proof}[Proof sketch]
+Given a feasible $y$, for each name at most one $k$ has $y_k=1$
+by \eqref{eq:F1}. That $k$ is a clash-free sub-interval of a unique
+maximal run $R$; set $w_{R,t}=1$ on that sub-interval, $\sigma$ at its
+start, and all other $w,\sigma$ of runs targeting the same name to $0$.
+\eqref{eq:st0}--\eqref{eq:len} hold by construction,
+\eqref{eq:F1c} is \eqref{eq:F1}, \eqref{eq:pinc}--\eqref{eq:keepc} are
+\eqref{eq:pin}--\eqref{eq:keep} rewritten in occupancy variables, and
+\eqref{eq:clash} is $S_k \cap T_k = \emptyset$ on a consecutive block.
+Conversely, a feasible $(w,\sigma)$ of a run $R$ is either all-zero or a
+single interval of length $\ge \kappa$. \eqref{eq:clash} makes that
+interval clash-free, hence a valid link $k \in \Links$; set $y_k=1$.
+\eqref{eq:F1c} gives \eqref{eq:F1}. The two $x$-vectors coincide, so the
+objectives coincide.
+\end{proof}
+
+Restricting to \emph{maximal} links
+(\texttt{--universe maximal}) is the compact model plus
+$\sum_t w_{R,t} = L \sum_t \sigma_{R,t}$ for every $R$: if a run is used,
+the whole run is used. That is a restriction of $\Links$, so its optimum
+is an upper bound on true $|C|^\star$, not a lower bound.
+\texttt{--universe legacy} is a further restriction (the heuristics'
+\texttt{enumerate\_candidates\_} view) and is not a lower bound either.
+
+\section{Size}
+\label{sec:size}
+
+Each rank belongs to at most one run per shift, so there are at most
+$m a_{\max}$ occupancy bits $w_{R,t}$ and as many starts $\sigma_{R,t}$,
+plus $m$ keep-bits $x_r$. Constraints are $O(1)$ per occupancy bit
+except \eqref{eq:keepc}, which has $O(a_{\max})$ terms per rank. The
+whole model is $O(m a_{\max})$ binaries and $O(m a_{\max})$ rows,
+against $O(\sum_R L_R^2)$ binaries for the expanded form.
+
+On the $200\times 50$ tandem with $k{=}21$ and $a_{\max}{=}8$:
+
+\begin{center}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+model & $|\Runs|$ / $|\Links|$ & binaries & rows & notes \\
+\midrule
+expanded, full
+  & ${\sim}7.7{\times}10^6$ sub-runs
+  & ${\sim}7.7{\times}10^6$
+  & does not write
+  & $\Theta(L^2)$ per run of length ${\sim}200$ \\
+compact, full
+  & $400$ runs
+  & ${\sim}1.7{\times}10^5$
+  & ${\sim}4.8{\times}10^5$
+  & equivalent to the row above \\
+expanded, maximal
+  & $400$ links
+  & $10\,401$
+  & $168\,219$
+  & restriction; opt $|C|=1285$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The maximal-universe expanded model is what
+\texttt{ilp\_baseline --universe maximal} currently emits; CBC solves it
+in tens of seconds on this instance (heuristics sit at $1473$, except
+greedy-size at $1670$). The compact full model is the one that matches
+\texttt{--universe full} without materializing the sub-runs.
+
+\section{A name-level relaxation}
+\label{sec:name}
+
+A coarser, still valid, lower bound drops copy-index alignment. Let
+$n_c = |I_c|$ for names with $n_c \ge \kappa$, and let $F_0$ be the
+number of ranks in intervals smaller than $\kappa$ (those ranks are
+never dropped). For each run $R$ targeting $c$ from a source name $s$
+of length $L_R$, a binary $y_R$ and an integer coverage $c_c \in [0,n_c]$
+satisfy
+\begin{align}
+  \sum_{R:\,\mathrm{target}(R)=c} y_R &\le 1, \\
+  c_c &\le \sum_{R:\,\mathrm{target}(R)=c} L_R\, y_R, \\
+  c_c &\ge \kappa \sum_{R:\,\mathrm{target}(R)=c} y_R, \\
+  y_R = 1 &\implies c_c + c_s \le n_s.
+\end{align}
+The last implication is source integrity at name granularity: dropping
+$c_c$ ranks of $c$ using $s$ requires $c_c$ kept ranks of $s$. Several
+targets may share the same source; each is limited by $n_s - c_s$
+independently, which is correct for free source sharing. Then
+\[
+  |C|^\star \;\ge\; F_0 + \sum_c (n_c - c_c).
+\]
+This ignores that a sub-run occupies specific copy indices, so it
+underestimates $|C|$ whenever two names need overlapping, not nested,
+kept slots of a common source. It is cheap ($O(|\Runs|)$ binaries) and
+strictly tighter than summing per-name best coverage, which treats
+source sharing as unbounded.
+
+\section{Where this sits}
+\label{sec:where}
+
+\texttt{ilp\_baseline} should keep writing the expanded model on small
+texts --- the $y_k$ are easy to decode-check, and the ten-case suite is
+tiny. On repetitive inputs the expanded full universe does not fit;
+the compact model of \S\ref{sec:compact} is the same integer program
+and is what a full-universe solve on those inputs has to use.
+\texttt{--universe maximal} remains a fast restriction, useful as an
+upper bound on $|C|^\star$ and as a check that the compact encoding of
+maximal runs matches the expanded $400$-link LP.
+
+\end{document}

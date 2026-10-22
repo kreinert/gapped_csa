@@ -81,7 +81,7 @@ here was produced by the committed binaries at \texttt{7f9127b}.
 \section{Scope, and how this note relates to the others}
 \label{sec:scope}
 
-Three documents in \texttt{doc/} now describe overlapping parts of the
+Four documents in \texttt{doc/} now describe overlapping parts of the
 same pipeline.
 
 \begin{itemize}
@@ -94,6 +94,12 @@ same pipeline.
   is a set-packing problem with two \emph{pairwise} constraints and no
   acyclicity requirement, and builds the exact cluster-local
   re-optimization \texttt{tree-dp3} on top of that.
+\item \texttt{compact\_ilp} writes the set-packing ILP that
+  \texttt{ilp\_baseline} emits, then the equivalent compact form that
+  decides one consecutive sub-run per maximal source run instead of one
+  binary per sub-run --- $O(m\,a_{\max})$ binaries rather than
+  $\Theta(\sum L^2)$. That is the formulation to solve on tandem inputs
+  where the expanded full universe will not even write.
 \item This note treats \texttt{tree-dp} itself in full.
 \end{itemize}
 
@@ -185,12 +191,15 @@ coverage subject to (F1) and (F2). Throughout, $a_{\max}$ denotes
 
 The link universe of \S\ref{sec:setup} is far too large to hand to a
 heuristic: it has $\Theta(m \cdot a_{\max})$ maximal runs and, if
-sub-runs are counted, $\Theta(m \cdot a_{\max} \cdot L)$ links for runs
-of length $L$. \texttt{enumerate\_candidates\_} produces a pruned view of
-it, one interval at a time. This pruned view is what every heuristic
-sees; the full universe is enumerated only by
-\texttt{enumerate\_all\_links\_}, which feeds the ILP baseline and
-therefore gives a genuine lower bound on all of them.
+sub-runs are counted, $\Theta(\sum_R L_R^2)$ links (up to
+$\Theta(a_{\max} m^2)$). \texttt{enumerate\_candidates\_} produces a
+pruned view of it, one interval at a time. This pruned view is what
+every heuristic sees; the full universe is enumerated only by
+\texttt{enumerate\_all\_links\_}, which feeds the expanded ILP baseline
+and therefore gives a genuine lower bound on all of them. On tandem
+inputs that expanded LP does not fit; the equivalent compact formulation
+(one occupancy mask per maximal run, $O(m\,a_{\max})$ binaries) is in
+\texttt{compact\_ilp}.
 
 \subsection{The scan}
 

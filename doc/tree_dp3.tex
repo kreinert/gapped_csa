@@ -1196,7 +1196,12 @@ $32$ & $122$ & $17$  & $0$ & $10.46\,\%$ \\
 On small instances the exact optimum is available from
 \texttt{ilp\_baseline}, which enumerates the full link universe of
 Definition~\ref{def:link} (all sub-runs, no maximality or lcp filter) and
-solves the set-packing ILP with \texttt{cbc}. The two counterexamples of
+solves the set-packing ILP with \texttt{cbc}. That expanded model emits
+one binary per sub-run and is the right check for the ten-case suite;
+the equivalent compact form --- one consecutive occupancy mask per
+maximal source run, $O(m\,a_{\max})$ binaries --- is in
+\texttt{compact\_ilp}, and is what a full-universe solve has to use once
+$\sum L_R^2$ no longer fits. The two counterexamples of
 \S\ref{sec:ce1}--\ref{sec:ce2}, and the hardest case of the fixed
 suite:
 
@@ -1228,7 +1233,9 @@ greedy's $25$, which no other heuristic achieves.
 \texttt{ilp\_baseline} reports \texttt{bounds all algos}, i.e.\ whether
 the computed optimum is $\le$ every heuristic's $|C|$. This is checked,
 not proven. The universe it enumerates is
-$\{k \in \Links : a_k \le a_{\max}\}$, and by
+$\{k \in \Links : a_k \le a_{\max}\}$ --- either expanded, one $y_k$ per
+sub-run, or compact, one occupancy mask per maximal run; see
+\texttt{compact\_ilp} --- and by
 \S\ref{sec:compose-phase2} the retarget loop can synthesize links with
 $a > a_{\max}$; such a link is decodable and would be feasible in a
 larger universe, so in principle a heuristic could reach a solution the

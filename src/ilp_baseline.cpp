@@ -2,8 +2,11 @@
 // of compress.hpp (kMinCoverage=3, max_add default 8): see "Link universe"
 // there. Because that universe is a superset of what every heuristic can build,
 // the optimum reported here is a valid lower bound for all of them. Emits
-// CPLEX .lp; solves with cbc/glpsol if present, else brute-force for tiny
-// instances.
+// CPLEX .lp (one binary y_e per enumerated link); solves with cbc/glpsol if
+// present, else brute-force for tiny instances. The expanded model is
+// Θ(L^2) binaries per source run of length L --- on tandem inputs use the
+// equivalent compact formulation in doc/compact_ilp.tex (one occupancy mask
+// per maximal run, O(m * max_add) binaries) instead of --universe full.
 //
 // Build:  make ilp_baseline
 // Usage:  ./ilp_baseline "<TEXT>" "<SHAPE>" [--max-add 8] [--lp-out path.lp]

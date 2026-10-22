@@ -581,10 +581,25 @@ compression on a 180 kb repetitive input: `####.####` → **40% of the full SA**
   `--universe` / `GCSA_LINK_UNIVERSE` picks the candidate set: `full`
   (default, exact), `maximal` (maximal source runs only) or `legacy` (the
   heuristics' `enumerate_candidates_` view). `full` costs `O(L^2)` links per
-  source run of length `L`, so on repetitive inputs the LP grows quickly —
-  e.g. `GCCTTTAAAG`×12 with `#.#` goes from 77 candidates / 0.07 s (`legacy`)
-  to 3625 candidates / 8.4 s (`full`). `maximal` and `legacy` are faster but
-  are **not** lower bounds.
+  source run of length `L`, so on repetitive inputs the expanded LP does not
+  fit — e.g. `GCCTTTAAAG`×12 with `#.#` goes from 77 candidates / 0.07 s
+  (`legacy`) to 3625 candidates / 8.4 s (`full`), and a 200×50 tandem under
+  k=21 has ~7.7 million sub-runs. `maximal` and `legacy` are faster but are
+  **not** lower bounds.
+- **Compact ILP (same optimum, O(m · max-add) binaries)**: every full-universe
+  link is a clash-free sub-interval of a maximal source run, so it is enough
+  to pick, per run, one consecutive occupancy mask rather than one binary per
+  sub-run. Keep-bits `x_r` are unchanged; each run `R` of length `L` gets
+  occupancy bits `w_{R,t}` and start bits `σ_{R,t}` (`t = 0..L-1`) with
+  “no holes / at most one start / length ≥ κ if used”, then the same pin /
+  drop / one-link-per-name / keep rows as the expanded model. The two integer
+  programs are equivalent (see `doc/compact_ilp.tex`). On the 200×50 tandem
+  that is ~1.7e5 binaries and ~4.8e5 rows, versus millions of `y_k`.
+  Restricting to maximal runs (`--universe maximal`) is the compact model plus
+  “if used, take the whole run”; CBC solves that expanded 400-link LP in ~17 s
+  at `|C| = 1285` (heuristics 1473–1670). A cheaper *name-level* relaxation,
+  also in that note, keeps only per-name coverage versus source capacity and
+  is still a valid lower bound, just a looser one.
 - **Suffix array construction**: a linear-time integer-alphabet SA-IS
   (`src/sais.hpp`) is the default; libdivsufsort is no longer a build dependency.
   SA-IS and its indices are currently `int32_t`; for texts longer than 2³¹,
