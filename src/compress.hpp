@@ -157,6 +157,7 @@
 #include <cmath>
 #include <cctype>
 #include <map>
+#include <numeric>
 
 namespace gcsa {
 
@@ -241,11 +242,14 @@ constexpr int kPhase2DefaultIters = 100;
 // dominating wall time on large DNA / skmer concatenations.
 constexpr size_t kPhase2AutoFastM = 1000000;
 
-// Max candidates retained per interval in the shared Phase II / leftover cache.
-// Enumeration itself is capped to this (see emit_run_'s admission gate) using
-// the same (coverage, add) ordering pick_best_ ranks by, so the true best
-// candidate is always retained regardless of the cap -- it can never be
-// beaten by anything still admitted. Override with GCSA_CAND_CACHE_CAP.
+// Floor on candidates retained per interval in the shared Phase II / leftover
+// cache. Enumeration itself is capped to cand_cache_cap_() (see emit_run_'s
+// admission gate) using the same (coverage, add) ordering pick_best_ ranks by,
+// so the true best candidate is always retained regardless of the cap -- it
+// can never be beaten by anything still admitted. The live cap is
+// max(this, --max-add) so a wrap-around add (P/gcd(P, stride), which auto
+// max-add equals on tandems) cannot be evicted by mid-range adds when
+// max_add > 64. GCSA_CAND_CACHE_CAP, if set, is an exact override.
 constexpr int kCandCacheDefaultCap = 64;
 
 // Cluster size the LNS Phase II falls back to when a cluster's exact solve
@@ -424,7 +428,7 @@ public:
         span_ = G_.shape.span;
         add_stride_ = span_;
         base_depth_ = 1;
-        max_add_ = std::max(1, max_add);
+        resolve_max_add_(max_add);
         algo_ = algo;
         phase2_iters_ = std::max(0, phase2_iters);
         compress_();
@@ -456,7 +460,7 @@ public:
         span_ = k;          // window width in characters, used by locate()
         add_stride_ = 1;    // one unit of `add` = one character
         base_depth_ = k;    // full k-mer match = k characters, not 1 symbol
-        max_add_ = std::max(1, max_add);
+        resolve_max_add_(max_add);
         algo_ = algo;
         phase2_iters_ = std::max(0, phase2_iters);
         compress_();
@@ -673,6 +677,22 @@ public:
     //   collect_diff_problem()'s "full" universe (what ilp_baseline uses) is
     //   still the reference for that -- it's just no longer what --bound
     //   reports by default.
+    // --max-add auto: dominant copy-gap P among eligible SA intervals, then
+    // the smallest add whose original-text shift is a multiple of P
+    // (add = P / gcd(P, add_stride)). Falls back to 8 when there is no
+    // repetitive mass (random DNA, unique k-mers).
+    struct MaxAddPrediction {
+        int period = 0;            // mode orig-text gap (0 = none)
+        int stride = 1;
+        int max_add = 8;
+        int64_t mode_gaps = 0;
+        int64_t total_gaps = 0;
+        bool auto_mode = false;
+        bool used_default = true;  // true when we kept the floor of 8
+    };
+
+    MaxAddPrediction last_max_add_prediction() const { return max_add_pred_; }
+
     struct BoundReport {
         size_t m = 0;
         bool cross_lcp = false;             // this run's GCSA_CROSS_LCP setting
@@ -684,6 +704,83 @@ public:
         size_t sum_best_coverage = 0;       // Sigma best_candidate_(...).coverage()
         size_t lower_bound_C = 0;           // m - sum_best_coverage
     };
+
+    // max_add <= 0 means --max-add auto: read the SA's orig-position gaps
+    // (already built) and pick the smallest add that can wrap the dominant
+    // copy period. A positive value is used as-is.
+    void resolve_max_add_(int max_add) {
+        if (max_add > 0) {
+            max_add_ = max_add;
+            max_add_pred_ = MaxAddPrediction{};
+            max_add_pred_.stride = add_stride_;
+            max_add_pred_.max_add = max_add_;
+            max_add_pred_.auto_mode = false;
+            max_add_pred_.used_default = false;
+            return;
+        }
+        max_add_pred_ = predict_max_add_();
+        max_add_ = max_add_pred_.max_add;
+        gcsa_log("[max-add] auto period=%d (%lld/%lld orig-gaps) stride=%d -> max_add=%d%s\n",
+                 max_add_pred_.period,
+                 (long long)max_add_pred_.mode_gaps,
+                 (long long)max_add_pred_.total_gaps,
+                 max_add_pred_.stride,
+                 max_add_pred_.max_add,
+                 max_add_pred_.used_default ? " (no period, default)" : "");
+    }
+
+    MaxAddPrediction predict_max_add_() const {
+        MaxAddPrediction P;
+        P.stride = std::max(1, add_stride_);
+        P.auto_mode = true;
+        const int floor_add = 8;
+        const int cap_add = 65536;
+        const int64_t n = (int64_t)std::max<size_t>(1, G_.n);
+        const int64_t max_gap = std::max<int64_t>(4096, n / 4);
+
+        std::unordered_map<int64_t, int64_t> hist;
+        hist.reserve(1024);
+        const auto intervals = sa_intervals();
+        std::vector<int64_t> pos;
+        for (const auto& iv : intervals) {
+            if (iv.hi - iv.lo < kMinCoverage) continue;
+            pos.clear();
+            pos.reserve((size_t)(iv.hi - iv.lo));
+            for (int32_t r = iv.lo; r < iv.hi; ++r)
+                pos.push_back(G_.orig_pos(r));
+            std::sort(pos.begin(), pos.end());
+            for (size_t i = 1; i < pos.size(); ++i) {
+                int64_t d = pos[i] - pos[i - 1];
+                if (d <= 0 || d > max_gap) continue;
+                hist[d]++;
+                P.total_gaps++;
+            }
+        }
+
+        int64_t best_d = 0, best_c = 0;
+        for (const auto& kv : hist) {
+            if (kv.second > best_c || (kv.second == best_c && kv.first < best_d)) {
+                best_c = kv.second;
+                best_d = kv.first;
+            }
+        }
+        P.period = (int)best_d;
+        P.mode_gaps = best_c;
+
+        // Need a real spike: enough pairs, and the mode not a thin tail.
+        const bool have_period = best_d > 0 && best_c >= 8
+            && best_c * 4 >= P.total_gaps;
+        if (!have_period) {
+            P.max_add = floor_add;
+            P.used_default = true;
+            return P;
+        }
+        int g = std::gcd(P.period, P.stride);
+        int unit = P.period / g;
+        P.max_add = std::min(cap_add, std::max(floor_add, unit));
+        P.used_default = (P.max_add == floor_add && unit <= floor_add);
+        return P;
+    }
 
     BoundReport compute_bound_report() const {
         const size_t m = G_.m();
@@ -719,6 +816,7 @@ private:
     GappedSA G_;
     int span_ = 1;
     int max_add_ = 8;
+    MaxAddPrediction max_add_pred_;
     CompressAlgo algo_ = CompressAlgo::GreedySize;
     int phase2_iters_ = 0;  // 0 = unspecified; see run_phase2_ for precedence
 
@@ -817,7 +915,7 @@ private:
         // growing) any candidate that can't beat the current worst kept one,
         // instead of building every viable candidate and trimming after the
         // fact. See emit_run_ for why the cap check sits after availability.
-        const int cap = gcsa_env_int("GCSA_CAND_CACHE_CAP", kCandCacheDefaultCap);
+        const int cap = cand_cache_cap_();
         for (int add = add_lo; add <= add_hi; ++add) {
             std::vector<std::pair<int32_t,int32_t>> pr;
             pr.reserve(hi - lo);
@@ -851,9 +949,9 @@ private:
 
     // Turn the source sub-run pr[i..j) into a candidate for I_c = [lo,hi).
     // `out` is kept sorted coverage-desc (ties by add-desc) and capped at
-    // `cap` entries -- the shared cache's cap (kCandCacheDefaultCap /
-    // GCSA_CAND_CACHE_CAP), enforced here rather than by a separate trim
-    // pass, so a candidate that can't make the cut is never materialized.
+    // `cap` entries -- cand_cache_cap_(), enforced here rather than by a
+    // separate trim pass, so a candidate that can't make the cut is never
+    // materialized.
     // The cap check is a pure comparison against the current out.back(); it
     // never mutates `out` itself (only a confirmed insert below does), so
     // its position relative to the availability filter doesn't affect
@@ -1288,9 +1386,20 @@ private:
         return iters;
     }
 
+    // Default cap is max(kCandCacheDefaultCap, max_add_), so wrap-around
+    // adds survive coverage-desc eviction on long-period tandems. An
+    // explicit GCSA_CAND_CACHE_CAP (positive) is an exact override.
+    int cand_cache_cap_() const {
+        if (const char* e = std::getenv("GCSA_CAND_CACHE_CAP")) {
+            int v = std::atoi(e);
+            if (v > 0) return v;
+        }
+        return std::max(kCandCacheDefaultCap, max_add_);
+    }
+
     // Truncate a coverage-desc candidate list for the shared cache.
-    static void trim_cand_cache_(std::vector<Candidate>& cands) {
-        int cap = gcsa_env_int("GCSA_CAND_CACHE_CAP", kCandCacheDefaultCap);
+    void trim_cand_cache_(std::vector<Candidate>& cands) const {
+        int cap = cand_cache_cap_();
         if (cap > 0 && (int)cands.size() > cap) cands.resize((size_t)cap);
     }
 
@@ -2787,7 +2896,7 @@ private:
         std::mutex cand_mu;
         // Same cap enumerate_candidates_ applies, so we can tell a truncated
         // cached list (may hide candidates) from a complete one (cannot).
-        const int cand_cap = gcsa_env_int("GCSA_CAND_CACHE_CAP", kCandCacheDefaultCap);
+        const int cand_cap = cand_cache_cap_();
         std::atomic<size_t> repaired_n{0};
         gcsa_parallel_for(intervals.size(), [&](size_t i) {
             const Interval& iv = intervals[i];

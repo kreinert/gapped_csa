@@ -237,7 +237,11 @@ static void print_usage(const char* argv0) {
         << "  -r <reads.fasta>    locate every read in a FASTA\n"
         << "  --algo <name>       greedy-size|greedy-degree|dep-order|pseudoforest-dp|\n"
         << "                      pseudoforest-dp-iterate (default: greedy-size)\n"
-        << "  --max-add N         max differential offset (default: 8)\n"
+        << "  --max-add N|auto    max differential offset (default: 8). \"auto\" reads\n"
+        << "                      the SA's orig-position gaps, takes the dominant\n"
+        << "                      copy period P, and sets max-add = P / gcd(P, stride)\n"
+        << "                      so one hop can wrap a tandem of period P. Falls\n"
+        << "                      back to 8 when there is no repetitive mass.\n"
         << "  --sa-cache DIR      reuse a prepared gapped SA from DIR, building and\n"
         << "                      storing it there on a miss. The SA depends only on\n"
         << "                      (text, shape) -- never on --algo/--max-add/\n"
@@ -317,7 +321,17 @@ int main(int argc, char** argv) {
         else if (k == "--table") want_table = true;
         else if (k == "--sa") want_sa = true;
         else if (k == "--bound") want_bound = true;
-        else if (k == "--max-add") max_add = std::stoi(need("--max-add"));
+        else if (k == "--max-add") {
+            std::string v = need("--max-add");
+            if (v == "auto") max_add = 0;
+            else {
+                max_add = std::stoi(v);
+                if (max_add < 1) {
+                    std::cerr << "--max-add must be >= 1 (or \"auto\")\n";
+                    return 1;
+                }
+            }
+        }
         else if (k == "--phase2-iters") {
             phase2_iters = std::stoi(need("--phase2-iters"));
             if (phase2_iters < 1) {
@@ -482,7 +496,7 @@ int main(int argc, char** argv) {
             if (src == "auto") {
                 const int pb_est =
                     estimate_pb(have_cached ? cached_G.n : text.size());
-                const int mc = min_coverage_breakeven(pb_est, max_add);
+                const int mc = min_coverage_breakeven(pb_est, max_add > 0 ? max_add : 8);
                 std::cout << "min-coverage: auto (" << origin << ") pb_estimate=" << pb_est
                           << " max_add=" << max_add << " -> min_coverage=" << mc << "\n";
                 kMinCoverage = mc;
@@ -510,6 +524,15 @@ int main(int argc, char** argv) {
     // self-test and the brute-force checks must read it from the index or they
     // would verify against an empty string and "fail" a perfectly good build.
     const std::string& text_ref = idx.gsa().text;
+
+    if (max_add == 0) {
+        CompressedIndex::MaxAddPrediction mp = idx.last_max_add_prediction();
+        std::cout << "max-add: auto period=" << mp.period
+                  << "  (" << mp.mode_gaps << "/" << mp.total_gaps << " orig-gaps)"
+                  << "  stride=" << mp.stride
+                  << "  -> max_add=" << mp.max_add
+                  << (mp.used_default ? "  (no period, default)\n" : "\n");
+    }
 
     std::cout << "distinct k-mers      : " << idx.num_kmers() << "\n";
     std::cout << "SA entries (m)       : " << idx.total_positions() << "\n";

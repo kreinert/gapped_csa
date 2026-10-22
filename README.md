@@ -126,6 +126,58 @@ GCSA_CROSS_LCP=1 ./gcsa -g genome.fasta -s "#####" --algo pseudoforest-dp
 GCSA_PFDP_ITERATE=1 ./gcsa -g genome.fasta -s "#####" --algo pseudoforest-dp
 ```
 
+### `--max-add auto` and the candidate cache
+
+`--max-add auto` runs after the SA is built. It histograms orig-position
+gaps in intervals with `|I_c| ≥ 3`. If one gap `P` is a real spike (at
+least 8 pairs **and** at least 25% of all counted gaps), it sets
+
+```
+max_add = max(8, P / gcd(P, stride))     # capped at 65536
+```
+
+where `stride` is the shape span (1 in regular-k mode). That is the
+smallest add whose original-text shift is a multiple of `P`, so one hop
+can wrap a tandem of period `P`. No spike (random DNA, the 10-strain
+E. coli pangenome) keeps the default of 8. The chosen values print as
+`max-add: auto period=... -> max_add=...`. `--bound` then reports the
+structural floor `F0` and the conflict-free best-cov lower bound on `|C|`
+for **this** search.
+
+The per-word candidate cache used to keep 64 coverage-desc links. On a
+predicted `max_add` of 100 that evicted the wrap add, so greedy packed a
+worse universe (100% 100×100 sat at 1741 instead of 999). The default cap
+is now `max(64, max_add)`. `GCSA_CAND_CACHE_CAP=N` is an exact override.
+
+Reproduce the small repeat suite (same generator args as `bench/datasets.py`,
+seed 1, k=21, greedy-degree):
+
+```bash
+make gcsa simulate_repeats simulate_random
+mkdir -p /tmp/gcsa_bounds_data
+for spec in 200:50 100:100 50:200; do
+  x=${spec%%:*}; y=${spec##*:}
+  ./simulate_repeats -x "$x" -y "$y" --seed 1 \
+      -o /tmp/gcsa_bounds_data/repeat_100pct_x${x}_y${y}.fasta
+  ./simulate_repeats -x "$x" -y "$y" --repetitive-frac 0.5 --seed 1 \
+      -o /tmp/gcsa_bounds_data/repeat_50pct_x${x}_y${y}.fasta
+  ./simulate_repeats -x "$x" -y "$y" --repetitive-frac 0.1 --seed 1 \
+      -o /tmp/gcsa_bounds_data/repeat_10pct_x${x}_y${y}.fasta
+done
+./simulate_random -n 1000000 --seed 1 -o /tmp/gcsa_bounds_data/random_1e6.fasta
+
+export GCSA_SKIP_SELFTEST=1
+for f in /tmp/gcsa_bounds_data/*.fasta; do
+  echo "==== $(basename "$f") ===="
+  ./gcsa -g "$f" -s '#####################' \
+    --algo greedy-degree --max-add auto --bound
+done
+```
+
+On the three 100% files this should print `max_add` 50 / 100 / 200 and
+`|C|` 786 / 999 / 958 against best-cov 42. Random DNA stays at
+`max_add=8`, `|C|=m`.
+
 Shapes use `#` (care) and `.` (don't care), e.g. `#.#`, `##.##`, `#..#..#`.
 Contiguous shapes (`#####`) give ordinary k-mers.
 
