@@ -324,6 +324,189 @@ preferred link to the forest and the preferred link rarely changes: a
 larger shift is chosen only to break a coverage tie. The candidate
 universe is not \texttt{tree-dp}'s binding constraint; the forest is.
 
+On a tandem, however, a \emph{specific} large $a$ is not a coverage
+tie-break. It is the only add that maps one copy of a $k$-mer onto
+another copy of the same $k$-mer. The rest of this section is the
+mechanism that finds that add from the GSA and then actually keeps it
+in the candidate lists that every heuristic, including
+\texttt{tree-dp}, reads.
+
+\section{Automatic $a_{\max}$ and the wrap-around add}
+\label{sec:auto-max-add}
+
+\subsection{When a small $a_{\max}$ cannot wrap}
+
+A link with add $a$ recovers a covered rank $t$ from a source rank $u$
+by the original-text shift
+\[
+  \orig(t) \;=\; \orig(u) + a\cdot s
+\]
+(\S\ref{sec:setup}, (V1)). On a tandem of period $P$ --- $x$ identical
+copies of a motif of length $P$ --- the occurrences of any fixed
+$k$-mer sit at original positions $x_0,\, x_0+P,\, x_0+2P,\,\dots$.
+The shift $a\cdot s$ lands on another occurrence of the \emph{same}
+$k$-mer if and only if
+\begin{equation}
+\label{eq:wrap}
+  a\cdot s \;\equiv\; 0 \pmod{P},
+\end{equation}
+i.e.\ iff $a$ is a multiple of
+\begin{equation}
+\label{eq:astar}
+  a^\star \;=\; \frac{P}{\gcd(P,s)}.
+\end{equation}
+This is the \textbf{wrap-around add}. For the contiguous shape of
+weight $21$ used below, $s=21$. On a motif of length $50$,
+$\gcd(50,21)=1$ so $a^\star=50$; on length $100$, $a^\star=100$; on
+length $200$, $a^\star=200$. None of these is visible at the default
+$a_{\max}=8$. The name-cycle packing that $a\le 8$ \emph{can} see ---
+hopping $a\cdot s \bmod P$ positions along the motif, keeping a
+dominating set of names as sources --- is a different, and on these
+inputs strictly coarser, feasible set: at $a_{\max}=8$ the maximal
+universe ILP on the $200\times 50$ tandem is $|C|=1285$, against $786$
+once $a^\star=50$ is admitted.
+
+\subsection{Predicting $P$ from the GSA}
+
+$P$ is not an input. After the GSA is built, and before any candidate
+is enumerated, \texttt{predict\_max\_add\_} reads it off the original
+positions already stored with the ranks. The procedure is
+Algorithm~\ref{alg:auto-max-add}; it is computed once per build and
+then used by every compressor (\texttt{tree-dp}, greedy-degree,
+dep-order, and the ILP baseline).
+
+\begin{algorithm}[H]
+\caption{Predict $a_{\max}$ from orig-position gaps
+  (\texttt{predict\_max\_add\_})}
+\label{alg:auto-max-add}
+\begin{algorithmic}[1]
+\Require gapped suffix array $G$ of length $n$, intervals $\{I_c\}$,
+  stride $s$, floor $a_0=8$, cap $A=65536$
+\Ensure $a_{\max}$
+\State $H \gets$ empty multiset of gaps; $\mathit{maxgap} \gets
+  \max(4096,\, n/4)$
+\ForAll{names $c$ with $\isize(c) \ge \kappa$}
+  \State let $p_1 < \cdots < p_{\isize(c)}$ be $\{\orig(r) : r\in I_c\}$
+    sorted
+  \For{$i = 2$ \textbf{to} $\isize(c)$}
+    \If{$0 < p_i - p_{i-1} \le \mathit{maxgap}$}
+      \State insert $p_i - p_{i-1}$ into $H$
+    \EndIf
+  \EndFor
+\EndFor
+\State $P \gets$ the mode of $H$ (ties to the smaller gap)
+\If{$|H| = 0$ \textbf{or} the multiplicity of $P$ is $< 8$
+    \textbf{or} that multiplicity is $< |H|/4$}
+  \State \Return $a_0$
+    \Comment{no spike: random DNA, unique $k$-mers}
+\EndIf
+\State \Return $\min\bigl(A,\, \max(a_0,\, P/\gcd(P,s))\bigr)$
+\end{algorithmic}
+\end{algorithm}
+
+Two filters stop the mode from being a pangenome artefact. Gaps larger
+than $\max(4096, n/4)$ are discarded, so a $\sim 5$--$10$\,Mbp
+inter-genome offset is not counted as a tandem period on a
+$50$\,Mbp concatenation. Independently, the mode must be a
+\emph{spike}: at least eight pairs, and at least a quarter of all
+counted gaps. On the $10$-strain E.\ coli concatenation the mode is
+$P = 10\,438\,234$ (the spacing of homologous $k$-mers across
+genomes) but it is only $9.2\,\%$ of the gaps, so the test refuses it
+and $a_{\max}$ stays $8$. On every $100\,\%$, $50\,\%$ and $10\,\%$
+file of the small repeat suite the gaps are identically $P$ and the
+test accepts; \texttt{--max-add auto} then prints
+$a_{\max} \in \{50,100,200\}$ according to the motif length.
+
+\texttt{--max-add auto} is the CLI spelling; internally $a_{\max}\le 0$
+is the sentinel that triggers Algorithm~\ref{alg:auto-max-add} after
+the GSA exists, because the histogram is a function of $\orig$ and
+the intervals, not of the raw text.
+
+\subsection{The coverage-desc cache must not evict $a^\star$}
+
+Enumeration does not hand every legal link to the heuristics. Each
+name keeps a cache of at most $\Gamma$ candidates, sorted by
+$(\cov \downarrow,\, a \downarrow)$ --- the same order
+\texttt{pick\_best\_} uses --- and \texttt{emit\_run\_} refuses to
+materialize anything that cannot beat the current worst retained
+entry. The default was $\Gamma = 64$
+(\texttt{kCandCacheDefaultCap}). That constant is invisible at
+$a_{\max}=8$. It is not invisible at $a_{\max}=a^\star$.
+
+On the $100\times 100$ tandem, auto sets $a_{\max}=100$. The wrap
+adds $a\in\{99,100\}$ have, individually, lower coverage than a band
+of mid-range adds $a\in\{64,\dots,68\}$ (coverage $86$--$87$ versus
+the wrap's fragmented intra-runs). Coverage-desc eviction therefore
+retained the mid-range band and dropped $a^\star$. Greedy-degree
+accepted adds $64$--$68$, Phase~II could not invent the wrap from a
+cache that did not contain it, and $|C|$ was $1741$ --- \emph{worse}
+than $a_{\max}=8$ ($1645$). Raising $\Gamma$ to $128$ lets $a^\star$
+survive; Phase~II then collapses the same Phase~I packing to
+$|C|=999$. The $200\times 50$ tandem never saw the bug:
+$a^\star=50 < 64$, so wrap was already in the cache and $|C|=786$
+with or without the change.
+
+The live cap is therefore
+\begin{equation}
+\label{eq:cap}
+  \Gamma \;=\; \max(64,\, a_{\max}),
+\end{equation}
+unless \texttt{GCSA\_CAND\_CACHE\_CAP} is set, in which case that
+value is used exactly (a diagnostic override, not a second default).
+On E.\ coli auto keeps $a_{\max}=8$, so \eqref{eq:cap} is a no-op
+and the cache does not grow.
+
+\subsection{What this does, and what it does not}
+
+Table~\ref{tab:auto} is greedy-degree, weight-$21$ contiguous,
+\texttt{--max-add auto}, $\Gamma=\max(64,a_{\max})$, on the seed-$1$
+repeat suite of \texttt{bench/datasets.py}. Best-cov is
+$m - \sum_c \max_{k\in\hat\Links_c}\cov(k)$, conflicts ignored --- a
+lower bound on \emph{this} search, not on the true optimum. On the
+three $100\,\%$ files it equals $42$;
+the feasible floor is much higher. For $200\times 50$ the maximal
+universe LP at $a_{\max}=50$ is $637.7$, so the heuristic's $786$ is
+$148$ rows above a real relaxation, not $744$ rows above $42$.
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+input & $a_{\max}$ & $m$ & best-cov & $|C|$ & $|C|$ at $\Gamma=64$ \\
+\midrule
+random $10^6$     & $8$  & $1\,000\,001$ & $1\,000\,001$ & $1\,000\,001$ & $1\,000\,001$ \\
+$100\,\%$ $200\times 50$ & $50$  & $10\,001$ & $42$ & $786$ & $786$ \\
+$100\,\%$ $100\times 100$ & $100$ & $10\,001$ & $42$ & $999$ & $1741$ \\
+$100\,\%$ $50\times 200$  & $200$ & $10\,001$ & $42$ & $958$ & $1071$ \\
+$50\,\%$ $100\times 100$  & $100$ & $20\,001$ & $10\,041$ & $10\,731$ & $11\,645$ \\
+$10\,\%$ $100\times 100$  & $100$ & $100\,001$ & $90\,041$ & $90\,731$ & $91\,645$ \\
+$10$ E.\ coli            & $8$  & $52\,117\,680$ & $26\,094\,932$ & $30\,298\,453$ & $30\,298\,453$ \\
+\bottomrule
+\end{tabular}
+\caption{Automatic $a_{\max}$ plus the wrap-preserving cache cap.
+  Motif length $P$ becomes $a_{\max}$ on every tandem; the cap change
+  moves only the files with $a_{\max}>64$. Ten E.\ coli genomes share
+  a $10.4$\,Mbp homologous spacing that fails the spike test, so
+  auto is the default $8$.}
+\label{tab:auto}
+\end{table}
+
+The mixed $10\,\%/50\,\%$ files of motif $50$ and $200$ do not move:
+their unique prefix already sits on best-cov, and the tandem leftover
+is packed by small adds (or by a wrap that $\Gamma=64$ already held).
+The $100\times 100$ mixed files pick up the same wrap as the pure
+tandem, $-914$ rows.
+
+Two caveats follow from the same measurements. First, auto chooses the
+universe; it does not choose the packing. Phase~I of greedy-degree on
+$200\times 50$ still keeps $5633$ ranks and relies on Phase~II to
+reach $786$. Second, enlarging LNS clusters
+(\texttt{GCSA\_LNS\_AUTO=1}) closes more of the $786$--$638$ gap on
+that file ($|C|=672$) and \emph{opens} it on $100\times 100$ wrap
+($999\to 1272$). The wrap-preserving cap is the change that is safe
+to leave on; cluster sizing remains instance-dependent.
+
 \section{Preference selection and the pseudoforest}
 \label{sec:pref}
 
