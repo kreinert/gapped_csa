@@ -2,7 +2,7 @@ CXX      ?= clang++
 CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -pthread
 INCLUDES := -Isrc
 
-BIN := validate gcsa bench_repetition simulate_repeats simulate_random simulate_pangenome compare_algos ilp_baseline
+BIN := validate gcsa bench_repetition simulate_repeats simulate_random simulate_pangenome compare_algos ilp_baseline lower_bound link_stats
 
 all: $(BIN)
 
@@ -32,5 +32,11 @@ ilp_baseline: src/ilp_baseline.cpp src/shape.hpp src/gapped_sa.hpp src/sais.hpp 
 
 clean:
 	rm -f $(BIN)
+
+lower_bound: src/lower_bound.cpp src/shape.hpp src/gapped_sa.hpp src/sais.hpp src/compress.hpp
+	$(CXX) $(CXXFLAGS) $(INCLUDES) src/lower_bound.cpp -o $@
+
+link_stats: src/link_stats.cpp src/shape.hpp src/gapped_sa.hpp src/sais.hpp src/compress.hpp
+	$(CXX) $(CXXFLAGS) $(INCLUDES) src/link_stats.cpp -o $@
 
 .PHONY: all clean

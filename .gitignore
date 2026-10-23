@@ -9,6 +9,8 @@
 /simulate_pangenome
 /dump_graph
 /find_minimal_gap
+/lower_bound
+/link_stats
 *.o
 *.lp
 a.out

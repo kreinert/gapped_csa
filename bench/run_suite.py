@@ -559,6 +559,34 @@ def balance_rows(rows: list, weights: dict, shard_n: int) -> "tuple[list, list]"
     return [[rows[i] for i in b] for b in bins], totals
 
 
+def require_gcsa_flags(bin_dir: Path, flags: "list[str]") -> None:
+    """Refuse to start if ./gcsa predates the flags this run depends on.
+
+    The binary and this script are versioned together but deployed separately,
+    so a cluster that pulled the repo without rebuilding runs a new run_suite.py
+    against an old gcsa. Without this check that surfaces as `unknown arg:
+    --sa-cache` one experiment at a time -- and only AFTER the input has been
+    materialized and gzip-measured, which for the large datasets is minutes of
+    wasted work per shard, on every shard of the array, before anything says
+    why. Probing --help once costs milliseconds and names the actual fix."""
+    exe = bin_dir / "gcsa"
+    if not exe.exists():
+        sys.exit(f"[error] {exe} does not exist -- run `make gcsa` in {bin_dir}")
+    try:
+        r = subprocess.run([str(exe), "--help"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        sys.exit(f"[error] cannot run {exe}: {e}")
+    help_text = (r.stdout or "") + (r.stderr or "")
+    missing = [f for f in flags if f not in help_text]
+    if missing:
+        sys.exit(
+            f"[error] {exe} does not understand {', '.join(missing)} -- it was built before "
+            f"the gapped-SA cache existed.\n"
+            f"        Rebuild it:  make -C {bin_dir} gcsa\n"
+            f"        If that path is already rebuilt, --bin-dir / BIN_DIR in config.py is "
+            f"pointing at a different tree than the one you rebuilt.")
+
+
 def balance_pairs(pairs: list, weights: dict, shard_n: int) -> "tuple[list, list]":
     """The same greedy longest-processing-time-first packing as balance_rows,
     but over (dataset_name, shape) PAIRS -- the granularity at which the gapped
@@ -933,6 +961,9 @@ def main():
     def log(msg):
         print(msg, file=sys.stderr)
 
+    if sa_cache is not None and not args.prepare_run:
+        require_gcsa_flags(bin_dir, ["--sa-load"])
+
     def blob_for(meta):
         """Absolute path of a prepared blob, or None to build from the genome."""
         return (sa_cache / meta["blob"]) if (sa_cache is not None and meta) else None
@@ -966,6 +997,7 @@ def main():
     if args.prepare_run:
         if sa_cache is None:
             sys.exit("[error] --prepare-run needs --sa-cache DIR to write into")
+        require_gcsa_flags(bin_dir, ["--sa-cache", "--prepare-only"])
         sa_cache.mkdir(parents=True, exist_ok=True)
         # Local to this pass: the sweep below keeps its own, and the two never
         # run in the same invocation.
