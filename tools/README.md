@@ -20,7 +20,10 @@ Python deps: `pandas numpy highspy ortools`; `ilp_baseline` needs `cbc` (e.g. `p
 
 ## Cluster workflow
 
-All three read run_suite.py's SA cache (`--sa-cache $S/sa`), so no FASTA is needed,
+All three read run_suite.py's SA cache (`--sa-cache $S/sa`), so no FASTA is needed.
+Integer shapes share one plain-SA sidecar per dataset (`<dataset>__plain.json`);
+`sweep_bounds.py` / `sweep_link_stats.py` expand it to one cell per `--plain-k`
+(default: the integer shapes in `--runs`, else in `bench/datasets.py` SHAPES),
 and all take `--only DATASET ...`, `--shard I/N` for array jobs, and resume on `--out`.
 
 ```

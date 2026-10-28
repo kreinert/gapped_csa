@@ -269,8 +269,29 @@ def gzip_ratio(path: Path) -> "tuple[int, int, float]":
 # 2026-09-10 run. With the sidecar present the sweep never opens the genome at
 # all -- the blob carries the text -- so the whole class of failure leaves the
 # hot path.
+#
+# Integer shapes (gcsa's regular mode: plain character SA, -s k) are the
+# exception to one-sidecar-per-shape. The plain SA does not depend on k -- only
+# the LCP >= k grouping applied at compression time does -- so gcsa caches one
+# plain blob per text, and every integer shape of a dataset shares ONE sidecar,
+# <dataset>__plain.json. Preparing any one k therefore prepares them all.
+PLAIN_SA_KEY = "plain"
+
+
+def is_plain_shape(shape: str) -> bool:
+    """A bare positive integer -s: regular mode, plain SA."""
+    return shape.isdigit()
+
+
+def sa_cache_key(shape: str) -> str:
+    """What a (dataset, shape) pair is prepared and cached under."""
+    return PLAIN_SA_KEY if is_plain_shape(shape) else shape
+
+
 def sa_meta_path(cache_dir: Path, ds_name: str, shape: str) -> Path:
-    shape_part = shape if _SHAPE_FILENAME_SAFE.match(shape) else re.sub(r"[^\w.-]", "_", shape)
+    key = sa_cache_key(shape)
+    shape_part = key if (key == PLAIN_SA_KEY or _SHAPE_FILENAME_SAFE.match(key)) \
+        else re.sub(r"[^\w.-]", "_", key)
     return cache_dir / "meta" / f"{ds_name}__{shape_part}.json"
 
 
@@ -1004,7 +1025,17 @@ def main():
         resolved_cache = {}
         # Note all_rows, not rows: the pairs to prepare are a property of the
         # whole sweep, and are then split across shards in their own right.
-        want = sorted({(d["name"], shape) for d, shape, _a, _m in all_rows})
+        # One pair per CACHE KEY, not per shape: all integer shapes of a dataset
+        # share one plain SA and one sidecar, so preparing them as separate
+        # pairs would have two tasks build the same blob. The representative
+        # shape is the smallest k; any k builds the same plain SA.
+        rep = {}
+        for d, shape, _a, _m in all_rows:
+            key = (d["name"], sa_cache_key(shape))
+            cur = rep.get(key)
+            if cur is None or (is_plain_shape(shape) and int(shape) < int(cur)):
+                rep[key] = shape
+        want = sorted((ds_name, shape) for (ds_name, _k), shape in rep.items())
         if shard_n is not None:
             pair_bins, pair_totals = balance_pairs(want, weights, shard_n)
             mine, my_weight = pair_bins[shard_i], pair_totals[shard_i]
@@ -1046,7 +1077,7 @@ def main():
                     continue
                 blob, m, nbytes = Path(mo.group(1)).name, int(mo.group(2)), int(mo.group(3))
                 write_sa_meta(sa_cache, ds_name, shape, {
-                    "blob": blob, "dataset": ds_name, "shape": shape, "m": m,
+                    "blob": blob, "dataset": ds_name, "shape": sa_cache_key(shape), "m": m,
                     "blob_bytes": nbytes, "raw_bytes": raw, "gzip_bytes": gz,
                     "gzip_ratio": round(ratio, 6),
                 })
@@ -1123,7 +1154,8 @@ def main():
             if sa_cache is not None and all(metas.values()):
                 m0 = metas[next(iter(shapes_needed))]
                 raw, gz, ratio = m0["raw_bytes"], m0["gzip_bytes"], m0["gzip_ratio"]
-                log(f"[prepared] {ds_name}: {len(shapes_needed)} SA blob(s) in {sa_cache}"
+                n_blobs = len({metas[sh]["blob"] for sh in shapes_needed})
+                log(f"[prepared] {ds_name}: {len(shapes_needed)} shape(s) from {n_blobs} SA blob(s) in {sa_cache}"
                     f"  {raw} bytes, gzip_ratio={ratio:.3f}  (genome not opened)")
             else:
                 if sa_cache is not None:

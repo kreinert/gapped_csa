@@ -25,18 +25,13 @@ ap.add_argument("--algos", nargs="*", default=list(SHORT))
 ap.add_argument("--max-adds", nargs="*", type=int, default=[8, 16, 32])
 ap.add_argument("--shard", default="0/1")
 ap.add_argument("--link-stats", default=os.path.join(ROOT, "link_stats"))
+ap.add_argument("--plain-k", nargs="*",
+                help="k values to run on each dataset's shared plain-SA blob "
+                     "(default: the integer shapes in bench/datasets.py SHAPES)")
 a = ap.parse_args()
 
-cells = []
-for p in sorted(glob.glob(os.path.join(a.sa_cache, "meta", "*.json"))):
-    try:
-        m = json.load(open(p))
-    except (OSError, ValueError):
-        continue
-    blob = os.path.join(a.sa_cache, m.get("blob", ""))
-    if m.get("dataset") and m.get("shape") and os.path.isfile(blob):
-        if not a.only or m["dataset"] in a.only:
-            cells.append((m["dataset"], m["shape"], blob))
+from sa_cache_cells import sidecar_cells, default_plain_ks
+cells = sidecar_cells(a.sa_cache, a.plain_k if a.plain_k is not None else default_plain_ks(), a.only)
 jobs = [(ds, sh, b, al, A) for (ds, sh, b) in cells for al in a.algos for A in a.max_adds]
 si, sn = (int(x) for x in a.shard.split("/"))
 jobs = jobs[si::sn]

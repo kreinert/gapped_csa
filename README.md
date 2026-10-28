@@ -95,6 +95,10 @@ GCSA_THREADS=8   ./gcsa -g genome.fasta -s "#####" --algo pseudoforest-dp   # pa
 # k-mer. Loading either kind as the other is refused.
 ./gcsa -g genome.fasta -s 21 --sa-cache /scratch/sa --prepare-only   # builds the plain blob
 ./gcsa -g genome.fasta -s 30 --sa-cache /scratch/sa --algo dep-order # reuses it for k=30
+# bench/run_suite.py follows suit: all integer shapes of a dataset share one
+# sidecar, sa/meta/<dataset>__plain.json, so `--prepare-run --shapes 21` also
+# prepares k=30 (and every other k), and --prepare-run builds each plain SA once
+# even when several integer shapes are requested across shards.
 # Phase II runs a fixed 100 dirty generations (or fewer, if it reaches a fixed
 # point first). A budget below the fixed point may increase |C|:
 ./gcsa -g genome.fasta -s "#####" --algo pseudoforest-dp --phase2-iters 25

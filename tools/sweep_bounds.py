@@ -9,8 +9,10 @@ Cluster use -- straight from run_suite.py's prepared SA cache, no FASTA needed:
 
   Cells are read from the cache's sidecars ($S/sa/meta/<dataset>__<shape>.json,
   written by run_suite.py --prepare-run); each one names its blob, which is
-  passed to ./lower_bound --sa-load.  --runs (any CSV with dataset, shape,
-  c_final columns, e.g. data/20260923_runs.csv) is optional: the best c_final
+  passed to ./lower_bound --sa-load. Integer shapes share one plain-SA sidecar
+  per dataset (<dataset>__plain.json); it is expanded to one cell per --plain-k
+  (default: the integer shapes in --runs, else in bench/datasets.py SHAPES).  --runs (any CSV with dataset, shape and
+  c_final or C columns: data/20260923_runs.csv, or run_suite.py's own --out) is optional: the best c_final
   per cell only steers the Lagrangian step size and limits the cells to ones
   that were actually run.
 
@@ -35,6 +37,9 @@ ap.add_argument("--iters", default="30")
 ap.add_argument("--only", nargs="*", help="dataset names to include")
 ap.add_argument("--shard", default="0/1", help="I/N: this task's slice of the cells")
 ap.add_argument("--lower-bound", default=os.path.join(ROOT, "lower_bound"))
+ap.add_argument("--plain-k", nargs="*",
+                help="k values to bound on each dataset's shared plain-SA blob "
+                     "(default: the integer shapes in --runs, else in bench/datasets.py SHAPES)")
 a = ap.parse_args()
 if not a.sa_cache and not a.data_dir:
     sys.exit("need --sa-cache or --data-dir")
@@ -45,9 +50,11 @@ if a.runs:
     for r in csv.DictReader(open(a.runs)):
         if r.get("complete", "True") not in ("True", "true", "1"):
             continue
-        try:
-            c = int(float(r["c_final"]))
-        except (KeyError, ValueError):
+        if r.get("status", "ok") not in ("ok", ""):
+            continue
+        try:   # c_final: the analysed runs CSV; C: run_suite.py's own output
+            c = int(float(r.get("c_final") or r["C"]))
+        except (KeyError, ValueError, TypeError):
             continue
         k = (r["dataset"], r["shape"])
         best[k] = min(best.get(k, c), c)
@@ -55,16 +62,10 @@ if a.runs:
 # cell list: (dataset, shape, blob-or-None)
 cells = []
 if a.sa_cache:
-    for p in sorted(glob.glob(os.path.join(a.sa_cache, "meta", "*.json"))):
-        try:
-            m = json.load(open(p))
-        except (OSError, ValueError):
-            continue
-        if not all(k in m for k in ("blob", "dataset", "shape")):
-            continue
-        blob = os.path.join(a.sa_cache, m["blob"])
-        if os.path.isfile(blob):
-            cells.append((m["dataset"], m["shape"], blob))
+    from sa_cache_cells import sidecar_cells, default_plain_ks
+    plain_ks = a.plain_k if a.plain_k is not None else (
+        sorted({sh for _, sh in best if sh.isdigit()}, key=int) if a.runs else default_plain_ks())
+    cells = sidecar_cells(a.sa_cache, plain_ks)
     if a.runs:
         cells = [c for c in cells if (c[0], c[1]) in best]
 else:
