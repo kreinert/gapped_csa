@@ -96,7 +96,11 @@ int main(int argc, char** argv) {
         else { std::cerr << "unknown arg " << k << "\n"; return 1; }
     }
     if (shape_str.empty()) { std::cerr << "need -s SHAPE\n"; return 1; }
-    Shape sh = Shape::parse(shape_str);
+    // A bare integer k means gcsa's "regular mode": plain character SA, k-mers
+    // grouped by LCP >= k characters, one add = one character, one chain.
+    const bool regular = shape_str.find_first_not_of("0123456789") == std::string::npos;
+    const int regular_k = regular ? std::stoi(shape_str) : 0;
+    Shape sh = Shape::parse(regular ? std::string((size_t)regular_k, '#') : shape_str);
     const int MC = kMinCoverage;
     const int A = As.back();   // scan adds 1..max(As); report a bound at every requested A
 
@@ -105,11 +109,15 @@ int main(int argc, char** argv) {
     if (!sa_cache.empty() && sa_load.empty()) {
         // same content-addressed blob name gcsa --sa-cache uses; never builds/writes
         if (genome.empty()) { std::cerr << "--sa-cache needs -g to derive the blob name\n"; return 1; }
-        sa_load = sa_cache + "/" + gsa_blob_name(gcsa_text_hash(load_dna(genome)), sh.pattern);
+        sa_load = sa_cache + "/" + gsa_blob_name(gcsa_text_hash(load_dna(genome)),
+                                                 regular ? std::string(kGsaPlainKey) : sh.pattern);
     }
     if (!sa_load.empty()) {
         std::string err;
-        if (!gsa_load(G, sa_load, &sh.pattern, &err)) { std::cerr << "--sa-load: " << err << "\n"; return 1; }
+        // blobs are keyed on the pattern, or "plain" for the (k-independent) plain SA
+        const std::string key = regular ? std::string(kGsaPlainKey) : sh.pattern;
+        if (!gsa_load(G, sa_load, &key, &err)) { std::cerr << "--sa-load: " << err << "\n"; return 1; }
+        if (regular) G.shape = sh;   // the blob carries no k
     } else {
         std::string text = !text_arg.empty() ? text_arg : load_dna(genome);
         if (!text_arg.empty()) {
@@ -117,10 +125,9 @@ int main(int argc, char** argv) {
             for (char c : text) if (std::isalpha((unsigned char)c)) clean.push_back(base_char(base_value(c)));
             text = clean;
         }
-        G = build_gapped_sa(sh, std::move(text));
+        G = regular ? build_plain_sa(regular_k, std::move(text)) : build_gapped_sa(sh, std::move(text));
     }
     const double t_sa = ms_since(t0);
-    std::vector<int32_t>().swap(G.lcp);   // not needed
 
     const size_t m = G.m();
     t0 = Clock::now();
@@ -134,19 +141,22 @@ int main(int argc, char** argv) {
         int32_t w = -1;
         uint64_t prev = 0;
         for (size_t r = 0; r < m; ++r) {
-            uint64_t nm = G.lex[(size_t)G.sa[r]];
-            if (r == 0 || nm != prev) { ++w; isize.push_back(0); prev = nm; }
+            // gapped: same first symbol (= k-mer name); regular: LCP >= k characters
+            const uint64_t nm = regular ? 0 : G.lex[(size_t)G.sa[r]];
+            const bool brk = regular ? (r == 0 || G.lcp[r] < regular_k) : (r == 0 || nm != prev);
+            if (brk) { ++w; isize.push_back(0); prev = nm; }
             word_of_rank[r] = w;
             ++isize[(size_t)w];
         }
     }
     const size_t K = isize.size();
     std::vector<uint64_t>().swap(G.lex);
+    std::vector<int32_t>().swap(G.lcp);
     std::string().swap(G.text);
 
     std::vector<int32_t> word_of_lex(m);
     for (size_t r = 0; r < m; ++r) word_of_lex[(size_t)G.sa[r]] = word_of_rank[r];
-    const int64_t span = sh.span;
+    const int64_t span = regular ? 1 : sh.span;   // text shift per unit of add
     // chain boundaries (lextext is grouped by residue: one block per residue)
     std::vector<size_t> chain_start;
     for (size_t i = 0; i < m; ++i)

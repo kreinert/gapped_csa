@@ -448,10 +448,25 @@ public:
                int max_add = 8, CompressAlgo algo = CompressAlgo::GreedySize,
                int phase2_iters = 0) {
         using Clock = std::chrono::steady_clock;
-        const bool timing = (std::getenv("GCSA_TIMING") != nullptr);
         auto t0 = Clock::now();
-        G_ = build_plain_sa(k, std::move(text));
+        GappedSA G = build_plain_sa(k, std::move(text));
+        const double sa_ms =
+            std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+        build_from_plain_sa(std::move(G), k, max_add, algo, phase2_iters, sa_ms, /*cached=*/false);
+    }
+
+    // Regular-mode counterpart of build_from_gsa: the same pipeline from an
+    // already-built PLAIN suffix array (build_plain_sa, or a "plain" blob --
+    // see gsa_key_is_plain). The plain SA is the same for every k; `k` decides
+    // only the LCP >= k grouping, and this sets the matching contiguous shape.
+    void build_from_plain_sa(GappedSA&& G, int k, int max_add = 8,
+                             CompressAlgo algo = CompressAlgo::GreedySize,
+                             int phase2_iters = 0, double sa_ms = 0.0, bool cached = true) {
+        using Clock = std::chrono::steady_clock;
+        const bool timing = (std::getenv("GCSA_TIMING") != nullptr);
         auto t1 = Clock::now();
+        G_ = std::move(G);
+        G_.shape = Shape::parse(std::string((size_t)k, '#'));
         regular_mode_ = true;
         span_ = k;          // window width in characters, used by locate()
         add_stride_ = 1;    // one unit of `add` = one character
@@ -466,8 +481,8 @@ public:
                 return std::chrono::duration<double, std::milli>(b - a).count();
             };
             gcsa_log(
-                "[timing] plain_sa=%.1fms  compress(%s)=%.1fms  m=%zu intervals~kmers later\n",
-                ms(t0, t1), algo_name(algo_), ms(t1, t2), G_.m());
+                "[timing] plain_sa=%.1fms%s  compress(%s)=%.1fms  m=%zu intervals~kmers later\n",
+                sa_ms, cached ? " (cached)" : "", algo_name(algo_), ms(t1, t2), G_.m());
         }
     }
 

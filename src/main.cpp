@@ -244,7 +244,10 @@ static void print_usage(const char* argv0) {
         << "                      --min-coverage -- so one blob serves every run of\n"
         << "                      that pair. Content-addressed: the key is a hash of\n"
         << "                      the cleaned text plus the shape, so a regenerated\n"
-        << "                      but byte-identical input still hits.\n"
+        << "                      but byte-identical input still hits. A bare-k -s\n"
+        << "                      (regular mode) caches the plain SA, which is the\n"
+        << "                      same for every k: one blob per text, separate from\n"
+        << "                      the \"###...\" lextext one.\n"
         << "  --sa-load FILE      load exactly this blob and do not build on failure.\n"
         << "                      Needs no -g at all: the blob carries the text. -s is\n"
         << "                      still required, and a blob built for another shape is\n"
@@ -406,8 +409,12 @@ int main(int argc, char** argv) {
     Shape sh = regular ? Shape::parse(std::string((size_t)regular_k, '#'))
                         : Shape::parse(shape_str);
     if (regular)
+        // span/weight printed too (both k), so log parsers that read them for
+        // gapped shapes fill the same columns; n is unknown yet under --sa-load
         std::cout << "mode=regular (no LexText) k=" << regular_k
-                  << " n=" << text.size() << "  algo=" << algo_name(algo) << "\n";
+                  << " span=" << regular_k << " weight=" << regular_k
+                  << (sa_load_path.empty() ? " n=" + std::to_string(text.size()) : std::string())
+                  << "  algo=" << algo_name(algo) << "\n";
     else if (!sa_load_path.empty())
         // n comes from the blob, which has not been opened yet -- printing
         // text.size() here would report a confident 0.
@@ -426,17 +433,16 @@ int main(int argc, char** argv) {
     bool have_cached = false, cached_from_disk = false;
     double cached_sa_ms = 0.0;
     if (!sa_load_path.empty() || !sa_cache_dir.empty()) {
-        if (regular) {
-            std::cerr << "--sa-cache/--sa-load apply to gapped shapes; regular (integer -s) "
-                         "mode builds a plain SA and is not cached\n";
-            return 1;
-        }
+        // Regular mode caches its plain SA too. It does not depend on k, so it
+        // is keyed "plain" -- one blob per text serves every -s k -- and never
+        // collides with the lextext blob of a contiguous k-mer.
+        const std::string key = regular ? std::string(kGsaPlainKey) : sh.pattern;
         using Clock = std::chrono::steady_clock;
         std::string blob = sa_load_path, err;
         if (blob.empty())
-            blob = sa_cache_dir + "/" + gsa_blob_name(gcsa_text_hash(text), sh.pattern);
+            blob = sa_cache_dir + "/" + gsa_blob_name(gcsa_text_hash(text), key);
         auto t0 = Clock::now();
-        cached_from_disk = gsa_load(cached_G, blob, &sh.pattern, &err);
+        cached_from_disk = gsa_load(cached_G, blob, &key, &err);
         cached_sa_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
         if (!cached_from_disk && !sa_load_path.empty()) {
             // An explicit --sa-load that cannot be honoured is an error, never a
@@ -449,10 +455,10 @@ int main(int argc, char** argv) {
             if (std::getenv("GCSA_TIMING"))
                 std::cerr << "[cache] miss (" << err << "), building\n";
             t0 = Clock::now();
-            cached_G = build_gapped_sa(sh, text);
+            cached_G = regular ? build_plain_sa(regular_k, text) : build_gapped_sa(sh, text);
             cached_sa_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
             std::string werr;
-            if (!gsa_save(cached_G, blob, &werr)) std::cerr << "[cache] not written: " << werr << "\n";
+            if (!gsa_save(cached_G, blob, &werr, key)) std::cerr << "[cache] not written: " << werr << "\n";
             else if (std::getenv("GCSA_TIMING")) std::cerr << "[cache] wrote " << blob << "\n";
         } else if (std::getenv("GCSA_TIMING")) {
             std::cerr << "[cache] hit " << blob << "\n";
@@ -460,7 +466,7 @@ int main(int argc, char** argv) {
         if (prepare_only) {
             std::cout << "prepared " << blob << "  m=" << cached_G.lex.size()
                       << "  bytes=" << gsa_blob_bytes(cached_G.n, cached_G.lex.size(),
-                                                      (uint32_t)sh.pattern.size()) << "\n";
+                                                      (uint32_t)key.size()) << "\n";
             return 0;
         }
         have_cached = true;
@@ -499,7 +505,10 @@ int main(int argc, char** argv) {
     }
 
     CompressedIndex idx;
-    if (have_cached)
+    if (have_cached && regular)
+        idx.build_from_plain_sa(std::move(cached_G), regular_k, max_add, algo, phase2_iters,
+                                cached_sa_ms, cached_from_disk);
+    else if (have_cached)
         idx.build_from_gsa(std::move(cached_G), max_add, algo, phase2_iters,
                            cached_sa_ms, cached_from_disk);
     else if (regular) idx.build(regular_k, text, max_add, algo, phase2_iters);

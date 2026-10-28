@@ -88,6 +88,13 @@ GCSA_THREADS=8   ./gcsa -g genome.fasta -s "#####" --algo pseudoforest-dp   # pa
 # text -- so a benchmark sweep never has to open (or generate, or delete) the
 # genome. A missing or wrong-shape blob is refused, never silently rebuilt:
 ./gcsa -s "##.##" --sa-load /scratch/sa/<hash>.gsa --algo dep-order
+# Regular mode (a bare k for -s, plain character SA) is cached the same way.
+# The plain SA does not depend on k -- only the LCP >= k grouping applied at
+# compression time does -- so it is keyed "plain": one blob per text serves
+# every k, and it never collides with the "#####..." lextext blob of the same
+# k-mer. Loading either kind as the other is refused.
+./gcsa -g genome.fasta -s 21 --sa-cache /scratch/sa --prepare-only   # builds the plain blob
+./gcsa -g genome.fasta -s 30 --sa-cache /scratch/sa --algo dep-order # reuses it for k=30
 # Phase II runs a fixed 100 dirty generations (or fewer, if it reaches a fixed
 # point first). A budget below the fixed point may increase |C|:
 ./gcsa -g genome.fasta -s "#####" --algo pseudoforest-dp --phase2-iters 25

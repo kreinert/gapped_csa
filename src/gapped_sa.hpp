@@ -207,7 +207,12 @@ inline GappedSA build_gapped_sa(const Shape& shape, std::string text) {
 //   magic       8   "GCSAGSA\0"
 //   version     u32 format version; a bump invalidates every existing blob
 //   endian      u32 0x01020304, refuses a foreign byte order
-//   shape_len   u32 followed by that many bytes of the shape pattern
+//   shape_len   u32 followed by that many bytes of the cache key: the shape
+//               pattern for a gapped SA ("##.##"), or kGsaPlainKey ("plain")
+//               for the plain character SA of gcsa's regular mode. The plain
+//               SA does not depend on k (only the LCP >= k grouping applied
+//               later does), so one plain blob per text serves every -s k, and
+//               it never collides with a lextext blob of a contiguous k-mer.
 //   n           u64 text length
 //   m           u64 lex/sa/lcp length (== n+1)
 //   alphabet    i64 alphabet_size
@@ -234,7 +239,14 @@ inline uint64_t gcsa_text_hash(const std::string& t) {
     return gcsa_fnv1a(t.data(), t.size());
 }
 
-// Blob filename for a (text, shape) pair. Both are folded in, so two shapes
+// A blob's cache key: the #/. pattern for a gapped SA, kGsaPlainKey for a plain
+// SA (regular mode, any k). Kept distinct on purpose -- the two SAs index the
+// same k-mers but are different arrays (lextext names vs raw characters), and
+// loading one for the other would corrupt every number.
+static const char* const kGsaPlainKey = "plain";
+inline bool gsa_key_is_plain(const std::string& key) { return key == kGsaPlainKey; }
+
+// Blob filename for a (text, key) pair. Both are folded in, so two shapes
 // over one genome are different entries and can coexist in one directory.
 inline std::string gsa_blob_name(uint64_t text_hash, const std::string& shape_pattern) {
     char buf[64];
@@ -274,20 +286,24 @@ inline uint64_t gsa_blob_bytes(uint64_t n, uint64_t m, uint32_t shape_len) {
 // directory and are renamed into place, so a blob at `path` is always whole:
 // a killed or out-of-disk writer leaves a .part behind rather than a truncated
 // SA that the next run would load and silently compute against.
-inline bool gsa_save(const GappedSA& G, const std::string& path, std::string* err) {
+// `key` is the cache key to record; empty means the SA's own shape pattern
+// (a gapped SA). A plain SA must pass kGsaPlainKey.
+inline bool gsa_save(const GappedSA& G, const std::string& path, std::string* err,
+                     const std::string& key = std::string()) {
+    const std::string& rec = key.empty() ? G.shape.pattern : key;
     const std::string tmp = path + "." + std::to_string((long)::getpid()) + ".part";
     {
         std::ofstream o(tmp, std::ios::binary);
         if (!o) { if (err) *err = "cannot open " + tmp + " for writing"; return false; }
         const uint32_t ver = kGsaBlobVersion, endian = kGsaBlobEndian;
-        const uint32_t slen = (uint32_t)G.shape.pattern.size();
+        const uint32_t slen = (uint32_t)rec.size();
         const uint64_t n = G.n, m = G.lex.size(), th = gcsa_text_hash(G.text);
         const int64_t alpha = G.alphabet_size;
         detail::gsa_put(o, "GCSAGSA\0", 8);
         detail::gsa_put(o, &ver, 4);
         detail::gsa_put(o, &endian, 4);
         detail::gsa_put(o, &slen, 4);
-        detail::gsa_put(o, G.shape.pattern.data(), slen);
+        detail::gsa_put(o, rec.data(), slen);
         detail::gsa_put(o, &n, 8);
         detail::gsa_put(o, &m, 8);
         detail::gsa_put(o, &alpha, 8);
@@ -312,8 +328,9 @@ inline bool gsa_save(const GappedSA& G, const std::string& path, std::string* er
 // must equal exactly what the header implies -- a short file means a truncated
 // or interrupted write, which must fail loudly rather than load a partial SA.
 // `expect_shape`, when non-null, additionally requires the blob to have been
-// built for that shape; that is the check that stops a stale or mismatched
-// cache entry from being compressed against the wrong pattern.
+// built for that cache key (a shape pattern, or kGsaPlainKey); that
+// is the check that stops a stale or mismatched cache entry from being
+// compressed against the wrong pattern -- or a plain SA against a lextext one.
 inline bool gsa_load(GappedSA& G, const std::string& path,
                      const std::string* expect_shape, std::string* err) {
     std::ifstream i(path, std::ios::binary);
@@ -343,7 +360,9 @@ inline bool gsa_load(GappedSA& G, const std::string& path,
           return false; }
     }
     if (expect_shape && pattern != *expect_shape) {
-        if (err) *err = path + ": blob was built for shape " + pattern + ", not " + *expect_shape;
+        auto what = [](const std::string& k) {
+            return gsa_key_is_plain(k) ? std::string("a plain SA") : "shape " + k; };
+        if (err) *err = path + ": blob was built for " + what(pattern) + ", not " + what(*expect_shape);
         return false;
     }
     uint64_t n = 0, m = 0, th = 0; int64_t alpha = 0;
@@ -367,7 +386,9 @@ inline bool gsa_load(GappedSA& G, const std::string& path,
         }
     }
     G = GappedSA{};
-    G.shape = Shape::parse(pattern);
+    // A plain SA carries no k: the caller supplies it (build_from_plain_sa sets
+    // the contiguous k-shape). Until then it holds a placeholder 1-mer shape.
+    G.shape = gsa_key_is_plain(pattern) ? Shape::parse("#") : Shape::parse(pattern);
     G.n = (size_t)n;
     G.alphabet_size = (int)alpha;
     G.text.resize((size_t)n);
