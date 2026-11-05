@@ -703,10 +703,13 @@ SHAPES = [
 
 # Full retained set: greedy-size and greedy-degree (Phase I greedy variants),
 # dep-order (dependency-order un-pin/retarget), and pseudoforest-dp /
-# pseudoforest-dp-iterate (exact DP, single-fire and iterated). Every one of
-# these now runs the same Phase II (dirty-set retarget) + LNS pipeline; see
-# compress.hpp's top-of-file CompressAlgo comment.
-ALGOS = ["greedy-size", "greedy-degree", "dep-order", "pseudoforest-dp", "pseudoforest-dp-iterate"]
+# pseudoforest-dp-iterate (exact DP, single-fire and iterated), and run-dp
+# (exact tree DP on the run / full-link forest, priced partial links for the
+# roots; added 2026-11-04). Every one of these runs the same Phase II
+# (dirty-set retarget) + LNS pipeline; see compress.hpp's top-of-file
+# CompressAlgo comment. Pass run_suite.py --algos to run a subset.
+ALGOS = ["greedy-size", "greedy-degree", "dep-order", "pseudoforest-dp", "pseudoforest-dp-iterate",
+         "run-dp"]
 MAX_ADDS = [8, 16, 32, 64, 128]
 
 # Above this input size, run_suite.py sets GCSA_SKIP_SELFTEST=1 (the

@@ -157,6 +157,7 @@
 #include <cmath>
 #include <cctype>
 #include <map>
+#include <stdexcept>
 
 namespace gcsa {
 
@@ -341,6 +342,7 @@ enum class CompressAlgo {
     DepOrder,              // dependency-order + un-pin / retarget
     PseudoforestDp,        // exact DP on the full out-degree<=1 preference graph (single-fire)
     PseudoforestDpIterate, // same DP, iterated to a fixed point (see compress_pseudoforest_dp_)
+    RunDp,                 // exact tree DP on the full-link (run) forest, then greedy partial links
 };
 
 inline const char* algo_name(CompressAlgo a) {
@@ -350,6 +352,7 @@ inline const char* algo_name(CompressAlgo a) {
         case CompressAlgo::DepOrder:              return "dep-order";
         case CompressAlgo::PseudoforestDp:        return "pseudoforest-dp";
         case CompressAlgo::PseudoforestDpIterate: return "pseudoforest-dp-iterate";
+        case CompressAlgo::RunDp:                 return "run-dp";
     }
     return "?";
 }
@@ -1120,8 +1123,14 @@ private:
     // Can we retarget dependent D through new candidate W_cand?
     // D.src must be a contiguous sub-run of W_cand.covered; then D can point at
     // the corresponding sub-run of W_cand.src with add' = D.add + W_cand.add.
-    static bool can_retarget_(const Candidate& dep, const Candidate& via,
-                              int32_t& new_src_lo, int32_t& new_src_hi) {
+    // GCSA_STRICT_MAX_ADD=1: never compose past --max-add, so every final
+    // link keeps add <= max_add and lower_bound's OPT(A) bounds the run.
+    bool can_retarget_(const Candidate& dep, const Candidate& via,
+                       int32_t& new_src_lo, int32_t& new_src_hi) const {
+        static const bool strict_add = [] {
+            const char* e = std::getenv("GCSA_STRICT_MAX_ADD");
+            return e && std::atoi(e) != 0; }();
+        if (strict_add && dep.add + via.add > max_add_) return false;
         // Find dep.src_lo as an element of via.covered.
         auto& cov = via.covered;
         auto it = std::find(cov.begin(), cov.end(), dep.src_lo);
@@ -2206,6 +2215,347 @@ private:
     }
 
     // ---- algorithms -------------------------------------------------------
+    // ------------------------------------------------------------------
+    // RunDp ("run-dp"): solve the run structure exactly, then greedy.
+    //
+    // Full-link forest.  Word v (|I_v| >= kMinCoverage) has a *parent* u when
+    // every occurrence of v is preceded (one add step back) by the same
+    // symbol: then the add-1 sources of I_v form one contiguous block B of
+    // ranks inside I_u with |B| = |I_v|, so v has a full-coverage link from u.
+    // Following parents a steps back gives v's full link at add a (the
+    // a-step left extension is unique, so the sources are again one block of
+    // the a-th ancestor).  Parent positions are strictly smaller, so this is
+    // a forest; a "run" is a unary path in it, but branching (u followed by
+    // different symbols in different occurrences; |B| < |I_u|) is handled
+    // too -- that is exactly the "run k-mer in a non-run context" case.
+    //
+    // Restricted to full links, every word is either kept whole or deleted
+    // whole by a link to a kept ancestor at distance d <= max_add (the
+    // intermediate words may themselves be deleted: the link reads the
+    // ancestor's ranks directly).  Minimising sum_{kept} |I_v| subject to
+    // "every deleted word has a kept ancestor within max_add" is a tree DP,
+    // O(nodes * max_add):
+    //   f(v, d) = min( |I_v| + S_v[1],                 keep v
+    //                  d <= A ? S_v[min(d+1, A+1)] : inf ) delete v, add d
+    //   S_v[d]  = sum over children c of f(c, d)
+    // with d = distance to the nearest kept proper ancestor (A+1 = none
+    // within reach; roots start there, so roots are kept).  On a single run
+    // of L words this keeps every (A+1)-th word, the optimum ceil(L/(A+1)).
+    // The DP is optimal over full-link solutions; partial links (roots, and
+    // the unpinned ranks of kept words) are then filled greedily, size-first
+    // with availability, exactly as greedy-size does, and Phase II follows.
+    // ------------------------------------------------------------------
+    void compress_run_dp_(const std::vector<Interval>& intervals,
+                          std::unordered_map<uint64_t, Candidate>& accepted) {
+        using Clock = std::chrono::steady_clock;
+        const bool timing = (std::getenv("GCSA_TIMING") != nullptr);
+        auto t0 = Clock::now();
+        auto ms = [](Clock::time_point a, Clock::time_point b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        const size_t m0 = kept_count_;
+        auto pct_kept = [&](size_t kept) {
+            return 100.0 * (double)kept / (double)std::max<size_t>(1, m0);
+        };
+        const int A = max_add_;
+        const size_t m = G_.m();
+        const int32_t W = (int32_t)intervals.size();
+
+        // 1. forest: parent interval of every word with |I| >= kMinCoverage
+        gcsa_log("[run-dp] full-link forest...\n");
+        std::vector<int32_t> iv_of(m, -1);
+        for (int32_t i = 0; i < W; ++i)
+            for (int32_t r = intervals[i].lo; r < intervals[i].hi; ++r) iv_of[(size_t)r] = i;
+        std::vector<int32_t> parent((size_t)W, -1);
+        {
+            const int nth = std::max(1, gcsa_env_int("GCSA_THREADS",
+                                (int)std::max(1u, std::thread::hardware_concurrency())));
+            std::atomic<int32_t> next(0);
+            auto work = [&]() {
+                for (;;) {
+                    const int32_t b0 = next.fetch_add(4096);
+                    if (b0 >= W) break;
+                    const int32_t b1 = std::min(W, b0 + 4096);
+                    for (int32_t i = b0; i < b1; ++i) {
+                        const Interval& iv = intervals[(size_t)i];
+                        const int32_t sz = iv.hi - iv.lo;
+                        if (sz < kMinCoverage) continue;
+                        int32_t pi = -1, qmin = INT32_MAX, qmax = -1;
+                        bool ok = true;
+                        for (int32_t r = iv.lo; r < iv.hi && ok; ++r) {
+                            const int64_t y = pred_lexpos_(r, 1);
+                            if (y < 0) { ok = false; break; }
+                            const int32_t q = rank_of_[(size_t)y];
+                            const int32_t qi = iv_of[(size_t)q];
+                            if (pi < 0) pi = qi; else if (qi != pi) ok = false;
+                            qmin = std::min(qmin, q); qmax = std::max(qmax, q);
+                        }
+                        if (!ok || pi < 0 || pi == i || qmax - qmin + 1 != sz) continue;
+                        for (int32_t q = qmin + 1; q <= qmax && ok; ++q)
+                            if ((int)G_.lcp[(size_t)q] < 1 + base_depth_) ok = false;
+                        if (ok) parent[(size_t)i] = pi;
+                    }
+                }
+            };
+            std::vector<std::thread> th;
+            for (int t = 1; t < nth; ++t) th.emplace_back(work);
+            work();
+            for (auto& t : th) t.join();
+        }
+        // nodes = words with |I| >= kMinCoverage (closed under parent: a
+        // parent's interval holds the child's whole block)
+        std::vector<int32_t> node_of((size_t)W, -1), iv_node;
+        for (int32_t i = 0; i < W; ++i)
+            if (intervals[(size_t)i].hi - intervals[(size_t)i].lo >= kMinCoverage) {
+                node_of[(size_t)i] = (int32_t)iv_node.size(); iv_node.push_back(i);
+            }
+        iv_of.clear(); iv_of.shrink_to_fit();
+        const int32_t N = (int32_t)iv_node.size();
+        std::vector<int32_t> par((size_t)N, -1), nchild((size_t)N + 1, 0);
+        size_t n_roots = 0, n_branch = 0;
+        for (int32_t v = 0; v < N; ++v) {
+            const int32_t p = parent[(size_t)iv_node[(size_t)v]];
+            if (p >= 0) { par[(size_t)v] = node_of[(size_t)p]; ++nchild[(size_t)par[(size_t)v] + 1]; }
+            else ++n_roots;
+        }
+        parent.clear(); parent.shrink_to_fit();
+        for (int32_t v = 0; v < N; ++v) nchild[(size_t)v + 1] += nchild[(size_t)v];
+        std::vector<int32_t> kids((size_t)nchild[(size_t)N]);
+        {
+            std::vector<int32_t> fill(nchild.begin(), nchild.end() - 1);
+            for (int32_t v = 0; v < N; ++v)
+                if (par[(size_t)v] >= 0) kids[(size_t)fill[(size_t)par[(size_t)v]]++] = v;
+        }
+        for (int32_t v = 0; v < N; ++v) if (nchild[(size_t)v + 1] - nchild[(size_t)v] > 1) ++n_branch;
+        // top-down order (roots first, BFS); the DP runs it backwards
+        std::vector<int32_t> order; order.reserve((size_t)N);
+        for (int32_t v = 0; v < N; ++v) if (par[(size_t)v] < 0) order.push_back(v);
+        for (size_t h = 0; h < order.size(); ++h) {
+            const int32_t v = order[h];
+            for (int32_t t = nchild[(size_t)v]; t < nchild[(size_t)v + 1]; ++t) order.push_back(kids[(size_t)t]);
+        }
+        auto t_forest = Clock::now();
+
+        // 1b. roots.  A root has no full link, only partial ones, and the
+        //     ranks those read are often run words the DP would delete.
+        //     GCSA_RUNDP_ROOTS_FIRST selects how the two compete:
+        //       0  ignore: DP first, roots only get what the leftover pass finds
+        //       1  greedy: roots claim their best available link first, size-first
+        //       2  priced (default): roots claim, size-first, the link maximising
+        //          coverage - price, where price = the exact increase of the
+        //          forest optimum from forcing the source word whole (outside
+        //          DP below) + the root's own lost anchoring; claim only if > 0.
+        //     A forest word with a pinned rank must then stay whole (a full link
+        //     deletes all its ranks); a root that lost ranks anchors nothing.
+        const char* rf_env = std::getenv("GCSA_RUNDP_ROOTS_FIRST");
+        const int roots_mode = rf_env ? std::atoi(rf_env) : 2;
+        std::vector<uint8_t> forced((size_t)N, 0), no_anchor((size_t)N, 0);
+
+        // 2. tree DP.  S_v[d-1] = sum_children f(child, d), d = 1..A+1, stored
+        //    only for words with children (0 otherwise) and as 32-bit: every
+        //    entry is a sum of kept counts within one subtree, so <= m.
+        if (m >= (size_t)std::numeric_limits<uint32_t>::max())
+            throw std::runtime_error("run-dp: m >= 2^32 is not supported");
+        const size_t R = (size_t)A + 1;
+        std::vector<int32_t> srow((size_t)N, -1);
+        size_t NI = 0;
+        for (int32_t v = 0; v < N; ++v)
+            if (nchild[(size_t)v + 1] > nchild[(size_t)v]) srow[(size_t)v] = (int32_t)NI++;
+        std::vector<uint32_t> S(NI * R, 0);
+        auto S_at = [&](int32_t v, size_t idx) -> int64_t {
+            const int32_t r = srow[(size_t)v];
+            return r < 0 ? 0 : (int64_t)S[(size_t)r * R + idx];
+        };
+        auto size_of = [&](int32_t v) {
+            const Interval& iv = intervals[(size_t)iv_node[(size_t)v]];
+            return (int64_t)(iv.hi - iv.lo);
+        };
+        const int64_t kInf = std::numeric_limits<int64_t>::max() / 4;
+        auto keep_cost = [&](int32_t v) {   // a non-anchor kept word passes no anchor down
+            return size_of(v) + S_at(v, no_anchor[(size_t)v] ? (size_t)A : 0); };
+        auto del_cost = [&](int32_t v, int d) {  // d in 1..A
+            if (forced[(size_t)v]) return kInf;
+            return S_at(v, (size_t)std::min(d + 1, A + 1) - 1);
+        };
+        auto f_of = [&](int32_t v, int d) {      // d in 1..A+1
+            return d <= A ? std::min(keep_cost(v), del_cost(v, d)) : keep_cost(v);
+        };
+        auto run_dp = [&]() {
+            std::fill(S.begin(), S.end(), 0);
+            for (size_t h = order.size(); h-- > 0; ) {
+                const int32_t v = order[h], p = par[(size_t)v];
+                if (p < 0) continue;
+                uint32_t* Sp = &S[(size_t)srow[(size_t)p] * R];
+                for (int d = 1; d <= A + 1; ++d) Sp[d - 1] += (uint32_t)f_of(v, d);
+            }
+        };
+        auto mark_forced = [&]() {
+            size_t nf = 0;
+            for (int32_t v = 0; v < N; ++v) {
+                const Interval& iv = intervals[(size_t)iv_node[(size_t)v]];
+                for (int32_t r = iv.lo; r < iv.hi; ++r) {
+                    if (removed_[(size_t)r]) { no_anchor[(size_t)v] = 1; forced[(size_t)v] = 1; }
+                    if (pin_count_[(size_t)r] > 0) forced[(size_t)v] = 1;
+                }
+                nf += forced[(size_t)v];
+            }
+            return nf;
+        };
+        std::vector<int32_t> roots_by_size;
+        for (int32_t v = 0; v < N; ++v) if (par[(size_t)v] < 0) roots_by_size.push_back(v);
+        std::stable_sort(roots_by_size.begin(), roots_by_size.end(),
+                         [&](int32_t a, int32_t b) { return size_of(a) > size_of(b); });
+        size_t n_root_links = 0;
+        const size_t before_roots = kept_count_;
+        if (roots_mode == 1) {
+            for (int32_t v : roots_by_size) {
+                const Interval& iv = intervals[(size_t)iv_node[(size_t)v]];
+                Candidate c = best_candidate_(iv.name, iv.lo, iv.hi, /*avail=*/true);
+                if (c.coverage() < kMinCoverage) continue;
+                accept_(c, accepted); ++n_root_links;
+            }
+        } else if (roots_mode >= 2) {
+            run_dp();
+            // outside DP: O_v[d-1] = optimum of everything outside v's subtree
+            // given that v's nearest kept proper ancestor is d away.  Depth-
+            // first with an explicit stack, so only the open path is held;
+            // price[v] = optimum with v forced whole - unconstrained optimum.
+            std::vector<int64_t> price((size_t)N, 0);
+            {
+                std::vector<int32_t> stk; std::vector<int64_t> pool, Op(R), Oc(R);
+                auto settle = [&](int32_t v, const int64_t* Ov) {
+                    int64_t best = kInf, forced_best = kInf;
+                    for (int d = 1; d <= A + 1; ++d) {
+                        if (Ov[d - 1] >= kInf) continue;
+                        best = std::min(best, Ov[d - 1] + f_of(v, d));
+                        forced_best = std::min(forced_best, Ov[d - 1] + keep_cost(v));
+                    }
+                    price[(size_t)v] = (best >= kInf) ? 0 : forced_best - best;
+                };
+                for (int32_t r0 : roots_by_size) {
+                    stk.push_back(r0);
+                    pool.insert(pool.end(), R, kInf); pool.back() = 0;   // d = A+1
+                    while (!stk.empty()) {
+                        const int32_t p = stk.back(); stk.pop_back();
+                        std::copy(pool.end() - (long)R, pool.end(), Op.begin());
+                        pool.resize(pool.size() - R);
+                        settle(p, Op.data());
+                        const int64_t minO = *std::min_element(Op.begin(), Op.end());
+                        const int64_t kp = keep_cost(p);
+                        for (int32_t t = nchild[(size_t)p]; t < nchild[(size_t)p + 1]; ++t) {
+                            const int32_t c = kids[(size_t)t];
+                            std::fill(Oc.begin(), Oc.end(), kInf);
+                            if (minO < kInf) {
+                                const int dc = no_anchor[(size_t)p] ? A + 1 : 1;
+                                Oc[(size_t)dc - 1] = std::min(Oc[(size_t)dc - 1], minO + kp - f_of(c, dc));
+                            }
+                            if (!forced[(size_t)p])
+                                for (int d = 1; d <= A; ++d) {
+                                    if (Op[(size_t)d - 1] >= kInf) continue;
+                                    const int dc = std::min(d + 1, A + 1);
+                                    Oc[(size_t)dc - 1] = std::min(Oc[(size_t)dc - 1],
+                                        Op[(size_t)d - 1] + S_at(p, (size_t)dc - 1) - f_of(c, dc));
+                                }
+                            stk.push_back(c);
+                            pool.insert(pool.end(), Oc.begin(), Oc.end());
+                        }
+                    }
+                }
+            }
+            std::vector<int32_t> rank_iv(m, -1);
+            for (int32_t i = 0; i < W; ++i)
+                for (int32_t r = intervals[(size_t)i].lo; r < intervals[(size_t)i].hi; ++r) rank_iv[(size_t)r] = i;
+            for (int32_t x : roots_by_size) {
+                const Interval& iv = intervals[(size_t)iv_node[(size_t)x]];
+                auto cs = enumerate_candidates_(iv.name, iv.lo, iv.hi, /*avail=*/true);
+                const int64_t na = S_at(x, (size_t)A) - S_at(x, 0);
+                int64_t best_net = 0; const Candidate* pick = nullptr; int32_t pick_u = -1;
+                for (const auto& c : cs) {
+                    const int32_t u = node_of[(size_t)rank_iv[(size_t)c.src_lo]];
+                    const int64_t cost = (u >= 0 && !forced[(size_t)u]) ? price[(size_t)u] : 0;
+                    const int64_t net = (int64_t)c.coverage() - cost - na;
+                    if (net > best_net) { best_net = net; pick = &c; pick_u = u; }
+                }
+                if (!pick) continue;
+                Candidate c = *pick; accept_(c, accepted); ++n_root_links;
+                forced[(size_t)x] = 1; no_anchor[(size_t)x] = 1;
+                if (pick_u >= 0) { forced[(size_t)pick_u] = 1; price[(size_t)pick_u] = 0; }
+            }
+        }
+        const size_t n_forced = roots_mode ? mark_forced() : 0;
+        if (roots_mode)
+            gcsa_log("[run-dp] roots (%s): |C| %zu -> %zu  (-%zu, %zu links, %zu forest words forced whole)\n",
+                     roots_mode == 1 ? "greedy" : "priced", before_roots, kept_count_,
+                     before_roots - kept_count_, n_root_links, n_forced);
+        gcsa_log("[run-dp] tree DP on %d nodes (%zu roots, %zu branching), max-add %d...\n",
+                 N, n_roots, n_branch, A);
+        run_dp();
+        int64_t dp_kept = 0;
+        for (int32_t v = 0; v < N; ++v) if (par[(size_t)v] < 0) dp_kept += keep_cost(v);
+
+        // 3. reconstruct top-down (ties keep: a kept word's free ranks stay
+        //    usable by the partial-link pass) and accept the full links
+        const size_t before_dp = kept_count_;
+        std::vector<uint8_t> dist((size_t)N, 0);   // 0 = kept, else add to kept ancestor
+        size_t n_del = 0, n_fail = 0;
+        std::unordered_map<uint64_t, std::vector<Candidate>> cand_cache;
+        for (size_t h = 0; h < order.size(); ++h) {
+            const int32_t v = order[h], p = par[(size_t)v];
+            int d = A + 1;
+            if (p >= 0) d = dist[(size_t)p] == 0 ? (no_anchor[(size_t)p] ? A + 1 : 1)
+                                                 : std::min(A + 1, (int)dist[(size_t)p] + 1);
+            if (d <= A && del_cost(v, d) < keep_cost(v)) {
+                const Interval& iv = intervals[(size_t)iv_node[(size_t)v]];
+                auto cs = enumerate_candidates_(iv.name, iv.lo, iv.hi, /*avail=*/true, /*only_add=*/d);
+                const Candidate* full = nullptr;
+                for (const auto& c : cs) if (c.coverage() == iv.hi - iv.lo) { full = &c; break; }
+                if (full) { Candidate c = *full; accept_(c, accepted); dist[(size_t)v] = (uint8_t)d; ++n_del; continue; }
+                ++n_fail;  // should not happen; keep v (its subtree then sees d = 1)
+            }
+            dist[(size_t)v] = 0;
+        }
+        S.clear(); S.shrink_to_fit();
+        auto t_dp = Clock::now();
+        const size_t after_dp = kept_count_;
+        gcsa_log("[run-dp] full links: |C| %zu -> %zu  (%.1f%% of original kept, -%zu)  "
+                 "deleted=%zu kept_nodes=%zu forced=%zu dp_kept_mass=%lld fail=%zu\n",
+                 before_dp, after_dp, pct_kept(after_dp), before_dp - after_dp,
+                 n_del, (size_t)N - n_del, n_forced, (long long)dp_kept, n_fail);
+
+        // 4. partial links, size-first with availability (greedy-size's rule)
+        gcsa_log("[run-dp] leftover greedy (size-first)...\n");
+        std::vector<const Interval*> left;
+        for (const auto& iv : intervals)
+            if (iv.hi - iv.lo >= kMinCoverage && !accepted.count(iv.name)) left.push_back(&iv);
+        std::stable_sort(left.begin(), left.end(),
+                  [](const Interval* a, const Interval* b){ return (a->hi-a->lo) > (b->hi-b->lo); });
+        size_t n_left = 0;
+        for (const Interval* ivp : left) {
+            Candidate c = best_candidate_(ivp->name, ivp->lo, ivp->hi, /*avail=*/true);
+            if (c.coverage() < kMinCoverage) continue;
+            accept_(c, accepted); ++n_left;
+        }
+        auto t_left = Clock::now();
+        const size_t after_left = kept_count_;
+        gcsa_log("[run-dp] leftover:  |C| %zu -> %zu  (%.1f%% of original kept, -%zu)\n",
+                 after_dp, after_left, pct_kept(after_left), after_dp - after_left);
+
+        const double phase1_ms = ms(t0, t_left);
+        run_phase2_and_lns_(intervals, accepted, "run-dp", false, timing, &cand_cache, phase1_ms);
+        auto t_end = Clock::now();
+        const size_t after_phase2 = kept_count_;
+        gcsa_log("[run-dp] phase II:  |C| %zu -> %zu  (%.1f%% of original kept, -%zu)\n",
+                 after_left, after_phase2, pct_kept(after_phase2), after_left - after_phase2);
+        gcsa_log("[run-dp] success: original |C|=%zu -- roots+full links=%.1f%%, +leftover=%.1f%%, "
+                 "+phase II=%.1f%% (of original kept)\n",
+                 m0, pct_kept(after_dp), pct_kept(after_left), pct_kept(after_phase2));
+        if (timing)
+            gcsa_log("[timing] run-dp forest=%.1fms dp=%.1fms leftover=%.1fms phase2=%.1fms total=%.1fms"
+                     "  nodes=%d roots=%zu deleted=%zu n_leftover=%zu accepted=%zu kept=%zu\n",
+                     ms(t0, t_forest), ms(t_forest, t_dp), ms(t_dp, t_left), ms(t_left, t_end),
+                     ms(t0, t_end), N, n_roots, n_del, n_left, accepted.size(), kept_count_);
+    }
+
     void compress_greedy_size_(const std::vector<Interval>& intervals,
                           std::unordered_map<uint64_t, Candidate>& accepted) {
         using Clock = std::chrono::steady_clock;
@@ -3554,6 +3904,8 @@ private:
         else if (algo_ == CompressAlgo::PseudoforestDp ||
                  algo_ == CompressAlgo::PseudoforestDpIterate)
             compress_pseudoforest_dp_(intervals, accepted);
+        else if (algo_ == CompressAlgo::RunDp)
+            compress_run_dp_(intervals, accepted);
         else if (algo_ == CompressAlgo::GreedyDegree)
             compress_greedy_degree_(intervals, accepted);
         else

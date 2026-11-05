@@ -16,7 +16,7 @@ import argparse, csv, glob, json, os, re, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__)); ROOT = os.path.dirname(HERE)
 SHORT = {"greedy-size": "gs", "greedy-degree": "gd", "dep-order": "dep",
-         "pseudoforest-dp": "pfdp", "pseudoforest-dp-iterate": "pfdpi"}
+         "pseudoforest-dp": "pfdp", "pseudoforest-dp-iterate": "pfdpi", "run-dp": "rundp"}
 ap = argparse.ArgumentParser()
 ap.add_argument("--sa-cache", required=True)
 ap.add_argument("--out", required=True)

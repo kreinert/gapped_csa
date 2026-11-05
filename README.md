@@ -61,6 +61,15 @@ make
 ./gcsa --algo dep-order
 ./gcsa --algo pseudoforest-dp             # exact DP on the preference pseudoforest (single-fire) + Phase II
 ./gcsa --algo pseudoforest-dp-iterate     # same DP, iterated to a fixed point, + Phase II
+./gcsa --algo run-dp                      # exact tree DP on the run (full-link) forest, then
+                                          # priced partial links for the roots, + Phase II
+# run-dp's root handling (see "Run-aware compression" below):
+#   GCSA_RUNDP_ROOTS_FIRST=2  priced (default)   =1 greedy roots first   =0 DP first
+# Retarget composes adds (d.add += cand.add), so a run at --max-add A can end
+# with links far past A (on n1 at A=8: up to add 45, over half the links).
+# Make --max-add a hard limit -- and lower_bound's OPT(A) a valid bound for
+# the converged run -- with:
+GCSA_STRICT_MAX_ADD=1 ./gcsa -g genome.fasta -s 21 --algo run-dp --max-add 32
 # Phase II (dirty-set unpin/retarget, then the exact cluster LNS) runs after
 # every algorithm's Phase I -- see run_phase2_and_lns_ in compress.hpp. Each
 # pass has its own switch, so all four combinations are reachable and each
@@ -182,6 +191,26 @@ on ties, the deeper LCP interval (so intervals fall back to deep, stable sources
 **≥ 3** (`kMinCoverage` in `compress.hpp`; all heuristics + Phase II share
 this floor). On the note's example it keeps **29/41** positions and returns
 identical query results.
+
+**Run-aware compression (`--algo run-dp`).** Call word `u` the *parent* of
+word `v` when every occurrence of `v` is preceded, one add step back, by the
+same symbol: then the add-1 sources of `I_v` are one contiguous block of `I_u`
+of size `|I_v|`, a full-coverage link. Following parents `a` steps gives `v`'s
+full link at add `a`. Parent positions are strictly smaller, so this is a
+forest. Its unary paths are the runs (a repeat of length L gives L−k+1 words
+with the same occurrences, one add apart). Its branchings are run words that
+also occur elsewhere, i.e. the parent's block is only part of `I_u`.
+Restricted to full links, each word is kept whole or deleted by a link to a
+kept ancestor at most `max_add` up; the words in between may be deleted too.
+Minimising the kept mass is a tree DP in O(words·max_add), which on one run
+keeps every (A+1)-th word. Roots have only partial links, whose sources are
+often run words, so before the final DP each root (size-first) claims the
+partial link maximising coverage − price. The price is the exact rise in the
+forest optimum from forcing the source word whole, from an outside pass of the
+same DP. Words pinned that way are forced whole, and a greedy pass then fills
+the remaining partial links. On run-structured inputs the Phase I result is
+within 1–2 % of `lower_bound` (98.6–99.1 % deletion efficiency on n1 and the
+repeat inputs, against 69–81 % for the other algorithms).
 
 **Choosing the LCP intervals optimally is the open research core of the project**
 (see below); the greedy here is a correct, reasonable baseline.

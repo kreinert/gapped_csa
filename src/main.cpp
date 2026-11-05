@@ -236,7 +236,7 @@ static void print_usage(const char* argv0) {
         << "  -q <query>          query string to locate\n"
         << "  -r <reads.fasta>    locate every read in a FASTA\n"
         << "  --algo <name>       greedy-size|greedy-degree|dep-order|pseudoforest-dp|\n"
-        << "                      pseudoforest-dp-iterate (default: greedy-size)\n"
+        << "                      pseudoforest-dp-iterate | run-dp (default: greedy-size)\n"
         << "  --max-add N         max differential offset (default: 8)\n"
         << "  --sa-cache DIR      reuse a prepared gapped SA from DIR, building and\n"
         << "                      storing it there on a miss. The SA depends only on\n"
@@ -337,8 +337,9 @@ int main(int argc, char** argv) {
             else if (a == "dep-order" || a == "dep") algo = CompressAlgo::DepOrder;
             else if (a == "pseudoforest-dp" || a == "pf-dp" || a == "pfdp") algo = CompressAlgo::PseudoforestDp;
             else if (a == "pseudoforest-dp-iterate" || a == "pf-dp-iterate" || a == "pfdp-iterate" || a == "pfdpi") algo = CompressAlgo::PseudoforestDpIterate;
+            else if (a == "run-dp" || a == "rundp") algo = CompressAlgo::RunDp;
             else {
-                std::cerr << "--algo must be greedy-size|greedy-degree|dep-order|pseudoforest-dp|pseudoforest-dp-iterate\n";
+                std::cerr << "--algo must be greedy-size|greedy-degree|dep-order|pseudoforest-dp|pseudoforest-dp-iterate|run-dp\n";
                 return 1;
             }
         }
