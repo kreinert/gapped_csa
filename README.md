@@ -65,6 +65,9 @@ make
                                           # priced partial links for the roots, + Phase II
 # run-dp's root handling (see "Run-aware compression" below):
 #   GCSA_RUNDP_ROOTS_FIRST=2  priced (default)   =1 greedy roots first   =0 DP first
+# run-dp's full links reach any kept ancestor by default (their adds can go
+# far past --max-add; --max-add then only caps the partial-link search):
+#   GCSA_RUNDP_REACH=bounded  cap full links at --max-add too (tree DP)
 # Retarget composes adds (d.add += cand.add), so a run at --max-add A can end
 # with links far past A (on n1 at A=8: up to add 45, over half the links).
 # Make --max-add a hard limit -- and lower_bound's OPT(A) a valid bound for
@@ -203,7 +206,10 @@ also occur elsewhere, i.e. the parent's block is only part of `I_u`.
 Restricted to full links, each word is kept whole or deleted by a link to a
 kept ancestor at most `max_add` up; the words in between may be deleted too.
 Minimising the kept mass is a tree DP in O(words·max_add), which on one run
-keeps every (A+1)-th word. Roots have only partial links, whose sources are
+keeps every (A+1)-th word. Full links are found from the forest rather than
+by trying adds, so by default (`GCSA_RUNDP_REACH` unset) their reach is
+unlimited and the optimum is simply "keep the roots", O(words); only the
+partial links below are capped by `--max-add`. Roots have only partial links, whose sources are
 often run words, so before the final DP each root (size-first) claims the
 partial link maximising coverage − price. The price is the exact rise in the
 forest optimum from forcing the source word whole, from an outside pass of the

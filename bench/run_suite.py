@@ -132,7 +132,8 @@ CSV_FIELDS = [
 
 # Characters a shape string may legitimately contain (see main.cpp) --
 # used only to sanity-check before dropping a shape straight into a log
-# filename; SHAPES in datasets.py never produces anything outside this.
+# filename (integer plain-SA shapes like "21" pass through the fallback
+# sanitizer unchanged).
 _SHAPE_FILENAME_SAFE = re.compile(r"^[#.]+$")
 
 

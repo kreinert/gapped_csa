@@ -699,6 +699,12 @@ SHAPES = [
                                         # Mete-supplied shape (Sep-8):
                                         # 11111111111111111110001010110101110011011,
                                         # span41/w31.
+    # Plain character SA (gcsa regular mode, `-s k`) for the two contiguous
+    # k-mers above: same index as "#"*21 / "#"*30, links shift by one
+    # character instead of one k-mer. All integer shapes of a dataset share
+    # one SA blob and sidecar (sa/meta/<dataset>__plain.json).
+    "21",
+    "30",
 ]
 
 # Full retained set: greedy-size and greedy-degree (Phase I greedy variants),
@@ -710,7 +716,8 @@ SHAPES = [
 # CompressAlgo comment. Pass run_suite.py --algos to run a subset.
 ALGOS = ["greedy-size", "greedy-degree", "dep-order", "pseudoforest-dp", "pseudoforest-dp-iterate",
          "run-dp"]
-MAX_ADDS = [8, 16, 32, 64, 128]
+# The values every sweep since 2026-09-23 has used.
+MAX_ADDS = [8, 16, 32]
 
 # Above this input size, run_suite.py sets GCSA_SKIP_SELFTEST=1 (the
 # brute-force check in main.cpp is O(n) extra work per config; fine at

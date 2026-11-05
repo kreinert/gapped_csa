@@ -2349,6 +2349,20 @@ private:
         //     deletes all its ranks); a root that lost ranks anchors nothing.
         const char* rf_env = std::getenv("GCSA_RUNDP_ROOTS_FIRST");
         const int roots_mode = rf_env ? std::atoi(rf_env) : 2;
+        // GCSA_RUNDP_REACH: how far up the forest a full link may reach.
+        //   unset / unbounded  any distance (default since 2026-11-05): the
+        //              full-link optimum is then "keep the roots", found
+        //              top-down in O(N) with no DP table.  Full links are found
+        //              from the forest, not by enumerating adds, so this costs
+        //              nothing extra; their adds go past --max-add (up to 3225
+        //              on n1), each decoded with one addition and stored in 1-4
+        //              bytes (serialize.hpp sizes each entry's add).
+        //   bounded    full links capped at --max-add too, solved by the tree DP.
+        //   Partial links (roots, leftover, Phase II) always enumerate adds up
+        //   to --max-add.
+        const char* reach_env = std::getenv("GCSA_RUNDP_REACH");
+        const bool unbounded = !(reach_env && (std::strcmp(reach_env, "bounded") == 0
+                                               || std::strcmp(reach_env, "max-add") == 0));
         std::vector<uint8_t> forced((size_t)N, 0), no_anchor((size_t)N, 0);
 
         // 2. tree DP.  S_v[d-1] = sum_children f(child, d), d = 1..A+1, stored
@@ -2361,7 +2375,7 @@ private:
         size_t NI = 0;
         for (int32_t v = 0; v < N; ++v)
             if (nchild[(size_t)v + 1] > nchild[(size_t)v]) srow[(size_t)v] = (int32_t)NI++;
-        std::vector<uint32_t> S(NI * R, 0);
+        std::vector<uint32_t> S(unbounded ? 0 : NI * R, 0);   // no DP table with unlimited reach
         auto S_at = [&](int32_t v, size_t idx) -> int64_t {
             const int32_t r = srow[(size_t)v];
             return r < 0 ? 0 : (int64_t)S[(size_t)r * R + idx];
@@ -2413,6 +2427,33 @@ private:
                 Candidate c = best_candidate_(iv.name, iv.lo, iv.hi, /*avail=*/true);
                 if (c.coverage() < kMinCoverage) continue;
                 accept_(c, accepted); ++n_root_links;
+            }
+        } else if (roots_mode >= 2 && unbounded) {
+            // With unlimited reach every non-root word is deleted via its
+            // root, so forcing such a word whole costs exactly |I_u|; roots
+            // (and words already forced) cost nothing.  A root that gives up
+            // ranks stops anchoring, and each of its children not already
+            // forced must then be kept: that is its anchor loss.
+            std::vector<int32_t> rank_iv(m, -1);
+            for (int32_t i = 0; i < W; ++i)
+                for (int32_t r = intervals[(size_t)i].lo; r < intervals[(size_t)i].hi; ++r) rank_iv[(size_t)r] = i;
+            for (int32_t x : roots_by_size) {
+                const Interval& iv = intervals[(size_t)iv_node[(size_t)x]];
+                int64_t na = 0;
+                for (int32_t t = nchild[(size_t)x]; t < nchild[(size_t)x + 1]; ++t)
+                    if (!forced[(size_t)kids[(size_t)t]]) na += size_of(kids[(size_t)t]);
+                auto cs = enumerate_candidates_(iv.name, iv.lo, iv.hi, /*avail=*/true);
+                int64_t best_net = 0; const Candidate* pick = nullptr; int32_t pick_u = -1;
+                for (const auto& c : cs) {
+                    const int32_t u = node_of[(size_t)rank_iv[(size_t)c.src_lo]];
+                    const int64_t cost = (u >= 0 && par[(size_t)u] >= 0 && !forced[(size_t)u]) ? size_of(u) : 0;
+                    const int64_t net = (int64_t)c.coverage() - cost - na;
+                    if (net > best_net) { best_net = net; pick = &c; pick_u = u; }
+                }
+                if (!pick) continue;
+                Candidate c = *pick; accept_(c, accepted); ++n_root_links;
+                forced[(size_t)x] = 1; no_anchor[(size_t)x] = 1;
+                if (pick_u >= 0) forced[(size_t)pick_u] = 1;
             }
         } else if (roots_mode >= 2) {
             run_dp();
@@ -2487,40 +2528,69 @@ private:
             gcsa_log("[run-dp] roots (%s): |C| %zu -> %zu  (-%zu, %zu links, %zu forest words forced whole)\n",
                      roots_mode == 1 ? "greedy" : "priced", before_roots, kept_count_,
                      before_roots - kept_count_, n_root_links, n_forced);
+        const size_t before_dp = kept_count_;
+        size_t n_del = 0, n_fail = 0;
+        int64_t dp_kept = 0;
+        int max_full_add = 0;
+        std::unordered_map<uint64_t, std::vector<Candidate>> cand_cache;
+        auto accept_full = [&](int32_t v, int d) {   // v's full link at add d, if available
+            const Interval& iv = intervals[(size_t)iv_node[(size_t)v]];
+            auto cs = enumerate_candidates_(iv.name, iv.lo, iv.hi, /*avail=*/true, /*only_add=*/d);
+            for (const auto& c : cs)
+                if (c.coverage() == iv.hi - iv.lo) {
+                    Candidate cc = c; accept_(cc, accepted); ++n_del;
+                    max_full_add = std::max(max_full_add, d);
+                    return true;
+                }
+            ++n_fail;  // should not happen; the caller keeps v
+            return false;
+        };
+        if (unbounded) {
+            // 3'. unlimited reach: top-down, delete every word that has a usable
+            //     kept ancestor at any distance; keep forced words and words
+            //     with none (the topmost word below a non-anchoring root).
+            gcsa_log("[run-dp] full links, unlimited reach, on %d nodes (%zu roots, %zu branching)...\n",
+                     N, n_roots, n_branch);
+            constexpr int32_t kNone = std::numeric_limits<int32_t>::max();
+            std::vector<int32_t> up((size_t)N, kNone);  // distance from v to nearest usable kept word at or above v
+            for (size_t h = 0; h < order.size(); ++h) {
+                const int32_t v = order[h], p = par[(size_t)v];
+                const int32_t d = (p >= 0 && up[(size_t)p] != kNone) ? up[(size_t)p] + 1 : kNone;
+                if (!forced[(size_t)v] && d != kNone && accept_full(v, d)) {
+                    up[(size_t)v] = d;
+                } else {
+                    dp_kept += size_of(v);
+                    up[(size_t)v] = no_anchor[(size_t)v] ? (d == kNone ? kNone : d) : 0;
+                }
+            }
+        } else {
         gcsa_log("[run-dp] tree DP on %d nodes (%zu roots, %zu branching), max-add %d...\n",
                  N, n_roots, n_branch, A);
         run_dp();
-        int64_t dp_kept = 0;
         for (int32_t v = 0; v < N; ++v) if (par[(size_t)v] < 0) dp_kept += keep_cost(v);
 
         // 3. reconstruct top-down (ties keep: a kept word's free ranks stay
         //    usable by the partial-link pass) and accept the full links
-        const size_t before_dp = kept_count_;
-        std::vector<uint8_t> dist((size_t)N, 0);   // 0 = kept, else add to kept ancestor
-        size_t n_del = 0, n_fail = 0;
-        std::unordered_map<uint64_t, std::vector<Candidate>> cand_cache;
+        std::vector<int32_t> dist((size_t)N, 0);   // 0 = kept, else add to kept ancestor
         for (size_t h = 0; h < order.size(); ++h) {
             const int32_t v = order[h], p = par[(size_t)v];
             int d = A + 1;
             if (p >= 0) d = dist[(size_t)p] == 0 ? (no_anchor[(size_t)p] ? A + 1 : 1)
-                                                 : std::min(A + 1, (int)dist[(size_t)p] + 1);
-            if (d <= A && del_cost(v, d) < keep_cost(v)) {
-                const Interval& iv = intervals[(size_t)iv_node[(size_t)v]];
-                auto cs = enumerate_candidates_(iv.name, iv.lo, iv.hi, /*avail=*/true, /*only_add=*/d);
-                const Candidate* full = nullptr;
-                for (const auto& c : cs) if (c.coverage() == iv.hi - iv.lo) { full = &c; break; }
-                if (full) { Candidate c = *full; accept_(c, accepted); dist[(size_t)v] = (uint8_t)d; ++n_del; continue; }
-                ++n_fail;  // should not happen; keep v (its subtree then sees d = 1)
+                                                 : std::min(A + 1, dist[(size_t)p] + 1);
+            if (d <= A && del_cost(v, d) < keep_cost(v) && accept_full(v, d)) {
+                dist[(size_t)v] = d;
+                continue;
             }
             dist[(size_t)v] = 0;
+        }
         }
         S.clear(); S.shrink_to_fit();
         auto t_dp = Clock::now();
         const size_t after_dp = kept_count_;
         gcsa_log("[run-dp] full links: |C| %zu -> %zu  (%.1f%% of original kept, -%zu)  "
-                 "deleted=%zu kept_nodes=%zu forced=%zu dp_kept_mass=%lld fail=%zu\n",
+                 "deleted=%zu kept_nodes=%zu forced=%zu dp_kept_mass=%lld fail=%zu max_full_add=%d\n",
                  before_dp, after_dp, pct_kept(after_dp), before_dp - after_dp,
-                 n_del, (size_t)N - n_del, n_forced, (long long)dp_kept, n_fail);
+                 n_del, (size_t)N - n_del, n_forced, (long long)dp_kept, n_fail, max_full_add);
 
         // 4. partial links, size-first with availability (greedy-size's rule)
         gcsa_log("[run-dp] leftover greedy (size-first)...\n");
